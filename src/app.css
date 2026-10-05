@@ -1,0 +1,266 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #2a313c;
+  --text: #e6edf3;
+  --muted: #7d8590;
+  --accent: #4fa3ff;
+  --danger: #ff6b6b;
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 15px;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+}
+
+a {
+  color: var(--accent);
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.brand {
+  font-weight: 700;
+  text-decoration: none;
+  color: var(--text);
+}
+.tagline {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+main {
+  padding: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+  min-width: 0;
+}
+h2,
+h3 {
+  margin: 0 0 12px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+label.check,
+label.inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+input,
+select,
+button {
+  font: inherit;
+  color: var(--text);
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+button {
+  cursor: pointer;
+  background: #21262d;
+}
+button:hover {
+  border-color: var(--muted);
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06111f;
+  font-weight: 600;
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.row {
+  display: flex;
+  gap: 12px;
+}
+.row > * {
+  flex: 1;
+}
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+}
+.error {
+  color: var(--danger);
+}
+
+.home {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+  max-width: 900px;
+  margin: 24px auto;
+}
+
+.share {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.label {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.link-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+code {
+  background: #0d1117;
+  padding: 6px 8px;
+  border-radius: 6px;
+  word-break: break-all;
+}
+
+.host-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 420px) 1fr;
+  gap: 16px;
+}
+@media (max-width: 900px) {
+  .host-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.preview {
+  width: 100%;
+  border-radius: 6px;
+  background: #000;
+  aspect-ratio: 16 / 9;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+.stats-grid div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.stats-grid span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trees {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-x: auto;
+}
+.tree-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+.edge {
+  stroke: #3a4350;
+  stroke-width: 1;
+}
+circle.relay {
+  stroke: #fff;
+  stroke-width: 1.5;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+th,
+td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+tr.stale td {
+  color: var(--danger);
+}
+
+.viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.stage {
+  position: relative;
+  background: #000;
+  border-radius: 10px;
+  overflow: hidden;
+  min-height: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stage canvas {
+  max-width: 100%;
+  max-height: 75vh;
+  display: block;
+}
+.overlay-msg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+.controls {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  gap: 6px;
+}
+.controls button {
+  background: rgba(13, 17, 23, 0.8);
+}

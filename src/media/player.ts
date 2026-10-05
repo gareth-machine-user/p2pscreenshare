@@ -1,0 +1,192 @@
+import { wallClock } from '../net/bootstrap'
+import { fromBase64, type StreamInfo } from '../proto/messages'
+import { AudioPlayer } from './audio'
+import { DecodeScheduler, PlayoutClock } from './jitterBuffer'
+import type { AssembledFrame } from './reassembler'
+
+interface Pending {
+  frame: VideoFrame
+  renderAt: number
+}
+
+export interface PlayerStats {
+  latencyMs: number | null
+  bufferMs: number
+  fps: number
+  decodedFrames: number
+  droppedFrames: number
+  waitingForKeyframe: boolean
+  width: number
+  height: number
+}
+
+/**
+ * Viewer playback: jitter buffer + dependency-aware decode ordering + WebCodecs decoding +
+ * render scheduling on the playout clock. Audio shares the same playout clock.
+ */
+export class Player {
+  readonly clock = new PlayoutClock()
+  readonly scheduler: DecodeScheduler
+  readonly audio = new AudioPlayer()
+  /** host clock - local clock (ms), from clock sync; used only for latency reporting. */
+  clockOffset: number | null = null
+
+  private decoder: VideoDecoder | null = null
+  private info: StreamInfo | null = null
+  private renderQueue: Pending[] = []
+  private renderAtByTs = new Map<number, number>()
+  private captureByTs = new Map<number, number>()
+  private raf = 0
+  private interval: ReturnType<typeof setInterval>
+  private renderedTimes: number[] = []
+  private latencySamples: number[] = []
+  private lastRendered: VideoFrame | null = null
+  private closed = false
+  width = 0
+  height = 0
+
+  constructor(
+    private canvas: HTMLCanvasElement | null,
+    onNeedKeyframe: () => void,
+  ) {
+    this.scheduler = new DecodeScheduler(this.clock, onNeedKeyframe)
+    const loop = () => {
+      this.tick()
+      if (!this.closed) this.raf = requestAnimationFrame(loop)
+    }
+    this.raf = requestAnimationFrame(loop)
+    // rAF pauses in background tabs; keep the pipeline draining anyway.
+    this.interval = setInterval(() => this.tick(), 50)
+  }
+
+  setCanvas(canvas: HTMLCanvasElement | null): void {
+    this.canvas = canvas
+  }
+
+  setStreamInfo(info: StreamInfo, force = false): void {
+    if (!force && this.info && JSON.stringify(this.info) === JSON.stringify(info)) return
+    this.info = info
+    if (info.audio) this.audio.configure(info.audio)
+    this.decoder?.close()
+    this.decoder = new VideoDecoder({
+      output: (f) => this.onDecoded(f),
+      error: (e) => {
+        console.warn('VideoDecoder error; resetting', e)
+        // A decoder error closes the decoder: rebuild it and resume from the next keyframe.
+        setTimeout(() => {
+          if (this.closed || this.info !== info) return
+          this.setStreamInfo(info, true)
+          this.scheduler.requireKeyframe()
+        }, 0)
+      },
+    })
+    const config: VideoDecoderConfig = {
+      codec: info.codec,
+      codedWidth: info.codedWidth,
+      codedHeight: info.codedHeight,
+      optimizeForLatency: true,
+      ...(info.description ? { description: fromBase64(info.description) } : {}),
+    }
+    this.decoder.configure(config)
+  }
+
+  push(f: AssembledFrame): void {
+    if (!f.replay) this.clock.addSample(f.captureTime, f.completedAt)
+    if (f.audio) {
+      this.audio.push(f, this.clock.renderAt(f.captureTime))
+      return
+    }
+    if (!this.info || f.epoch !== this.info.epoch) return
+    this.scheduler.push(f)
+    this.pump()
+  }
+
+  private pump(): void {
+    if (!this.decoder || this.decoder.state !== 'configured') return
+    for (const f of this.scheduler.poll(wallClock())) {
+      const ts = Math.round(f.captureTime * 1000)
+      this.renderAtByTs.set(ts, this.clock.renderAt(f.captureTime) ?? wallClock())
+      this.captureByTs.set(ts, f.captureTime)
+      try {
+        this.decoder.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: ts, data: f.data }))
+      } catch (err) {
+        console.warn('decode error', err)
+      }
+    }
+  }
+
+  private onDecoded(frame: VideoFrame): void {
+    const renderAt = this.renderAtByTs.get(frame.timestamp) ?? wallClock()
+    this.renderAtByTs.delete(frame.timestamp)
+    this.renderQueue.push({ frame, renderAt })
+  }
+
+  private tick(): void {
+    this.pump()
+    const now = wallClock()
+    // Show the newest frame that is due; drop older due frames.
+    let due: Pending | null = null
+    while (this.renderQueue.length && this.renderQueue[0].renderAt <= now) {
+      if (due) due.frame.close()
+      due = this.renderQueue.shift()!
+    }
+    // Guard against unbounded growth if the clock jumps.
+    while (this.renderQueue.length > 90) this.renderQueue.shift()!.frame.close()
+    if (!due) return
+    this.render(due.frame, now)
+  }
+
+  private render(frame: VideoFrame, now: number): void {
+    const capture = this.captureByTs.get(frame.timestamp)
+    this.captureByTs.delete(frame.timestamp)
+    if (this.captureByTs.size > 300) this.captureByTs.clear()
+    if (capture !== undefined && this.clockOffset !== null) {
+      this.latencySamples.push(now + this.clockOffset - capture)
+      if (this.latencySamples.length > 90) this.latencySamples.shift()
+    }
+    this.renderedTimes.push(now)
+    while (this.renderedTimes.length && now - this.renderedTimes[0] > 1000) this.renderedTimes.shift()
+
+    this.width = frame.displayWidth
+    this.height = frame.displayHeight
+    const c = this.canvas
+    if (c && !document.hidden) {
+      if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) {
+        c.width = frame.displayWidth
+        c.height = frame.displayHeight
+      }
+      c.getContext('2d')!.drawImage(frame, 0, 0)
+    }
+    this.lastRendered?.close()
+    this.lastRendered = frame
+  }
+
+  get stats(): PlayerStats {
+    const lat = [...this.latencySamples].sort((a, b) => a - b)
+    const s = this.scheduler.stats
+    return {
+      latencyMs: lat.length ? lat[Math.floor(lat.length / 2)] : null,
+      bufferMs: this.clock.bufferMs,
+      fps: this.renderedTimes.length,
+      decodedFrames: s.decoded,
+      droppedFrames: s.droppedLate + s.droppedUndecodable,
+      waitingForKeyframe: this.scheduler.waitingForKeyframe,
+      width: this.width,
+      height: this.height,
+    }
+  }
+
+  close(): void {
+    this.closed = true
+    cancelAnimationFrame(this.raf)
+    clearInterval(this.interval)
+    this.renderQueue.forEach((p) => p.frame.close())
+    this.lastRendered?.close()
+    try {
+      this.decoder?.close()
+    } catch {
+      // ignore
+    }
+    this.audio.close()
+  }
+}
