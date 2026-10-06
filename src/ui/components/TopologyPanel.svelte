@@ -63,11 +63,11 @@
     <table>
       <thead>
         <tr>
-          <th title="The number on this peer's node in the trees above (P = the publisher)">#</th><th>Peer</th><th title="Live: what this peer's uplink sends (relaying, probes), from its last stats report (2 s average)">Sending</th><th title="Measured upload capacity from the last probe; not current use">Est. upload</th><th>Home</th><th>Slots</th><th>Children</th><th>Depth</th><th>Latency</th><th>FPS</th><th>Late</th>
+          <th title="The number on this peer's node in the trees above (P = the publisher)">#</th><th>Peer</th><th title="Live: what this peer's uplink sends (relaying, probes), from its last stats report (2 s average)">Sending</th><th title="Its uplink's measured capacity, as it gossips it; not current use">Upload capacity</th><th>Home</th><th>Slots</th><th>Children</th><th>Depth</th><th>Latency</th><th>FPS</th><th>Late</th>
           <th title="Frames in per second, and frames lost per second (incomplete, late, undecodable or skipped)">In / lost /s</th>
           <th title="Uplink fragments dropped per second for missing their deadline, by temporal layer">Drops T0/T1/T2</th>
           <th title="Average time fragments wait in this peer's uplink queue">Queue</th>
-          <th title="The presenter's own link to this viewer (if fed directly): live fragments dropped per second and queueing. A congested link here with the rest fine means this viewer's connection is slow, not the presenter's uplink.">From presenter</th>
+          <th title="The presenter's own link to this viewer (if fed directly): live fragments dropped per second, queueing, and what its connections carry. A backlogged link here with the rest fine means this viewer's connection is slow, not the presenter's uplink.">From presenter</th>
         </tr>
       </thead>
       <tbody>
@@ -87,7 +87,7 @@
             <td class:warn={(r.lost ?? 0) > 0.5}>{r.stats?.loss ? `${r.stats.loss.incomingFps} / ${Math.round((r.lost ?? 0) * 10) / 10}` : '—'}</td>
             <td class:warn={!!r.drops && r.drops[0] + r.drops[1] + r.drops[2] > 0.5}>{r.drops ? r.drops.join(' / ') : '—'}</td>
             <td>{fmtMs(r.queueMs)}</td>
-            <td class:warn={!!r.link?.congested} data-testid="link-from-presenter">{r.link ? `${r.link.drops}/s · ${fmtMs(r.link.queueMs)}` : '—'}</td>
+            <td class:warn={!!r.link?.backlogged} data-testid="link-from-presenter">{r.link ? `${r.link.drops}/s · ${fmtMs(r.link.queueMs)}${r.link.capKbps != null ? ` · carries ${fmtKbps(r.link.capKbps)}` : ''}` : '—'}</td>
           </tr>
         {/each}
       </tbody>

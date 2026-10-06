@@ -59,11 +59,10 @@ test('the owner kicks a member: links close, and a reload does not get it back i
   expect((await meshSnapshot(mallory)).openLinks).toBe(0)
 })
 
-test('one slow viewer does not throttle the stream; a full uplink does', async ({ browser }) => {
-  test.setTimeout(150_000)
+test('one slow viewer does not throttle the stream; a capped uplink does, down to what it carries', async ({ browser }) => {
+  test.setTimeout(180_000)
   const seed = `e2e-slow-${Date.now()}`
-  // A low bitrate, so a send buffer under the 64 KiB high mark is still long queueing (below).
-  const KBPS = 400
+  const KBPS = 2000
   const owner = await openHost(browser, seed, { k: 1, m: 0, bitrate: KBPS, up: 20_000 })
   // Weak uploads, so neither relays: the presenter feeds both directly.
   const a = await openViewer(browser, seed, 'slow', 300)
@@ -74,71 +73,63 @@ test('one slow viewer does not throttle the stream; a full uplink does', async (
   /**
    * Makes the presenter's link to a viewer look like a slow receiver: its send buffer stays full,
    * though it keeps draining (a buffer that never drains is a stalled connection, which the uplink
-   * routes around: net/uplink.ts STALL_MS).
+   * routes around: net/uplink.ts STALL_MS). Its queue never empties and it delivers next to nothing.
    */
   const slowLink = (peer: string) =>
     owner.evaluate((id) => {
       const conn = (window.__p2p as Any).mesh.conns.get(id)
-      Object.defineProperty(conn, 'bufferedAmount', { get: () => 64 * 1024 * 1024 - (performance.now() % 1000) })
-    }, peer)
-  /**
-   * Makes the link look backed up but still flowing (a connection at its congestion window): a
-   * send buffer just under the high mark (64 KiB), draining, so fragments keep going (no drops)
-   * but each waits behind it (~1.2 s at this bitrate).
-   */
-  const queuedLink = (peer: string) =>
-    owner.evaluate((id) => {
-      const conn = (window.__p2p as Any).mesh.conns.get(id)
-      Object.defineProperty(conn, 'bufferedAmount', { get: () => 60 * 1024 - (performance.now() % 1000) })
+      Object.defineProperty(conn, 'bufferedAmount', { configurable: true, get: () => 64 * 1024 * 1024 - (performance.now() % 1000) })
     }, peer)
   const state = () =>
-    owner.evaluate(() => {
+    owner.evaluate((peers) => {
       const s = window.__p2p as Any
-      return { kbps: s.publishing.full.kbps as number, full: s.uplinkFull, links: Object.fromEntries(s.linkRates) as Record<string, { congested: boolean }> }
-    })
+      return {
+        kbps: s.publishing.full.kbps as number,
+        rate: s.rateStatus(),
+        uplinkKbps: s.capacity.uplinkKbps as number | null,
+        peers: peers.map((p: string) => s.peerCapacity(p)) as { kbps: number | null; bound: boolean }[],
+        // The slow viewer's mesh link (k=1: the one stripe goes over it).
+        slowLink: (s.linkStatsFor(peers[0]) as Any[]).find((l) => l.lane === 0) as { capKbps: number | null; bound: boolean; backlogged: boolean },
+      }
+    }, ids)
 
+  // The uplink is measured (headroom probe), at about the 20 Mbps cap.
+  await waitFor(state, (st) => (st.uplinkKbps ?? 0) > 10_000, 30_000, 'uplink measured')
   await slowLink(ids[0])
   await new Promise((r) => setTimeout(r, 15_000))
   const one = await state()
   console.log('one slow link:', JSON.stringify(one))
-  expect(one.links[ids[0]]?.congested).toBe(true)
-  expect(one.full).toBeNull()
-  expect(one.kbps).toBe(KBPS) // not throttled
+  // The slow viewer's connection is its own bottleneck, the bitrate holds for the other one.
+  expect(one.peers[0].bound).toBe(true)
+  expect(one.slowLink).toMatchObject({ bound: true, backlogged: true })
+  expect(one.slowLink.capKbps!).toBeLessThan(KBPS)
+  expect(one.kbps).toBe(KBPS)
+  expect(one.rate.limit).toBe('chosen')
   expect((await viewerSnapshot(b)).fps).toBeGreaterThan(20) // the other viewer is unaffected
 
-  // Both links back up together (the second one queueing, not dropping), but the path RTTs stay
-  // flat: that is the connections' own ceilings, not queueing in the network, so the bitrate holds.
-  await queuedLink(ids[1])
-  await new Promise((r) => setTimeout(r, 10_000))
-  const flat = await state()
-  console.log('both backed up, flat RTT:',JSON.stringify(flat), JSON.stringify(await owner.evaluate(() => Object.fromEntries((window.__p2p as Any).pathQueue))))
-  expect(flat.links[ids[0]]?.congested && flat.links[ids[1]]?.congested).toBe(true)
-  expect(flat.full).toBeNull()
-  expect(flat.kbps).toBe(KBPS)
-
-  // Now the path RTTs inflate as well (+200 ms on every connection, as a full router queue would):
-  // that is what a full uplink looks like, so the bitrate drops.
-  for (const id of ids) {
-    await owner.evaluate((peer) => {
-      for (const { conn } of (window.__p2p as Any).mesh.connectionsOf(peer)) {
-        const pc = conn.pc as RTCPeerConnection
-        const orig = pc.getStats.bind(pc)
-        const base = new Map<string, number>()
-        ;(pc as Any).getStats = async () => {
-          const out = new Map<string, Any>()
-          ;(await orig()).forEach((r: Any) => {
-            if (r.type === 'candidate-pair' && typeof r.responsesReceived === 'number') {
-              if (!base.has(r.id)) base.set(r.id, r.responsesReceived)
-              const n = r.responsesReceived - base.get(r.id)!
-              r = { ...r, currentRoundTripTime: r.currentRoundTripTime + 0.2, totalRoundTripTime: r.totalRoundTripTime + 0.2 * n }
-            }
-            out.set(r.id, r)
-          })
-          return out
-        }
-      }
-    }, id)
+  // Back to normal, then the presenter's uplink is capped below what two full copies need: the
+  // token bucket carries 2.5 Mbps, so its queues back up on both links at once. The bitrate settles
+  // at 85% of what that carries per viewer.
+  await owner.evaluate((id) => delete (window.__p2p as Any).mesh.conns.get(id).bufferedAmount, ids[0])
+  const CAP = 2500
+  await owner.evaluate((cap) => ((window.__p2p as Any).uplink.capKbps = cap), CAP)
+  // Video per viewer at a wire budget of CAP / 2 (k=1, no audio: stripeKbpsFor = v × 1.05 + 15).
+  const settle = (0.85 * (CAP / 2 - 15)) / 1.05
+  const capped = await waitFor(state, (st) => st.kbps <= settle * 1.15, 30_000, 'bitrate under the cap')
+  console.log('capped uplink:', JSON.stringify(capped))
+  expect(capped.rate.limit).toBe('uplink')
+  expect(capped.uplinkKbps!).toBeLessThan(CAP * 1.1)
+  // It stays there (no oscillation back up to the chosen quality), and both viewers keep playing.
+  const kbpsSeen: number[] = []
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 2000))
+    kbpsSeen.push((await state()).kbps)
   }
-  await waitFor(state, (s) => s.kbps < KBPS, 25_000, 'throttled on a full uplink')
-  console.log('both backed up, RTT inflated:', JSON.stringify(await state()))
+  console.log('settled:', kbpsSeen.join(' '), 'target', Math.round(settle))
+  for (const k of kbpsSeen) {
+    expect(k).toBeLessThanOrEqual(settle * 1.15)
+    expect(k).toBeGreaterThanOrEqual(settle * 0.6)
+  }
+  const ss = await Promise.all([a, b].map(viewerSnapshot))
+  expect(ss.every((s) => s.fps > 10)).toBe(true)
 })

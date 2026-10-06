@@ -1,5 +1,6 @@
 // Per-connection stats from RTCPeerConnection.getStats(), and a path RTT history per connection.
-// Pure (no browser APIs), for unit tests with fixture reports.
+// Pure (no browser APIs), for unit tests with fixture reports. For display only (the Peers panel and
+// Stats): no bitrate or capacity decision uses them.
 //
 // The round-trip time is the selected ICE candidate pair's: the STUN checks a connected pair keeps
 // sending (Chrome: one every ~2.6 s). They share the connection's UDP socket, so they wait in any
@@ -182,7 +183,7 @@ export function rttInflationThreshold(baselineMs: number, floorMs: number, share
 export const RTT_MIN_SAMPLES = 3
 
 /**
- * Queueing on the path to one peer, from its connections' stats. All connections of a pair share
+ * Queueing on the path to one peer, from its connections' stats (shown as "+N ms" in the Peers panel). All connections of a pair share
  * the path, so it counts as inflated only when every connection with a fresh RTT and enough history
  * is (one connection's lone spike isn't queueing); `inflationMs` is the smallest. Null when no
  * connection qualifies: the RTT signal is unavailable.

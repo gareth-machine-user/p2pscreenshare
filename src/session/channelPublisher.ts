@@ -42,8 +42,8 @@ export interface PublisherContext {
   announce(): void
   /** This peer's encoder and uplink over the last window (Topology panel). */
   publisherStats(): { encoder: EncoderRates | null; uplink: UplinkRates | null }
-  /** This peer's link to another, over the last window. */
-  linkRate(peer: string): { drops: number; queueMs: number; congested: boolean } | null
+  /** This peer's link to another, over the last window (Topology panel). */
+  linkRate(peer: string): { drops: number; queueMs: number; backlogged: boolean; capKbps: number | null } | null
   onChange(): void
 }
 
@@ -66,8 +66,6 @@ const STRIPE_SAMPLE_MS = 250
 const STRIPE_SAMPLES = 40
 /** Audience upload counts as short when supply is below 90% of demand for this long. */
 const SHORT_SUPPLY_FOR_MS = 10_000
-/** At most this often, an overcommitted channel asks its subscribers to re-measure their upload. */
-const REPROBE_ASK_MS = 60_000
 
 export interface ChannelSubscriber {
   id: string
@@ -123,7 +121,6 @@ export class ChannelPublisher {
   /** Excess lateness of parents, from children's reports, and which have been late too long. */
   private late = new LateParentTracker()
   private shortSince: number | null = null
-  private lastReprobeAsk = 0
   /** Set while the audience can't carry this channel: a bitrate it could carry. */
   limited: { feasibleKbps: number; ratio: number } | null = null
 
@@ -558,11 +555,6 @@ export class ChannelPublisher {
     for (const c of result.changes) this.apply(c)
     this.sendPositions(result)
     if (deficitChanged) this.ctx.announce()
-    // Overcommitted: maybe the audience's estimates are stale (a network got better). Ask.
-    if (result.overcommitted > 0 && now - this.lastReprobeAsk > REPROBE_ASK_MS) {
-      this.lastReprobeAsk = now
-      for (const sub of this.subscribers.values()) if (sub.active) this.send(sub.id, { t: 'reprobe', ch: this.id })
-    }
     this.ctx.onChange()
   }
 

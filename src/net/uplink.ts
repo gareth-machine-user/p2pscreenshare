@@ -5,7 +5,7 @@ import { tuning } from '../tuning'
 // (T2, then T1) expire first, so overloaded relays degrade frame rate instead of stalling the
 // base layer.
 const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
-/** Replays and probe data are sent only while the channel's send buffer holds less than this (bytes). */
+/** Replays and headroom-probe data are sent only while the channel's send buffer holds less than this (bytes). */
 export const REPLAY_BUFFER_MAX = 64 * 1024
 
 /**
@@ -13,7 +13,7 @@ export const REPLAY_BUFFER_MAX = 64 * 1024
  * long is stalled (ms). A path at any rate drains something every round trip; what stops a whole
  * SCTP association instead is loss recovery by retransmission timeout (Chromium's minimum is
  * ~400 ms, doubling on each repeat), e.g. after a burst overflowed the connection's 64 KB UDP
- * socket buffer. A stall is that connection's, not a full uplink: it isn't congestion.
+ * socket buffer. A stall is that connection's alone: its windows say nothing about capacity.
  */
 export const STALL_MS = 750
 
@@ -33,8 +33,17 @@ interface Item {
   maxAge: number
 }
 
-/** Live-media counters for one link (cumulative). */
+/** Counters for one link (cumulative). Live media only, except where noted. */
 export interface LinkCounters {
+  /** Every byte handed to the channel: live media, replays and background (probe) data. */
+  handedBytes: number
+  /**
+   * How long the link's queue has held something, up to `busySince` (ms). A link whose queue never
+   * empties over a window carried all it could: it was backlogged (session/capacity.ts).
+   */
+  busyMs: number
+  /** Since when the queue has been non-empty, or null while it is empty. */
+  busySince: number | null
   sentItems: number
   /** Live-media bytes handed to the channel (with bufferedAmount, how long its buffer takes to drain). */
   sentBytes: number
@@ -55,7 +64,7 @@ export interface UplinkStats {
   queuedBytes: number
   /** Media items dropped for missing their queueing deadline, by temporal layer (T0..T3). */
   droppedByLayer: number[]
-  /** Background (probe) items dropped. */
+  /** Background (headroom probe) items dropped. */
   droppedBackground: number
   /** GOP-cache replay items dropped (a new child's catch-up, not live media: not a congestion signal). */
   droppedReplay: number
@@ -110,10 +119,7 @@ export class Uplink {
   private background = new Map<MediaLink, number>()
   /** Per link: frames that already lost a fragment there (until when to remember them). */
   private deadFrames = new Map<MediaLink, Map<string, number>>()
-  /**
-   * Per-link live-media counters: a full uplink congests most links at once, while one slow
-   * receiver (its downlink or path) congests only its own link.
-   */
+  /** Per-link counters (session/capacity.ts measures each connection's delivered rate from them). */
   readonly perLink = new Map<MediaLink, LinkCounters>()
   /** Per link: its send buffer as last seen (plus what was sent into it since), and when it last drained. */
   private progress = new Map<MediaLink, { buffered: number; at: number; stalled: boolean }>()
@@ -121,7 +127,7 @@ export class Uplink {
   private counters(link: MediaLink): LinkCounters {
     let c = this.perLink.get(link)
     if (!c) {
-      c = { sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0, lastStallAt: -Infinity, stallEpisodes: 0 }
+      c = { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0, lastStallAt: -Infinity, stallEpisodes: 0 }
       this.perLink.set(link, c)
     }
     return c
@@ -159,9 +165,35 @@ export class Uplink {
     return this.stalledMs(link, now) >= STALL_MS
   }
 
+  /** How long `link`'s queue has held something in total (ms), up to `now`. */
+  busyMs(link: MediaLink, now = performance.now()): number {
+    const c = this.perLink.get(link)
+    if (!c) return 0
+    return c.busyMs + (c.busySince !== null ? now - c.busySince : 0)
+  }
+
+  /** How long the oldest item waiting for `link` has waited (ms); 0 when nothing waits. */
+  headAgeMs(link: MediaLink, now = performance.now()): number {
+    const q = this.queues.get(link)
+    if (!q?.length) return 0
+    let oldest = q[0].enqueuedAt
+    for (const it of q) if (it.enqueuedAt < oldest) oldest = it.enqueuedAt
+    return now - oldest
+  }
+
+  /** Keeps the link's busy clock in step with whether its queue holds anything. */
+  private markBusy(link: MediaLink, busy: boolean, now: number): void {
+    const c = this.counters(link)
+    if (busy && c.busySince === null) c.busySince = now
+    else if (!busy && c.busySince !== null) {
+      c.busyMs += now - c.busySince
+      c.busySince = null
+    }
+  }
+
   /**
-   * Marks a link as background. `bufferMax` bounds its send buffer (default REPLAY_BUFFER_MAX): a
-   * probe raises it on fast links, where 64 KB drains in a few ms and would cap the measurement.
+   * Marks a link as background (a headroom probe's `bin` channel). `bufferMax` bounds its send
+   * buffer (default REPLAY_BUFFER_MAX).
    */
   setBackground(link: MediaLink, on = true, bufferMax = REPLAY_BUFFER_MAX): void {
     if (on) this.background.set(link, bufferMax)
@@ -190,6 +222,7 @@ export class Uplink {
     if (firstReplay >= 0) q.splice(firstReplay, 0, item)
     else q.push(item)
     this.stats.queuedBytes += data.byteLength
+    this.markBusy(link, true, item.enqueuedAt)
     this.drain()
   }
 
@@ -207,12 +240,25 @@ export class Uplink {
     dst.length = 0
     dst.push(...merged)
     src.length = 0
+    const now = performance.now()
+    this.markBusy(from, false, now)
+    this.markBusy(to, true, now)
     this.drain()
   }
 
   /** Items waiting for one link. */
   queued(link: MediaLink): number {
     return this.queues.get(link)?.length ?? 0
+  }
+
+  /** Drops everything waiting for `link` (a probe that ended), keeping its counters. */
+  discard(link: MediaLink): void {
+    const q = this.queues.get(link)
+    if (!q) return
+    const bg = this.background.has(link)
+    for (const it of q) this.drop(it, bg)
+    q.length = 0
+    this.markBusy(link, false, performance.now())
   }
 
   forget(link: MediaLink): void {
@@ -316,6 +362,7 @@ export class Uplink {
             // What went into the buffer isn't drained by the next look at it.
             const p = this.progress.get(link)
             if (p) p.buffered += it.data.byteLength
+            this.counters(link).handedBytes += it.data.byteLength
             this.tokens -= it.data.byteLength
             this.stats.sentBytes += it.data.byteLength
             this.stats.sentItems++
@@ -338,6 +385,7 @@ export class Uplink {
         }
         if (waitingOnTokens) break
       }
+      for (const [link, q] of this.queues) if (!q.length) this.markBusy(link, false, now)
       if (waitingOnTokens && this.timer === null) {
         this.timer = setTimeout(() => {
           this.timer = null
@@ -355,19 +403,5 @@ export class Uplink {
     if (background) this.stats.droppedBackground++
     else if (it.replay) this.stats.droppedReplay++
     else this.stats.droppedByLayer[Math.min(3, it.layer)]++
-  }
-
-  /** Paces an arbitrary payload through the token bucket (used for the upload probe). */
-  async paced(bytes: number): Promise<void> {
-    if (this.capKbps === null) return
-    for (;;) {
-      const now = performance.now()
-      this.refill(now)
-      if (this.tokens > 0) {
-        this.tokens -= bytes
-        return
-      }
-      await new Promise((r) => setTimeout(r, 4))
-    }
   }
 }

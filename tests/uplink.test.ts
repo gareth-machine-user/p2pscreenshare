@@ -182,7 +182,7 @@ describe('Uplink scheduling', () => {
     expect(u.stats.queueDelayN).toBe(2)
   })
 
-  it("a background link's send-buffer allowance can be raised (probes on fast links)", () => {
+  it("a background link's send-buffer allowance can be raised", () => {
     const u = new Uplink()
     const bg = new StubLink('bg')
     u.setBackground(bg)
@@ -353,7 +353,7 @@ describe('Uplink cap', () => {
     expect(u.stats.sentBytes).toBeLessThanOrEqual(10_500)
   })
 
-  it('reports queueing delay of sent media (the congestion-control signal)', () => {
+  it('reports queueing delay of sent media', () => {
     const u = new Uplink()
     const a = new StubLink('a')
     a.block()
@@ -366,18 +366,54 @@ describe('Uplink cap', () => {
     expect(u.stats.queueDelaySum).toBe(400)
   })
 
-  it('paces arbitrary payloads through the same bucket', async () => {
-    const u = new Uplink(80)
-    let done = false
-    void u.paced(1000).then(() => (done = true))
-    await vi.advanceTimersByTimeAsync(4)
-    expect(done).toBe(true)
-    // The probe's debt now delays media.
+})
+
+describe('Uplink capacity counters', () => {
+  it('counts every byte handed to a link, background and replays included', () => {
+    const u = new Uplink()
+    const a = new StubLink('a')
+    const bg = new StubLink('bg')
+    u.setBackground(bg)
+    u.send(a, msg(1, 100), 0)
+    u.send(a, msg(2, 50), 0, undefined, true)
+    u.send(bg, msg(3, 30), 0)
+    expect(u.perLink.get(a)).toMatchObject({ handedBytes: 150, sentBytes: 100 })
+    expect(u.perLink.get(bg)?.handedBytes).toBe(30)
+  })
+
+  it("keeps a busy clock: how long a link's queue held something", () => {
+    const u = new Uplink()
     const a = new StubLink('a')
     u.send(a, msg(1), 0)
-    await vi.advanceTimersByTimeAsync(50)
-    expect(log).toEqual([])
-    await vi.advanceTimersByTimeAsync(60)
-    expect(sentBy('a')).toEqual([1])
+    // Sent at once: never busy.
+    vi.advanceTimersByTime(100)
+    expect(u.busyMs(a)).toBe(0)
+    a.block()
+    u.send(a, msg(2), 0)
+    vi.advanceTimersByTime(300)
+    expect(u.busyMs(a)).toBe(300)
+    expect(u.headAgeMs(a)).toBe(300)
+    a.unblock()
+    u.kick()
+    vi.advanceTimersByTime(500)
+    expect(u.busyMs(a)).toBe(300)
+    expect(u.headAgeMs(a)).toBe(0)
+  })
+
+  it('discards what waits for a probe link, keeping its counters', () => {
+    const u = new Uplink()
+    const bg = new StubLink('bg')
+    u.setBackground(bg)
+    u.send(bg, msg(1, 20), 0)
+    bg.block()
+    u.send(bg, msg(2, 20), 0)
+    u.send(bg, msg(3, 20), 0)
+    vi.advanceTimersByTime(100)
+    u.discard(bg)
+    expect(u.queued(bg)).toBe(0)
+    expect(u.stats.queuedBytes).toBe(0)
+    expect(u.stats.droppedBackground).toBe(2)
+    expect(u.perLink.get(bg)?.handedBytes).toBe(20)
+    expect(u.busyMs(bg)).toBe(100)
   })
 })

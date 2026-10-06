@@ -31,7 +31,7 @@
       const r = recs.get(p.id)!
       const self = p.self
       const unreachable = new Set([...r.unreachable, ...all.filter((o) => o.unreachable.includes(r.id)).map((o) => o.id)])
-      const path = self ? undefined : session.pathQueue.get(r.id)
+      const path = self ? null : session.pathQueueFor(r.id)
       return {
         id: p.id,
         name: p.name,
@@ -43,21 +43,25 @@
         // Path RTT from getStats; before the first poll, the gossiped one.
         rtt: self ? null : (p.rttMs ?? mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
         baseline: p.baselineMs,
+        // Its uplink's capacity as it gossips it (yours: what you measured), and what your
+        // connections to it carry (session/capacity.ts).
         capacity: p.estKbps,
+        linkCap: p.capKbps,
+        bound: p.bound,
         // Live, on the wire: you → that peer and back; for "you", your totals.
         send: p.sendKbps,
         recv: p.recvKbps,
         breakdown: p.breakdown,
         links: p.links,
         inflationMs: path?.inflationMs ?? null,
-        pathQueued: path?.queued ?? null,
+        pathQueued: path?.queued ?? false,
         unreachable: unreachable.size,
         // Can't reach a good part of the lobby: it only gets the stripes it can reach.
         limited: n > 2 && unreachable.size >= Math.max(1, Math.floor((n - 1) / 3)),
       }
     })
   })
-  const cols = $derived(onkick ? 8 : 7)
+  const cols = $derived(onkick ? 9 : 8)
 </script>
 
 <div class="table-wrap" data-testid="peers-panel">
@@ -69,7 +73,8 @@
         <th title="Live: what you receive from this peer right now (on the wire, last 2 s)">Receiving</th>
         <th title="Path round-trip time now / its 2-minute minimum (ICE candidate pair)">RTT now / base</th>
         <th>Link</th>
-        <th class="secondary" title="Measured upload capacity from the last probe; not current use">Est. upload</th>
+        <th title="What your connections to this peer carry (most delivered while they were backlogged, or in the last headroom probe); &quot;limit&quot;: the peer's own connection was the bottleneck">Carries</th>
+        <th class="secondary" title="The peer's uplink capacity as it measured and gossips it; not current use">Est. upload</th>
         <th>Unreachable</th>
         {#if onkick}<th></th>{/if}
       </tr>
@@ -92,7 +97,8 @@
             {#if r.pathQueued}<span class="badge warn" title="Path RTT {r.inflationMs} ms above its baseline: queueing in the network">+{r.inflationMs} ms</span>{/if}
           </td>
           <td data-testid="link-status">{r.status}{#if r.lanes > 1}<span class="badge" data-testid="lanes" title="Connections carrying media to this peer">{r.lanes} lanes</span>{:else if r.turn}<span class="badge" title="Relayed through TURN: a single connection">TURN</span>{/if}</td>
-          <td class="secondary" title="Measured upload capacity from the last probe; not current use">{fmtKbps(r.capacity)}</td>
+          <td data-testid="link-capacity">{#if !r.self}{fmtKbps(r.linkCap)}{#if r.bound}<span class="badge warn" title="Its connections were backlogged while the rest of your uplink wasn't: this is what they carry">limit</span>{/if}{/if}</td>
+          <td class="secondary" data-testid="est-upload" title="The peer's uplink capacity as it measured and gossips it; not current use">{fmtKbps(r.capacity)}</td>
           <td data-testid="unreachable-count">{r.unreachable || ''}</td>
           {#if onkick}
             <td>
@@ -108,7 +114,10 @@
                 <span title="Send / receive rate on the wire (getStats)">↑ {fmtMbps(l.sendKbps)} ↓ {fmtMbps(l.recvKbps)}</span>
                 <span title="Path RTT now / its 2-minute minimum (ICE candidate pair)" class:stale={!l.fresh}>RTT {fmtMs(l.rttMs)} / {fmtMs(l.baselineMs)}{l.fresh ? '' : ' (stale)'}</span>
                 {#if l.queueMs !== null}
-                  <span title="Live media: time queued (uplink + send buffer) and fragments dropped per second" class:warn={l.congested}>queue {fmtMs(l.queueMs)} · {l.drops} drops/s</span>
+                  <span title="Live media: time queued in the uplink and fragments dropped per second; backlogged: its queue never emptied" class:warn={l.backlogged}>queue {fmtMs(l.queueMs)} · {l.drops} drops/s{l.backlogged ? ' · backlogged' : ''}</span>
+                {/if}
+                {#if l.deliveredKbps !== null || l.capKbps !== null}
+                  <span title="Delivered over the last window (all channels) / what this connection carries">delivered {fmtMbps(l.deliveredKbps)} / carries {fmtMbps(l.capKbps)}{l.bound ? ' (limit)' : ''}</span>
                 {/if}
                 {#if l.stalled}<span class="badge warn" title="This connection's send buffer stopped draining for a while (an SCTP stall, not congestion): its stripes moved to another connection meanwhile" data-testid="lane-stalled">stalled</span>{/if}
                 {#if l.relayed}<span class="badge">relayed</span>{/if}

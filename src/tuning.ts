@@ -17,14 +17,6 @@ export interface Tuning {
   playoutMinDelayMs: number
   /** How long the media data channel keeps retransmitting a lost packet (ms). */
   mediaMaxPacketLifeTimeMs: number
-  /** Congestion control backs off when sent fragments waited longer than this on average (ms). */
-  ccQueueMs: number
-  /**
-   * Path RTT inflation (ms above the baseline) that means queueing in the network, at least: the
-   * threshold is max(this, half the baseline). Only then does a congested link count towards a full
-   * uplink (capacity.ts uplinkIsFull).
-   */
-  ccRttInflationMs: number
   /** A stripe silent this long means its parent is gone or stalled (ms). */
   stripeSilenceMs: number
   keyframeIntervalMs: number
@@ -40,8 +32,6 @@ const PROFILES: Record<Tuning['priority'], Tuning> = {
     playoutSafetyMs: 120,
     playoutMinDelayMs: 150,
     mediaMaxPacketLifeTimeMs: 3000,
-    ccQueueMs: 800,
-    ccRttInflationMs: 40,
     stripeSilenceMs: 1500,
     // Keyframes are expensive (and in constant-bitrate mode each one briefly blurs the picture to
     // fit the budget), so they come rarely: joiners start from relays' cached GOP, and a viewer
@@ -57,8 +47,6 @@ const PROFILES: Record<Tuning['priority'], Tuning> = {
     playoutSafetyMs: 40,
     playoutMinDelayMs: 30,
     mediaMaxPacketLifeTimeMs: 1000,
-    ccQueueMs: 250,
-    ccRttInflationMs: 25,
     stripeSilenceMs: 1000,
     keyframeIntervalMs: 2000,
   },

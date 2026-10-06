@@ -5,9 +5,9 @@ import { blockMainThreadExpr, DIAG_PRESETS, formatTimeline, hostSampleExpr, inje
 
 // Opt-in diagnostic (E2E_DIAG=1): a presenter and one viewer on this machine, no upload cap, at a
 // high quality preset, with a high-entropy test pattern (the encoder runs at its full bitrate).
-// Samples both pages every second and prints a timeline of the congestion controller's inputs and
-// decisions, so a bitrate cut between two local tabs (where the network can't be the bottleneck)
-// can be traced to what fired it.
+// Samples both pages every second and prints a timeline of the rate control's inputs and decisions
+// (delivered rate and backlog per connection, measured capacity, the bitrate and what limits it),
+// so a bitrate cut between two local tabs (where the network can't be the bottleneck) can be traced.
 //
 //   E2E_DIAG=1 DIAG_PRESET=ultra DIAG_SECONDS=75 DIAG_OUT=/tmp/diag.json npx playwright test diag-congestion
 //
@@ -15,7 +15,7 @@ import { blockMainThreadExpr, DIAG_PRESETS, formatTimeline, hostSampleExpr, inje
 // 2.5 Mbps, Auto quality). DIAG_PATTERN=bars: the plain test pattern (~2 Mbps whatever the
 // preset); bursty: still, with a burst of motion every 4 s (a mostly static screen).
 // DIAG_STALL=lane,ms,everyMs emulates SCTP association stalls on one presenter connection;
-// DIAG_BLOCK=ms,everyMs blocks the presenter's main thread.
+// DIAG_BLOCK=ms,everyMs blocks the presenter's main thread. DIAG_UP=kbps caps the presenter's upload.
 // Playwright keeps every page visible; tools/diag-tabs.ts runs the same with real background tabs.
 
 test.afterEach(closeContexts)
@@ -28,12 +28,14 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
   test.setTimeout((seconds + 120) * 1000)
   const seed = `e2e-diag-${Date.now()}`
   // No upload cap (openHost's default cap would be the bottleneck).
+  // DIAG_UP=kbps: the presenter's debug upload cap (a token bucket in its uplink) instead of none.
+  const up = process.env.DIAG_UP ? Number(process.env.DIAG_UP) : null
   const host = await openHost(browser, seed, {
     k: 4,
     m: 1,
     bitrate: preset.bitrate,
     res: preset.res,
-    up: null,
+    up,
     pattern: process.env.DIAG_PATTERN === 'bars' ? undefined : process.env.DIAG_PATTERN === 'bursty' ? 'bursty' : 'busy',
     autoQuality: presetName === 'auto',
   })
@@ -61,11 +63,11 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
     const [h, v]: any[] = await Promise.all([host.evaluate(hostSampleExpr(viewerId)), viewer.evaluate(viewerSampleExpr(hostId))])
     const prev = rows.at(-1)
     rows.push({ t: Math.round((Date.now() - t0) / 100) / 10, h, v })
-    if (prev && h.kbps !== prev.h.kbps) console.log(`[${rows.at(-1)!.t}s] bitrate ${prev.h.kbps} -> ${h.kbps}: ${h.ccReason}`)
+    if (prev && h.kbps !== prev.h.kbps) console.log(`[${rows.at(-1)!.t}s] bitrate ${prev.h.kbps} -> ${h.kbps}: ${JSON.stringify(h.rate)}`)
     if (h.localLoad && !prev?.h.localLoad) console.log(`[${rows.at(-1)!.t}s] local load: ${JSON.stringify(h.localLoad)}`)
     await new Promise((r) => setTimeout(r, Math.max(0, 1000 - (Date.now() - tick))))
   }
-  console.log(`preset ${presetName} (${preset.bitrate} kbps ${preset.res}), ${seconds} s`)
+  console.log(`preset ${presetName} (${preset.bitrate} kbps ${preset.res}), ${seconds} s${up ? `, upload cap ${up} kbps` : ''}`)
   console.log(formatTimeline(rows))
   if (process.env.DIAG_OUT) writeFileSync(process.env.DIAG_OUT, JSON.stringify({ preset: presetName, rows }, null, 1))
 })

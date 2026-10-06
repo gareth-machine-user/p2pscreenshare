@@ -1,193 +1,293 @@
 import { describe, expect, it } from 'vitest'
-import { stripeKbpsFor, uplinkIsFull } from '../src/session/capacity'
-import { CongestionController, videoKbpsForWire, type CongestionSample } from '../src/session/congestion'
+import { CapacityModel, FROZEN_LAG_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
+import { BitrateController, DOWN_GAP_MS, rateTarget, TARGET_SHARE, upperMedian, videoKbpsForWire, type RateInputs } from '../src/session/congestion'
 import { LINK_BUFFER_HIGH } from '../src/net/link'
 
-// A presenter with one viewer: k=4, m=1, audio, so the presenter sends all 5 stripes over one
-// WebRTC connection whose congestion control tops out at `ceiling` (wire kbps).
+// k=4, m=1 with audio: every direct child gets one full copy, all 5 stripes.
 const K = 4
-const COPIES = 5
+const STRIPES = 5
 const QUALITY = 16_000
-const ownWire = (v: number) => COPIES * stripeKbpsFor(v, K, true)
-/** The best video bitrate a wire ceiling can carry (no other traffic). */
-const sustainable = (wire: number) => videoKbpsForWire(wire, ownWire)
+const wireAt = (v: number) => STRIPES * stripeKbpsFor(v, K, true)
+/** The best video bitrate a full-copy wire rate can carry. */
+const sustainable = (wire: number) => videoKbpsForWire(wire, wireAt)
+/** What the controller settles at for a given full-copy wire budget. */
+const settleAt = (wire: number) => TARGET_SHARE * sustainable(wire)
 
-/** publishedStream.ts PublishedStream.adaptBitrate: clamp to [300, ceiling], 50 kbps steps. */
-const applyRate = (kbps: number, ceiling: number) => Math.round(Math.min(ceiling, Math.max(300, kbps)) / 50) * 50
+/** publishedStream.ts PublishedStream.adaptBitrate: clamp to [300, chosen], 50 kbps steps. */
+const applyRate = (kbps: number, chosen: number) => Math.round(Math.min(chosen, Math.max(300, kbps)) / 50) * 50
 
-/** The policy this replaced (PeerSession.adaptBitrate before congestion.ts), for comparison. */
-class OldPolicy {
-  private lastDown = -Infinity
-  private lastUp = -Infinity
-  private cleanSince: number | null = null
-  sample(s: CongestionSample): { kbps: number } | null {
-    if (s.full) {
-      this.cleanSince = null
-      if (s.now - this.lastDown >= 4000 && s.currentKbps > 300) {
-        this.lastDown = s.now
-        const severe = s.dropsPerS > 50 || s.queueMs > 1600
-        return { kbps: s.currentKbps * (severe ? 0.5 : 0.75) }
-      }
-      return null
-    }
-    this.cleanSince ??= s.now
-    if (s.currentKbps < s.maxKbps && s.now - this.cleanSince >= 5000 && s.now - this.lastUp >= 5000) {
-      this.lastUp = s.now
-      return { kbps: Math.min(s.maxKbps, s.currentKbps * 1.25) }
-    }
-    return null
-  }
-}
+const base: RateInputs = { chosenKbps: QUALITY, audienceKbps: null, uplinkKbps: null, directChildren: 1, peerKbps: [null], wireAt }
 
-interface Policy {
-  sample(s: CongestionSample): { kbps: number } | null
-}
+describe('bitrate target', () => {
+  it('converts wire to video kbps consistently with stripeKbpsFor', () => {
+    expect(sustainable(wireAt(10_000))).toBeCloseTo(10_000, 0)
+    expect(sustainable(100)).toBe(0) // less than the per-stripe constants
+  })
+
+  it('keeps the chosen quality with nothing measured, or capacity to spare', () => {
+    expect(rateTarget(base)).toMatchObject({ kbps: QUALITY, limit: 'chosen' })
+    expect(rateTarget({ ...base, uplinkKbps: 200_000 })).toMatchObject({ kbps: QUALITY, limit: 'chosen' })
+    // Nobody watching: nothing to divide by.
+    expect(rateTarget({ ...base, uplinkKbps: 1000, directChildren: 0, peerKbps: [] })).toMatchObject({ kbps: QUALITY, limit: 'chosen' })
+  })
+
+  it('a fixed-capacity link: 85% of what it carries', () => {
+    const t = rateTarget({ ...base, uplinkKbps: 14_000 })
+    expect(t.limit).toBe('uplink')
+    expect(t.kbps).toBeCloseTo(settleAt(14_000))
+  })
+
+  it('a shared uplink: divided among the direct children', () => {
+    const t = rateTarget({ ...base, uplinkKbps: 20_000, directChildren: 4, peerKbps: [null, null, null, null] })
+    expect(t).toMatchObject({ limit: 'uplink', uplinkPerChildKbps: 5000 })
+    expect(t.kbps).toBeCloseTo(settleAt(5000))
+  })
+
+  it('one slow viewer: the median protects the others', () => {
+    const t = rateTarget({ ...base, uplinkKbps: 100_000, directChildren: 3, peerKbps: [null, 2000, null] })
+    expect(t).toMatchObject({ kbps: QUALITY, limit: 'chosen', medianPeerKbps: null })
+    // One of two isn't the median either.
+    expect(rateTarget({ ...base, uplinkKbps: 100_000, directChildren: 2, peerKbps: [2000, null] }).limit).toBe('chosen')
+  })
+
+  it('most viewers slow: their median', () => {
+    const t = rateTarget({ ...base, uplinkKbps: 100_000, directChildren: 3, peerKbps: [3000, 4000, null] })
+    expect(t).toMatchObject({ limit: 'viewers', medianPeerKbps: 4000 })
+    expect(t.kbps).toBeCloseTo(settleAt(4000))
+    expect(upperMedian([5, 1, 3, 2])).toBe(3)
+  })
+
+  it('never above what the audience can relay', () => {
+    expect(rateTarget({ ...base, uplinkKbps: 100_000, audienceKbps: 6000 })).toMatchObject({ kbps: 6000, limit: 'audience' })
+  })
+})
+
+describe('bitrate pacing', () => {
+  const t = (kbps: number, limit: 'uplink' | 'chosen' = 'uplink') => ({ kbps, limit, uplinkPerChildKbps: null, medianPeerKbps: null })
+
+  it('down at once, at most every 4 s; up by at most 25% per 10 s; small changes ignored', () => {
+    const c = new BitrateController()
+    expect(c.step(0, 16_000, t(8000))).toBe(8000)
+    expect(c.step(2000, 8000, t(4000))).toBeNull()
+    expect(c.step(DOWN_GAP_MS, 8000, t(4000))).toBe(4000)
+    // Up: not within 10 s of a cut, then +25% at most, then again 10 s later.
+    expect(c.step(10_000, 4000, t(16_000, 'chosen'))).toBeNull()
+    expect(c.step(14_000, 4000, t(16_000, 'chosen'))).toBe(5000)
+    expect(c.step(20_000, 5000, t(16_000, 'chosen'))).toBeNull()
+    expect(c.step(24_000, 5000, t(16_000, 'chosen'))).toBe(6250)
+    // Within 5%: noise.
+    expect(c.step(40_000, 6250, t(6400))).toBeNull()
+    expect(c.step(40_000, 6250, t(6000))).toBeNull()
+    // But back to the chosen quality from just below it.
+    expect(c.step(40_000, 15_800, t(16_000, 'chosen'))).toBe(16_000)
+  })
+})
 
 /**
- * One link, simulated in 100 ms ticks: what the stream (plus `other` kbps) offers goes through the
- * data channel's send buffer (LINK_BUFFER_HIGH, invisible to queueing stats) into the uplink's
- * queue; the link drains `ceiling(t)` kbps. Fragments queued past ~1.5 s (a mix of the per-layer
- * deadlines) are dropped. Every 2 s the policy sees a sample, as PeerSession.adaptBitrate does,
- * with uplinkIsFull's single-link test (the probe measured the same connection: probe ≈ ceiling).
+ * A presenter feeding `children` viewers one full copy each, simulated in 100 ms ticks. Viewer i's
+ * connection carries at most `link(t)[i]` kbps and all of them share the uplink's `uplink(t)` kbps
+ * (fair shares). Each connection has an uplink queue in front of a 64 KiB send buffer; fragments
+ * waiting longer than 1.5 s are dropped. Every 2 s the estimator (CapacityModel) sees one window
+ * per connection, and the controller moves the bitrate, as PeerSession does. While no connection is
+ * backlogged, a 1.5 s headroom probe runs every 30 s: background bytes on every connection, after
+ * media.
  */
-function simulate(policy: Policy, ceiling: (t: number) => number, seconds: number, other = 0) {
+function simulate(o: {
+  seconds: number
+  uplink: (t: number) => number
+  link: (t: number, i: number) => number
+  children?: number
+  /** A connection stalls (delivers nothing) at time t. */
+  stalled?: (t: number, i: number) => boolean
+  /** The page is frozen at time t (the windows say so). */
+  frozen?: (t: number) => boolean
+  audienceKbps?: number
+}) {
   const TICK = 0.1
-  const bufferKbit = (LINK_BUFFER_HIGH * 8) / 1000
-  const FRAGMENT_KBIT = 1.1 * 8
+  const n = o.children ?? 1
+  const bufKbit = (LINK_BUFFER_HIGH * 8) / 1000
+  const model = new CapacityModel()
+  const ctl = new BitrateController()
   let v = QUALITY
-  let backlog = 0 // kbit, send buffer + app queue
-  let win = { sent: 0, drops: 0, qSum: 0, n: 0 }
+  const links = Array.from({ length: n }, () => ({ q: 0, buf: 0, delivered: 0, busy: 0, stalledInWin: false }))
+  let lastProbe = -Infinity
+  let probe: { until: number; delivered: number[] } | null = null
+  let backloggedLast = false
+  let frozenInWin = false
   const rates: { t: number; kbps: number }[] = []
   let changes = 0
-  for (let i = 1; i <= seconds / TICK; i++) {
+  for (let i = 1; i <= o.seconds / TICK; i++) {
     const t = i * TICK
-    const c = ceiling(t)
-    backlog += (ownWire(v) + other) * TICK
-    const sent = Math.min(backlog, c * TICK)
-    backlog -= sent
-    const appQueue = Math.max(0, backlog - bufferKbit)
-    const maxQueue = 1.5 * c
-    if (appQueue > maxQueue) {
-      win.drops += (appQueue - maxQueue) / FRAGMENT_KBIT
-      backlog -= appQueue - maxQueue
+    const offered = wireAt(v) * TICK
+    // Probing: every 30 s (first at 1 s) while nothing is backlogged.
+    if (!probe && !backloggedLast && (lastProbe === -Infinity ? t >= 1 : t - lastProbe >= 30)) {
+      probe = { until: t + 1.5 - TICK, delivered: links.map(() => 0) }
+      lastProbe = t
     }
-    win.sent += sent
-    win.qSum += (Math.min(appQueue, maxQueue) / c) * 1000
-    win.n++
+    // Media into the queues and on into the send buffers.
+    for (const l of links) {
+      l.q += offered
+      const move = Math.min(l.q, bufKbit - l.buf)
+      l.q -= move
+      l.buf += move
+    }
+    // Fair shares of the uplink, each connection capped by its own rate: media first, then probes.
+    let room = o.uplink(t) * TICK
+    const cap = links.map((_, j) => (o.stalled?.(t, j) ? 0 : o.link(t, j) * TICK))
+    const fill = (demand: number[]) => {
+      const got = demand.map(() => 0)
+      let open = demand.map((d, j) => (d > 0 ? j : -1)).filter((j) => j >= 0)
+      while (open.length && room > 1e-9) {
+        const share = room / open.length
+        for (const j of open) {
+          const take = Math.min(share, demand[j] - got[j])
+          got[j] += take
+          room -= take
+        }
+        open = open.filter((j) => demand[j] - got[j] > 1e-9)
+      }
+      return got
+    }
+    // The buffer refills on buffer-low events as it drains: the queue goes out too, within the tick.
+    const media = fill(links.map((l, j) => Math.min(l.buf + l.q, cap[j])))
+    const bg = probe ? fill(links.map((_, j) => cap[j] - media[j])) : links.map(() => 0)
+    links.forEach((l, j) => {
+      const fromBuf = Math.min(l.buf, media[j])
+      l.buf -= fromBuf
+      l.q -= media[j] - fromBuf
+      l.delivered += media[j] + bg[j]
+      if (probe) probe.delivered[j] += media[j] + bg[j]
+      const move = Math.min(l.q, bufKbit - l.buf)
+      l.q -= move
+      l.buf += move
+      // Fragments past their deadline (about 1.5 s of the offered rate) are dropped.
+      l.q = Math.min(l.q, (offered / TICK) * 1.5)
+      if (l.q > 0) l.busy += TICK
+      if (o.stalled?.(t, j)) l.stalledInWin = true
+    })
+    if (o.frozen?.(t)) frozenInWin = true
+    if (probe && t >= probe.until - 1e-9) {
+      const pw: ConnWindow[] = probe.delivered.map((d, j) => ({ id: j, peer: `p${j}`, kbps: d / 1.5, active: true, backlogged: true, stalled: false, queueMs: 0 }))
+      model.update(t * 1000, pw, { probe: true })
+      probe = null
+    }
     if (i % 20 === 0) {
-      const sentKbps = win.sent / 2
-      const dropsPerS = win.drops / 2
-      const queueMs = win.qSum / win.n
-      const congested = dropsPerS > 2 || queueMs > 800
-      // The ceiling is the path bottleneck (the uplink itself): its queue shows as path RTT inflation.
-      const full = !!uplinkIsFull([{ congested, drops: dropsPerS, pathQueued: queueMs > 40 }])
-      const d = policy.sample({ now: t * 1000, full, sentKbps, currentKbps: v, maxKbps: QUALITY, dropsPerS, queueMs, ownWireKbpsAt: ownWire })
-      if (d) {
-        const next = applyRate(d.kbps, QUALITY)
-        if (next !== v) changes++
-        v = next
+      const windows: ConnWindow[] = links.map((l, j) => ({
+        id: j,
+        peer: `p${j}`,
+        kbps: l.delivered / 2,
+        active: true,
+        backlogged: l.busy >= 1.8 - 1e-9,
+        stalled: l.stalledInWin,
+        queueMs: (l.q / (offered / TICK)) * 1000,
+      }))
+      model.update(t * 1000, windows, { frozen: frozenInWin })
+      backloggedLast = windows.some((w) => w.backlogged)
+      for (const l of links) Object.assign(l, { delivered: 0, busy: 0, stalledInWin: false })
+      frozenInWin = false
+      const peerKbps = links.map((_, j) => {
+        const p = model.peer(`p${j}`)
+        return p.bound ? p.kbps : null
+      })
+      const target = rateTarget({ chosenKbps: QUALITY, audienceKbps: o.audienceKbps ?? null, uplinkKbps: model.uplinkKbps, directChildren: n, peerKbps, wireAt })
+      const next = ctl.step(t * 1000, v, target)
+      if (next !== null) {
+        const r = applyRate(next, QUALITY)
+        if (r !== v) changes++
+        v = r
       }
       rates.push({ t, kbps: v })
-      win = { sent: 0, drops: 0, qSum: 0, n: 0 }
     }
   }
-  return { rates, changes }
+  return { rates, changes, model }
 }
 
 const between = (rates: { t: number; kbps: number }[], from: number, to: number) => rates.filter((r) => r.t > from && r.t <= to).map((r) => r.kbps)
 const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length
+const range = (xs: number[]) => `${Math.round(mean(xs))} [${Math.min(...xs)}..${Math.max(...xs)}]`
 
-export { simulate, OldPolicy }
-describe('congestion controller', () => {
-  it('converts wire to video kbps consistently with stripeKbpsFor', () => {
-    expect(sustainable(ownWire(10_000))).toBeCloseTo(10_000, 0)
-    expect(sustainable(100)).toBe(0) // less than the per-stripe constants
-  })
-
-  it('settles near the rate one 14 Mbps connection carries, without 16 → 8 oscillation', () => {
+describe('estimator and controller, end to end', () => {
+  it('settles near what one 14 Mbps connection carries, without 16 → 8 oscillation', () => {
     const max = sustainable(14_000) // ≈ 10.2 Mbps of video
-    const neu = simulate(new CongestionController(), () => 14_000, 180)
-    const old = simulate(new OldPolicy(), () => 14_000, 180)
-    const settled = between(neu.rates, 40, 180)
-    const oldSettled = between(old.rates, 40, 180)
-    // Documentation: the numbers this test pins down.
-    console.log(
-      `ceiling 14 Mbps wire (max ${Math.round(max)} kbps video): new mean ${Math.round(mean(settled))} [${Math.min(...settled)}..${Math.max(...settled)}] ` +
-        `${neu.changes} changes; old mean ${Math.round(mean(oldSettled))} [${Math.min(...oldSettled)}..${Math.max(...oldSettled)}] ${old.changes} changes`,
-    )
-    for (const r of settled) {
-      expect(r).toBeGreaterThanOrEqual(max * 0.8)
-      expect(r).toBeLessThanOrEqual(max * 1.1)
-    }
-    expect(mean(settled)).toBeGreaterThan(max * 0.85)
-    expect(neu.changes).toBeLessThan(old.changes)
-    expect(neu.changes).toBeLessThanOrEqual(25)
-    // The old policy swings far below the sustainable rate.
-    expect(Math.min(...oldSettled)).toBeLessThan(max * 0.7)
-    expect(mean(settled)).toBeGreaterThan(mean(oldSettled))
-  })
-
-  it('accounts for other traffic on the uplink', () => {
-    const other = 1500
-    const max = sustainable(14_000 - other)
-    const r = simulate(new CongestionController(), () => 14_000, 180, other)
-    // The other traffic is learned from the first quiet samples; after that, settled as before.
-    const settled = between(r.rates, 80, 180)
-    console.log(`ceiling 14 Mbps wire, 1.5 Mbps other (max ${Math.round(max)} kbps video): ${Math.min(...settled)}..${Math.max(...settled)}, ${r.changes} changes`)
+    const r = simulate({ seconds: 180, uplink: () => 100_000, link: () => 14_000 })
+    const settled = between(r.rates, 20, 180)
+    console.log(`one connection at 14 Mbps (sustainable ${Math.round(max)} kbps): ${range(settled)}, ${r.changes} changes`)
     for (const x of settled) {
       expect(x).toBeGreaterThanOrEqual(max * 0.8)
-      expect(x).toBeLessThanOrEqual(max * 1.1)
+      expect(x).toBeLessThanOrEqual(max * 0.95)
+    }
+    expect(r.changes).toBeLessThanOrEqual(6)
+  })
+
+  it('a shared uplink with several children: its fair share each', () => {
+    const r = simulate({ seconds: 120, uplink: () => 20_000, link: () => 50_000, children: 4 })
+    const settled = between(r.rates, 20, 120)
+    const max = sustainable(5000)
+    console.log(`4 children on a 20 Mbps uplink (sustainable ${Math.round(max)} kbps each): ${range(settled)}, ${r.changes} changes`)
+    for (const x of settled) {
+      expect(x).toBeGreaterThanOrEqual(max * 0.8)
+      expect(x).toBeLessThanOrEqual(max * 0.95)
     }
   })
 
-  it('recovers to the chosen quality when the ceiling rises', () => {
-    const r = simulate(new CongestionController(), (t) => (t < 120 ? 14_000 : 30_000), 300)
-    const reachedAt = r.rates.find((x) => x.t > 120 && x.kbps === QUALITY)?.t
-    console.log(`ceiling 14 → 30 Mbps at 120 s: back to 16 Mbps at ${reachedAt} s`)
-    expect(reachedAt).toBeDefined()
-    expect(reachedAt!).toBeLessThan(120 + 110)
-    expect(between(r.rates, 240, 300).every((x) => x === QUALITY)).toBe(true)
+  it('one slow viewer does not throttle the others', () => {
+    const r = simulate({ seconds: 90, uplink: () => 200_000, link: (_, i) => (i === 2 ? 3000 : 50_000), children: 3 })
+    console.log(`3 children, one at 3 Mbps: ${range(r.rates.map((x) => x.kbps))}; slow peer ${JSON.stringify(r.model.peer('p2'))}`)
+    expect(r.rates.every((x) => x.kbps === QUALITY)).toBe(true)
+    expect(r.model.peer('p2').bound).toBe(true)
+    expect(r.model.peer('p2').kbps).toBeLessThan(3500)
   })
 
-  it('still cuts hard on genuinely severe congestion', () => {
-    const r = simulate(new CongestionController(), (t) => (t < 60 ? 30_000 : 3_000), 120)
-    const max = sustainable(3_000)
+  it('all viewers slow: settles at what their connections carry', () => {
+    const r = simulate({ seconds: 120, uplink: () => 200_000, link: () => 6000, children: 3 })
+    const settled = between(r.rates, 20, 120)
+    const max = sustainable(6000)
+    console.log(`3 children at 6 Mbps each (sustainable ${Math.round(max)} kbps): ${range(settled)}`)
+    for (const x of settled) {
+      expect(x).toBeGreaterThanOrEqual(max * 0.8)
+      expect(x).toBeLessThanOrEqual(max * 0.95)
+    }
+  })
+
+  it('recovers to the chosen quality when capacity rises', () => {
+    const r = simulate({ seconds: 300, uplink: () => 100_000, link: (t) => (t < 120 ? 14_000 : 40_000) })
+    const reachedAt = r.rates.find((x) => x.t > 120 && x.kbps === QUALITY)?.t
+    console.log(`14 → 40 Mbps at 120 s: back to 16 Mbps at ${reachedAt} s`)
+    expect(reachedAt).toBeDefined()
+    // The next headroom probe (≤ 30 s) sees it, then +25% per 10 s.
+    expect(reachedAt!).toBeLessThan(120 + 60)
+    expect(between(r.rates, 200, 300).every((x) => x === QUALITY)).toBe(true)
+  })
+
+  it('cuts fast when capacity falls', () => {
+    const r = simulate({ seconds: 120, uplink: () => 100_000, link: (t) => (t < 60 ? 40_000 : 3000) })
     const at = (t: number) => r.rates.find((x) => x.t >= t)!.kbps
     expect(at(58)).toBe(QUALITY)
-    // Within the first few seconds, at least halved (and halved again as needed).
-    expect(at(64)).toBeLessThanOrEqual(QUALITY / 2)
-    const settled = between(r.rates, 100, 120)
-    console.log(`ceiling 30 → 3 Mbps at 60 s (max ${Math.round(max)} kbps): settled ${Math.min(...settled)}..${Math.max(...settled)}`)
+    const max = sustainable(3000)
+    // Within one or two windows of the fall.
+    expect(at(64)).toBeLessThanOrEqual(max)
+    const settled = between(r.rates, 70, 120)
+    console.log(`40 → 3 Mbps at 60 s (sustainable ${Math.round(max)} kbps): at 64 s ${at(64)}, then ${range(settled)}`)
     for (const x of settled) {
-      expect(x).toBeLessThanOrEqual(max * 1.1)
-      expect(x).toBeGreaterThanOrEqual(max * 0.6)
+      expect(x).toBeLessThanOrEqual(max)
+      expect(x).toBeGreaterThanOrEqual(max * 0.7)
     }
   })
 
-  it('halves blind when nothing gets through', () => {
-    const cc = new CongestionController()
-    const d = cc.sample({ now: 10_000, full: true, sentKbps: 0, currentKbps: 8000, maxKbps: QUALITY, dropsPerS: 200, queueMs: 2000, ownWireKbpsAt: ownWire })
-    expect(d?.kbps).toBe(4000)
-    expect(cc.hint).toBeNull()
+  it('ignores stalls: a connection that stops for a second every 10 s is not a slow uplink', () => {
+    const r = simulate({ seconds: 120, uplink: () => 100_000, link: () => 60_000, children: 2, stalled: (t, i) => i === 0 && t % 10 < 1 })
+    expect(r.rates.every((x) => x.kbps === QUALITY)).toBe(true)
   })
 
-  it('lets a ceiling hint expire after a minute clean', () => {
-    const cc = new CongestionController()
-    const base = { maxKbps: QUALITY, dropsPerS: 0, queueMs: 0, ownWireKbpsAt: ownWire }
-    cc.sample({ ...base, now: 0, full: true, sentKbps: ownWire(8000), currentKbps: 10_000, queueMs: 1000 })
-    expect(cc.hint?.kbps).toBeCloseTo(8000, -1)
-    // Clean from 2 s at 7.2 Mbps: back to 95% of the hint after 5 s, then +5% per 10 s.
-    let v = 7200
-    const ups: number[] = []
-    for (let t = 2000; t <= 70_000; t += 2000) {
-      const d = cc.sample({ ...base, now: t, full: false, sentKbps: ownWire(v), currentKbps: v })
-      if (d) {
-        v = applyRate(d.kbps, QUALITY)
-        ups.push(t)
-      }
-    }
-    expect(ups[0]).toBe(8000)
-    expect(cc.hint).toBeNull()
-    expect(v).toBeGreaterThan(8000 * 1.2)
+  it('ignores windows in which the page froze', () => {
+    // A frozen page sends nothing while it is frozen: the uplink looks slow and backlogged.
+    const r = simulate({ seconds: 120, uplink: (t) => (t > 30 && t % 12 < 1.5 ? 0 : 100_000), link: () => 60_000, frozen: (t) => t > 30 && t % 12 < 1.5 })
+    expect(FROZEN_LAG_MS).toBeLessThan(1500)
+    expect(r.rates.every((x) => x.kbps === QUALITY)).toBe(true)
+  })
+
+  it('never climbs above what the audience can relay', () => {
+    const r = simulate({ seconds: 60, uplink: () => 100_000, link: () => 100_000, audienceKbps: 7000 })
+    expect(Math.max(...between(r.rates, 5, 60))).toBe(7000)
   })
 })

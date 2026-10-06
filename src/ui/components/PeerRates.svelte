@@ -2,7 +2,7 @@
   import { fmtKbps, fmtMs } from '../route'
   import { fmtMbps, type LivePeerRow } from '../liveRates'
 
-  // Stats: every member's estimated upload (gossiped probe result), and for members this peer is
+  // Stats: every member's measured upload capacity (gossiped), and for members this peer is
   // connected to, what flows between you right now (ui/liveRates.ts livePeers).
   let { rows }: { rows: LivePeerRow[] } = $props()
 </script>
@@ -16,7 +16,7 @@
         <th title="Live: what you send to this peer (all connections, last 2 s)">Sending</th>
         <th title="Live: what you receive from this peer (all connections, last 2 s)">Receiving</th>
         <th title="Path round-trip time now / its 2-minute minimum">RTT</th>
-        <th class="secondary" title="Measured upload capacity from the last probe; not current use">Upload (est.)</th>
+        <th class="secondary" title="Its uplink's measured capacity, as it gossips it; not current use">Upload (est.)</th>
       </tr>
     </thead>
     <tbody>

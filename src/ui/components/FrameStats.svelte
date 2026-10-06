@@ -8,14 +8,17 @@
     uplink = null,
     encoder = null,
     adapting = null,
+    stalledLanes = 0,
     clamp = null,
   }: {
     loss?: LossRates | null
     renderedFps?: number | null
     uplink?: UplinkRates | null
     encoder?: EncoderRates | null
-    /** Why the presenter's bitrate last changed. */
+    /** What sets the presenter's bitrate (ui/rateText.ts). */
     adapting?: string | null
+    /** The presenter's connections that stalled in the last window. */
+    stalledLanes?: number
     /** Why the bitrate is below the chosen quality, if it is. */
     clamp?: string | null
   } = $props()
@@ -36,7 +39,8 @@
       <div><span>Encode time</span><b>{fmtMs(encoder.encodeMs)}</b></div>
       <div><span>Biggest frame</span><b>{n(encoder.maxFrameKB)} KB</b></div>
       <div><span>Keyframes /s</span><b>{n(encoder.keyframes)}</b></div>
-      {#if adapting}<div><span>Bitrate control</span><b data-testid="cc-reason">{adapting}</b></div>{/if}
+      {#if adapting}<div><span>Bitrate</span><b data-testid="cc-reason">{adapting}</b></div>{/if}
+      {#if stalledLanes > 0}<div><span>Stalled connections</span><b class="warn" title="Their send buffers stopped draining (an SCTP stall): their stripes moved to another connection meanwhile" data-testid="stalled-lanes">{stalledLanes} stalled</b></div>{/if}
     </div>
     {#if clamp}<p class="hint warn" data-testid="clamp-explained">{clamp}</p>{/if}
   {/if}

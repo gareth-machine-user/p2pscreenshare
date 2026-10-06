@@ -48,13 +48,10 @@ const valid: PeerMsg[] = [
   { t: 'position', ch: 1, home: null, depth: [] },
   { t: 'position', ch: 1, home: 2, depth: [1, 2, 3] },
   { t: 'topo', ch: 1, z: 'abc' },
-  { t: 'reprobe', ch: 1 },
   { t: 'publish-req' },
   { t: 'publish-deny' },
   { t: 'need-gop', ch: 1, stripes: [0] },
   { t: 'need-gop', ch: 1, stripes: [0, 2, 3] },
-  { t: 'probe-end', id: 7 },
-  { t: 'probe-result', bytes: 1000, ms: 50 },
 ]
 
 const roundTrip = (v: unknown): unknown => JSON.parse(JSON.stringify(v))
@@ -104,8 +101,6 @@ describe('peer message validation', () => {
     ['need-gop with stripes not a list', { t: 'need-gop', ch: 1, stripes: 0 }],
     ['need-gop with absurdly many stripes', { t: 'need-gop', ch: 1, stripes: Array.from({ length: 1000 }, (_, i) => i) }],
     ['need-gop without a channel', { t: 'need-gop', stripes: [0] }],
-    ['a missing probe id', { t: 'probe-end' }],
-    ['a string probe result', { t: 'probe-result', bytes: '1', ms: 2 }],
     ['missing stats', { t: 'stats', ch: 1 }],
     ['stats without stripes', { t: 'stats', ch: 1, stats: { ...stats, stripes: undefined } }],
     ['stats with a bad stripe', { t: 'stats', ch: 1, stats: { ...stats, stripes: [{ parent: 3, lateMs: 0, lastRecvAgoMs: null, rttMs: null }] } }],

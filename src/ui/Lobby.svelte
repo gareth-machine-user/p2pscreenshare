@@ -18,7 +18,7 @@
   import PresenterBar from './components/PresenterBar.svelte'
   import NameDialog from './components/NameDialog.svelte'
   import FrameStats from './components/FrameStats.svelte'
-  import { clampText } from './clamp'
+  import { rateReason, rateText } from './rateText'
   import { fmtMbps, sessionPeers, uploadBadge } from './liveRates'
   import PeerRates from './components/PeerRates.svelte'
   import Icon from './components/Icon.svelte'
@@ -216,7 +216,8 @@
     if (!session) return null
     const mesh = session.mesh
     const owner = mesh.member(mesh.ownerId)
-    const c = session.bitrateClamp()
+    const rate = session.rateStatus()
+    const rateLine = rate ? rateText(rate) : null
     return {
       name: owner?.name ? `${owner.name}'s lobby` : isOwner ? 'Your lobby' : 'Lobby',
       members: mesh.memberCount,
@@ -233,14 +234,13 @@
       revoked: session.revokedNotice,
       presenterAudio: session.publishing?.audio ?? null,
       limited: session.publishing?.full?.limited ?? null,
-      clamp: c ? clampText(c) : null,
+      clamp: rateLine,
       kicked: session.kicked,
       uploading: session.publishing
         ? uploadBadge({
             sendKbps: session.liveRates().sendKbps,
-            full: !!session.uplinkFull,
-            clamp: c ? clampText(c) : null,
-            ccReason: session.ccReason,
+            capacityKbps: session.capacity.uplinkKbps,
+            rate: rateLine,
             local: session.localLoad,
           })
         : null,
@@ -308,13 +308,13 @@
       stats: sub?.lastStats ?? null,
       playerStats: p,
       hasAudio: !!sub?.ann.stream?.audio,
-      capacity: s.capacity.estimateKbps,
+      capacity: s.capacity.uplinkKbps,
       live: s.liveRates(),
       peers: gearTab === 'stats' ? sessionPeers(s) : [],
       loss: sub?.loss ?? null,
       uplinkRates: s.uplinkStatsNow,
       encoderRates: s.encoderStatsNow,
-      ccReason: s.ccReason,
+      rate: s.rateStatus(),
       channel: presenting ? (pub?.id ?? null) : (sub?.channel ?? null),
       tiles,
       pub: pub
@@ -439,11 +439,11 @@
                   <div><span>Codec</span><b>{view.pub.codec ?? '—'}</b></div>
                   <div><span>Stripes</span><b>{view.pub.k} + {view.pub.m}</b></div>
                   <div><span>Uploading now</span><b data-testid="live-send-total" title="Live, all connections, last 2 s">{fmtMbps(view.live.sendKbps)}</b></div>
-                  <div><span>Est. upload</span><b title="Measured upload capacity from the last probe; not current use">{fmtKbps(view.capacity)}</b></div>
+                  <div><span>Upload capacity</span><b data-testid="upload-capacity" title="What your uplink carried when it was full (or in the last headroom probe); not current use">{fmtKbps(view.capacity)}</b></div>
                   <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
                   <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
                 </div>
-                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.ccReason} clamp={lobby?.clamp ?? null} />
+                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.rate ? rateReason(view.rate) : null} stalledLanes={view.rate?.stalledLanes ?? 0} clamp={lobby?.clamp ?? null} />
                 <PeerRates rows={view.peers} />
               {:else}
                 <div class="stats-grid" data-testid="viewer-stats">
@@ -456,7 +456,7 @@
                   <div><span>Decoded / dropped</span><b>{view.playerStats?.decodedFrames ?? 0} / {view.playerStats?.droppedFrames ?? 0}</b></div>
                   <div><span>Receiving now</span><b data-testid="live-recv-total" title="Live, all connections, last 2 s">{fmtMbps(view.live.recvKbps)}</b></div>
                   <div><span>Uploading now</span><b title="Live, all connections, last 2 s (relaying and probes)">{fmtMbps(view.live.sendKbps)}</b></div>
-                  <div><span>Est. upload</span><b title="Measured upload capacity from the last probe; not current use">{fmtKbps(view.capacity)}</b></div>
+                  <div><span>Upload capacity</span><b title="What your uplink carried when it was full (or in the last headroom probe); not current use">{fmtKbps(view.capacity)}</b></div>
                   <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
                 </div>
                 <FrameStats loss={view.loss} renderedFps={view.playerStats?.fps ?? null} uplink={view.uplinkRates} />

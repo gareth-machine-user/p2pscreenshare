@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { liveStreamsOf, planStage, type StageChannel, type ViewQuality } from '../src/session/stage'
-import { PROBE_BUFFER, PROBE_CHUNK, PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeDiscardReason, shuffle, UploadProbe, type UploadProbeContext } from '../src/session/uploadProbe'
-import type { PeerMsg } from '../src/proto/messages'
+import { HeadroomProbe, PROBE_BUFFER, PROBE_CHUNK, PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeStarved } from '../src/session/headroom'
+import { deliveredKbps } from '../src/session/capacity'
 import type { LinkState, ProbeLink } from '../src/net/link'
 import { Uplink } from '../src/net/uplink'
 import { resetTicker } from '../src/net/ticker'
@@ -79,85 +79,19 @@ describe('stage selection', () => {
   })
 })
 
-describe('shuffle', () => {
-  it('is a permutation', () => {
-    const xs = Array.from({ length: 20 }, (_, i) => i)
-    expect(sorted(shuffle([...xs]))).toEqual(xs)
-  })
-
-  it('is unbiased over the orders of a small array', () => {
-    const counts = new Map<string, number>()
-    const n = 60_000
-    for (let i = 0; i < n; i++) {
-      const k = shuffle(['a', 'b', 'c']).join('')
-      counts.set(k, (counts.get(k) ?? 0) + 1)
-    }
-    expect(counts.size).toBe(6)
-    for (const c of counts.values()) expect(Math.abs(c / n - 1 / 6)).toBeLessThan(0.01)
-  })
-})
-
-describe('upload probe (receiving side)', () => {
-  function setup() {
-    const sent: { to: string; msg: PeerMsg }[] = []
-    const ctx: UploadProbeContext = {
-      targets: () => [],
-      uplink: { stats: { sentBytes: 0, droppedBackground: 0 }, setBackground: () => {}, queued: () => 0, send: () => {}, forget: () => {}, kick: () => {} },
-      capacity: { probeKbps: null, setProbe: () => true },
-      sendTo: (to, msg) => sent.push({ to, msg }),
-      onProbed: () => {},
-    }
-    return { p: new UploadProbe(ctx), sent }
-  }
-  const chunk = (id: number, size = 1024) => {
-    const c = new Uint8Array(size)
-    new DataView(c.buffer).setUint32(0, id, true)
-    return c
-  }
-
-  it('counts bytes after the first chunk, per sender and probe id', () => {
-    const { p, sent } = setup()
-    p.onChunk(chunk(7), 'a')
-    p.onChunk(chunk(7), 'a')
-    p.onChunk(chunk(7), 'a')
-    p.onChunk(chunk(8), 'a')
-    p.onChunk(chunk(7), 'b')
-    p.onEnd(7, 'a')
-    expect(sent).toHaveLength(1)
-    expect(sent[0].to).toBe('a')
-    expect(sent[0].msg).toMatchObject({ t: 'probe-result', bytes: 2048 })
-    // Ended: a second end marker reports nothing.
-    p.onEnd(7, 'a')
-    expect(sent[1].msg).toEqual({ t: 'probe-result', bytes: 0, ms: 0 })
-  })
-
-  it('ignores runt chunks', () => {
-    const { p, sent } = setup()
-    p.onChunk(new Uint8Array(3), 'a')
-    p.onEnd(0, 'a')
-    expect(sent[0].msg).toEqual({ t: 'probe-result', bytes: 0, ms: 0 })
-  })
-
-  it('does nothing without open neighbours', async () => {
-    const { p } = setup()
-    expect(await p.probe()).toBeNull()
-    expect(p.lastProbeAt).toBeGreaterThan(-Infinity)
-  })
-})
-
-describe('upload probe discard', () => {
+describe('headroom probe starvation', () => {
   const ok = { maxGapMs: 50, elapsedMs: PROBE_DURATION_MS + 10 }
   it('keeps a probe with regular refills', () => {
-    expect(probeDiscardReason(ok)).toBeNull()
+    expect(probeStarved(ok)).toBe(false)
   })
   it('discards a probe whose sending was starved', () => {
-    expect(probeDiscardReason({ ...ok, maxGapMs: PROBE_MAX_GAP_MS + 1 })).toBe('starved')
+    expect(probeStarved({ ...ok, maxGapMs: PROBE_MAX_GAP_MS + 1 })).toBe(true)
     // The end deadline fired late: the main thread was busy or throttled.
-    expect(probeDiscardReason({ ...ok, elapsedMs: PROBE_DURATION_MS + PROBE_MAX_GAP_MS + 1 })).toBe('starved')
+    expect(probeStarved({ ...ok, elapsedMs: PROBE_DURATION_MS + PROBE_MAX_GAP_MS + 1 })).toBe(true)
   })
 })
 
-/** A probe channel whose buffer the test drains, firing buffer-low events like an RTCDataChannel. */
+/** A bin channel whose buffer the test drains, firing buffer-low events like an RTCDataChannel. */
 class StubProbeLink implements ProbeLink {
   isOpen = true
   state: LinkState = 'open'
@@ -177,7 +111,7 @@ class StubProbeLink implements ProbeLink {
   }
 }
 
-describe('upload probe (sending side)', () => {
+describe('headroom probe', () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] })
     resetTicker()
@@ -187,98 +121,52 @@ describe('upload probe (sending side)', () => {
     vi.useRealTimers()
   })
 
-  function setup(n: number) {
-    const links = Array.from({ length: n }, () => new StubProbeLink())
+  /** Runs a probe over links each draining `bytesPerMs[i]`; returns each link's delivered kbps. */
+  async function run(bytesPerMs: number[], during?: (t: number, links: StubProbeLink[]) => void) {
     const uplink = new Uplink()
-    const sent: { to: string; msg: PeerMsg }[] = []
-    const probes: number[] = []
-    let probed = 0
-    const ctx: UploadProbeContext = {
-      targets: () => links.map((l, i) => ({ remoteId: `p${i}`, isOpen: true, probeLink: l })),
-      uplink,
-      capacity: {
-        probeKbps: null,
-        setProbe: (k) => {
-          probes.push(k)
-          return true
-        },
-      },
-      sendTo: (to, msg) => sent.push({ to, msg }),
-      onProbed: () => probed++,
-    }
-    return { p: new UploadProbe(ctx), links, uplink, sent, probes, probed: () => probed }
-  }
-
-  /** Runs a probe whose links each drain `bytesPerMs`; receivers report what they got. */
-  async function run(s: ReturnType<typeof setup>, bytesPerMs: number, during?: (t: number) => void) {
-    const result = s.p.probe()
+    const links = bytesPerMs.map(() => new StubProbeLink())
+    const probe = new HeadroomProbe(uplink)
+    const snap = () => ({ at: performance.now(), links: links.map((l) => ({ handed: uplink.perLink.get(l)?.handedBytes ?? 0, buffered: l.bufferedAmount })) })
+    const result = probe.run(links, snap)
     for (let t = 0; t < PROBE_DURATION_MS + 100; t++) {
-      during?.(t)
-      for (const l of s.links) l.drain(bytesPerMs)
+      during?.(t, links)
+      links.forEach((l, i) => l.drain(bytesPerMs[i]))
       await vi.advanceTimersByTimeAsync(1)
     }
-    for (const { to, msg } of s.sent) if (msg.t === 'probe-end') s.p.onResult(to, { bytes: s.links[Number(to.slice(1))].sent, ms: PROBE_DURATION_MS })
-    return result
+    const r = await result
+    const kbps = r ? r.start.links.map((a, i) => deliveredKbps(r.end.links[i].handed - a.handed, a.buffered, r.end.links[i].buffered, r.end.at - r.start.at)) : null
+    return { kbps, links, uplink, probe }
   }
 
-  it('keeps fast links busy from buffer-low events (100 Mbps each)', async () => {
-    const s = setup(3)
-    const rate = 12_500 // bytes per ms: 100 Mbps
-    const kbps = await run(s, rate)
-    for (const l of s.links) {
-      // Nearly all of 1.5 s at full rate went out on each link...
-      expect(l.sent).toBeGreaterThan(rate * PROBE_DURATION_MS * 0.9)
-      // The channel's own low mark and handler are restored afterwards.
+  it('keeps fast links busy from buffer-low events and measures what each delivered', async () => {
+    // 100 Mbps and 20 Mbps.
+    const { kbps, links, uplink, probe } = await run([12_500, 2500])
+    expect(kbps).not.toBeNull()
+    expect(kbps![0]).toBeGreaterThan(100_000 * 0.9)
+    expect(kbps![0]).toBeLessThan(100_000 * 1.05)
+    expect(kbps![1]).toBeGreaterThan(20_000 * 0.9)
+    expect(kbps![1]).toBeLessThan(20_000 * 1.05)
+    for (const l of links) {
+      // The channel's own low mark and handler are restored, and nothing is left queued.
       expect(l.bufferLowThreshold).toBe(0)
       expect(l.onBufferLow).toBeNull()
+      expect(uplink.queued(l)).toBe(0)
     }
-    expect(kbps).toBeGreaterThan(3 * 100_000 * 0.9)
-    expect(s.probes).toHaveLength(1)
-    expect(s.probed()).toBe(1)
-    // Nothing left queued to trail the end marker.
-    for (const l of s.links) expect(s.uplink.queued(l)).toBe(0)
+    expect(probe.running).toBe(false)
+    expect(probe.lastAt).toBeGreaterThan(-Infinity)
   })
 
   it('keeps at most PROBE_BUFFER in a channel, however fast it drains', async () => {
-    // The bin channel shares its SCTP association with ctl: a big probe backlog there stalled the
-    // mesh link in Chromium until the failure detector dropped it.
-    const s = setup(1)
+    // The bin channel shares its SCTP association with the media channel (and ctl): a deep backlog
+    // there stalled the association in Chromium.
     let maxBuffered = 0
-    await run(s, 12_500, () => (maxBuffered = Math.max(maxBuffered, s.links[0].bufferedAmount)))
+    await run([12_500], (_, [l]) => (maxBuffered = Math.max(maxBuffered, l.bufferedAmount)))
     expect(maxBuffered).toBeLessThanOrEqual(PROBE_BUFFER + PROBE_CHUNK)
-    expect(s.links[0].sent).toBeGreaterThan(12_500 * PROBE_DURATION_MS * 0.9)
   })
 
-  it('probes every lane of a neighbour in parallel and reports their sum', async () => {
-    // One neighbour, three connections, each draining 1 MB/s (its own congestion window).
-    const lanes = [new StubProbeLink(), new StubProbeLink(), new StubProbeLink()]
-    const sent: { to: string; msg: PeerMsg }[] = []
-    const probes: number[] = []
-    const p = new UploadProbe({
-      targets: () => [{ remoteId: 'v', isOpen: true, probeLink: lanes[0], probeLinks: lanes }],
-      uplink: new Uplink(),
-      capacity: {
-        probeKbps: null,
-        setProbe: (k) => {
-          probes.push(k)
-          return true
-        },
-      },
-      sendTo: (to, msg) => sent.push({ to, msg }),
-      onProbed: () => {},
-    })
-    const result = p.probe()
-    for (let t = 0; t < PROBE_DURATION_MS + 100; t++) {
-      for (const l of lanes) l.drain(1000)
-      await vi.advanceTimersByTimeAsync(1)
-    }
-    // One end marker for the neighbour, which reports what arrived on all its lanes together.
-    expect(sent.filter((s) => s.msg.t === 'probe-end')).toHaveLength(1)
-    for (const l of lanes) expect(l.sent).toBeGreaterThan(1000 * PROBE_DURATION_MS * 0.9)
-    p.onResult('v', { bytes: lanes.reduce((a, l) => a + l.sent, 0), ms: PROBE_DURATION_MS })
-    const kbps = await result
-    // ~3 × 8 Mbps: the aggregate, not one connection's ceiling.
-    expect(kbps).toBeGreaterThan(3 * 8000 * 0.9)
-    expect(probes).toEqual([kbps])
+  it('does nothing without links, or while one runs', async () => {
+    const probe = new HeadroomProbe(new Uplink())
+    expect(await probe.run([], () => 0)).toBeNull()
+    expect(probe.lastAt).toBe(-Infinity)
   })
 })

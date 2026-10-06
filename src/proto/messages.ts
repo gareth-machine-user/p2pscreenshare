@@ -103,8 +103,11 @@ export interface TopologyReport {
     failures: number
     avoid: string[]
     stats: SubscriberStats | null
-    /** The publisher's own link to this peer, if it feeds it directly: drops/s and queueing. */
-    link?: { drops: number; queueMs: number; congested: boolean } | null
+    /**
+     * The publisher's own link to this peer, if it feeds it directly: drops/s, queueing, whether it
+     * was backlogged, and what its connections carry (session/capacity.ts; null until measured).
+     */
+    link?: { drops: number; queueMs: number; backlogged: boolean; capKbps: number | null } | null
   }[]
   /** The publisher's own encoder and uplink. */
   publisherStats?: { encoder: EncoderRates | null; uplink: UplinkRates | null }
@@ -128,8 +131,6 @@ export type PublisherMsg =
   | { t: 'position'; ch: number; home: number | null; depth: number[] }
   /** Gzipped TopologyReport (base64url), at most every 3 s while requested. */
   | { t: 'topo'; ch: number; z: string }
-  /** The channel is overcommitted: please re-measure your upload (estimates may be stale). */
-  | { t: 'reprobe'; ch: number }
 
 export type PeerMsg =
   | SubscriberMsg
@@ -143,22 +144,16 @@ export type PeerMsg =
    * publisher) to replay its cached GOP, before escalating to `need-key` for everyone.
    */
   | { t: 'need-gop'; ch: number; stripes: number[] }
-  /** End of an upload probe (sent on the reliable channel, outside the uplink queue). */
-  | { t: 'probe-end'; id: number }
-  /** A neighbour's report of a probe it received from us: bytes, over its arrival window. */
-  | { t: 'probe-result'; bytes: number; ms: number }
 
 /** Every message type, once: the runtime lists below must match the unions (checked at compile time). */
 export const SUBSCRIBER_MSG_TYPES = ['subscribe', 'unsubscribe', 'stripe-ok', 'reattach', 'need-key', 'stats', 'topo-req'] as const satisfies readonly SubscriberMsg['t'][]
-export const PUBLISHER_MSG_TYPES = ['set-parent', 'add-child', 'remove-child', 'position', 'topo', 'reprobe'] as const satisfies readonly PublisherMsg['t'][]
+export const PUBLISHER_MSG_TYPES = ['set-parent', 'add-child', 'remove-child', 'position', 'topo'] as const satisfies readonly PublisherMsg['t'][]
 export const PEER_MSG_TYPES = [
   ...SUBSCRIBER_MSG_TYPES,
   ...PUBLISHER_MSG_TYPES,
   'publish-req',
   'publish-deny',
   'need-gop',
-  'probe-end',
-  'probe-result',
 ] as const satisfies readonly PeerMsg['t'][]
 
 // Fails to compile if a union gains a type the lists above miss.
@@ -276,13 +271,10 @@ const shapes: { [T in PeerMsg['t']]: (m: Obj) => boolean } = {
   'remove-child': (m) => isNum(m.ch) && isIndex(m.stripe) && typeof m.child === 'string',
   position: (m) => isNum(m.ch) && (m.home === null || isIndex(m.home)) && isNumArray(m.depth),
   topo: (m) => isNum(m.ch) && typeof m.z === 'string',
-  reprobe: (m) => isNum(m.ch),
   'publish-req': () => true,
   'publish-deny': () => true,
   // Bounded: a parent serves at most one replay per stripe anyway.
   'need-gop': (m) => isNum(m.ch) && Array.isArray(m.stripes) && m.stripes.length > 0 && m.stripes.length <= MAX_STRIPES && m.stripes.every(isIndex),
-  'probe-end': (m) => isNum(m.id),
-  'probe-result': (m) => isNum(m.bytes) && isNum(m.ms),
 }
 
 /** Returns the message if it is a well-formed PeerMsg, else null (a buggy or hostile peer). */

@@ -29,7 +29,7 @@ only to find the lobby; no media server is involved.
   channel's stripes like the video (any k of the k+m stripes play it). A small jitter buffer
   reorders frames and decodes them in sequence, and an AudioWorklet plays them as one continuous stream, correcting
   drift by playing up to 1% fast or slow and fading across real gaps, so there are no clicks.
-  Catch-up replays and upload probes are paced so live audio never waits behind them.
+  Catch-up replays and headroom probes are paced so live audio never waits behind them.
 - **Graceful degradation.** Uplink queues drop temporal enhancement layers (T2, then T1) first, so
   an overloaded relay lowers the frame rate instead of stalling. A relay cache of the frames since
   the last keyframe (the GOP) lets new or re-attached children start decoding immediately.
@@ -66,13 +66,13 @@ npm run tracker             # ws://localhost:8000
   when you switch away (so sharing the whole screen doesn't film the preview). A presenter bar
   mutes the mic or the stream audio, switches the source, changes the quality and stops, and shows
   what you are uploading right now ("Uploading 4.2 Mbps", amber with the reason on hover while
-  your uplink is congested or the bitrate is held down). With the **Auto** preset the stream drops
+  the bitrate is held below the chosen quality, e.g. "limited by your upload: ~8.0 Mbps"). With the **Auto** preset the stream drops
   its bitrate if the audience can't upload enough to carry it ("Audience upload is limited" shows
   either way).
 - **Watching.** With two or more streams live, a tile rail shows live previews; click one to put it
   on the stage. Hover the player for mute (every stream starts muted), quality (Auto, Full or
   Preview), fullscreen, and a gear with **Stats** (including what you receive and upload right
-  now, and a per-peer list: every member's estimated upload, marked "est.", and for peers you're
+  now, and a per-peer list: every member's measured upload capacity, marked "est.", and for peers you're
   connected to the live sending / receiving rates and RTT), **Peers** (who is connected; see
   [Per-link stats](#per-link-stats)) and **Topology** (the stream's relay trees, fetched from its
   presenter; every node carries a number, P for the publisher and #1, #2, … in join order, that
@@ -139,15 +139,14 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    stream, with a random 32-bit id drawn each time it starts. The publisher announces it in its
    record; viewers send `subscribe` directly to the publisher, and relay only in channels they
    watch.
-5. **Capacity** (`src/session/capacity.ts`). At join a peer sends a 1.5 s probe to 3 random
-   neighbours at background priority, and adds what its uplink sent meanwhile. Probe sends are
-   driven by the probe channels' buffer-low events, not timers, since a presenter's tab is usually
-   hidden and throttled; a probe whose sending was starved anyway is discarded, and one probe can't cut
-   the estimate below half (a second low probe, or uplink drops, must confirm). While relaying,
-   drops above 3% cap the estimate at 90% of the achieved rate; it re-probes every 5 minutes when
-   lightly loaded and visible. 75% of the estimate is split into relay slots per watched channel (a publisher
-   first reserves its own roots), weighted towards channels whose publisher reports a deficit,
-   and gossiped.
+5. **Capacity** (`src/session/capacity.ts`). One measured quantity: what each connection
+   *delivered* (bytes handed to its channels, less what its send buffers grew by) per 2 s window,
+   and whether it was *backlogged* (its uplink queue never emptied: it carried all it could). The
+   uplink's capacity is the most delivered over the last 10 s in windows where most connections
+   were backlogged at once; a connection's own is the most it delivered while it alone was
+   backlogged (see [Rate control](#rate-control)). 75% of the uplink's capacity is split into relay
+   slots per watched channel (a publisher first reserves its own roots), weighted towards channels
+   whose publisher reports a deficit, and gossiped with it.
 6. **Planning** (`src/session/channelPublisher.ts`, `src/topology/planner.ts`). The publisher replans
    every 2 s and 50 ms after inputs change. `plan()` is pure and deterministic: home stripes are
    balanced by offered slots, each tree is built top-down keeping valid existing parents
@@ -173,7 +172,7 @@ dcSCTP: 5 MB receive window, bursts of 4 packets of 1191 bytes), which on real W
 around 10–25 Mbps whatever the uplink. A presenter feeding one viewer at 16 Mbps with 4+1 stripes
 needs about 21.6 Mbps on that one connection. So each mesh pair opens **media lanes**
 (`src/mesh/lane.ts`, `src/mesh/lanes.ts`): extra RTCPeerConnections that carry only an unordered
-`media` channel (same packet lifetime as the mesh link's) and a `bin` channel for probes.
+`media` channel (same packet lifetime as the mesh link's) and a `bin` channel for headroom probes.
 
 - **Setting.** `lanes=N` (page or hash query), 1–4 connections per pair, **default 2** (the mesh
   link plus one lane). `lanes=1` is exactly the single-connection behaviour. A pair uses the
@@ -188,12 +187,10 @@ needs about 21.6 Mbps on that one connection. So each mesh pair opens **media la
   the mapping only changes when a lane is given up for good. Each lane has its own uplink queue;
   the receiver de-duplicates by fragment id, so the split is invisible downstream. Audio is coded
   across the stripes like the video, so it spreads over the lanes the same way.
-- **Congestion.** Each lane is its own flow: a peer counts as congested only when most of its
-  active lanes are (one lane at its window is that connection's ceiling, not the uplink), and the
-  upload probe runs over every lane of each neighbour at once, so in a two-peer lobby it measures
-  the lanes together rather than one connection's ceiling. Even when every lane of every peer is
-  backed up, the bitrate is cut only if the path RTTs inflate too (or drops are heavy): see
-  Congestion control under [Tuning](#quality-versus-latency).
+- **Capacity.** Each lane is its own connection with its own delivered rate; a peer's capacity is
+  the sum over its lanes, and headroom probes push every lane at once, so in a two-peer lobby
+  they measure the lanes together rather than one connection's ceiling (see
+  [Rate control](#rate-control)).
 - **Connection budget.** Chromium allows 500 RTCPeerConnections per page, and closed ones may
   count until the page reloads. With the default of 2, a 50-peer lobby uses 98 per page. A failed
   lane is retried after 5 s, then 30 s, and a pair that has had 3 lane failures gets no more
@@ -203,12 +200,11 @@ needs about 21.6 Mbps on that one connection. So each mesh pair opens **media la
 and viewer (e.g. `…/#/lobby/<code>?lanes=4`; reload the page after changing it), share with the
 **1080p Ultra-Hi** (16 Mbps) or **4K** (20 Mbps) preset, and compare: the **Peers** panel shows
 "N lanes" next to each open link (or "TURN" when lanes were skipped), the live send rate to each
-peer (expand it for each lane's rate, RTT and queueing) and each peer's probed upload estimate;
-the presenter's **Stats** show **Bitrate control** (whether congestion control lowered the
-bitrate, and why), **Your uplink** (send rate, dropped T0/T1/T2 fragments) and **Queueing delay**;
-the viewer's Stats show incomplete and late frames. With one connection at its ceiling, queueing
-and drops climb and the bitrate is lowered below the preset; with lanes the same stream should
-hold the preset.
+peer and what its connections carry (expand it for each lane's delivered rate, capacity, RTT and
+queueing); the presenter's **Stats** show **Upload capacity**, **Bitrate** (what limits it),
+**Your uplink** (send rate, dropped T0/T1/T2 fragments) and **Queueing delay**; the viewer's Stats
+show incomplete and late frames. With one connection at its ceiling, it stays backlogged and the
+bitrate settles at 85% of what it carries; with lanes the same stream should hold the preset.
 
 ### Security
 
@@ -278,7 +274,7 @@ membership layer handles everything else.
 | A relay is consistently late | Every viewer measures how far behind the first piece of each frame each stripe arrives; the publisher attributes the excess to the parent | Lateness counts as a parent-choice penalty; a parent late by more than 150 ms for 10 s loses its children there for 30 s | 10 s |
 | Several publishers compete for relays | Channel announcements carry the latest plan's `deficit` | Every 10 s each peer moves 10% of its budget weight from channels without a deficit to those with one | a few rounds |
 | The audience can't upload enough | Offered slots below 90% of the N × S needed for 10 s | The presenter sees "Audience upload is limited: about X Mbps will play smoothly"; with Auto quality the encoder drops to that bitrate (in place, no new capture) | ~10 s |
-| Upload estimates go stale | Every 5 min while relaying lightly, or when a publisher whose channel is overcommitted asks | Re-probe | — |
+| Upload capacity changes | Backlogged windows (any time), or a headroom probe every 30 s while nothing is backlogged | Capacity follows (max over 10 s; at once when queueing passes 1 s) | 2–30 s |
 
 Measured in the e2e tests on one machine:
 - **With parity (`m ≥ 1`):** a relay leaving is invisible (minimum 31–34 fps during failover).
@@ -466,7 +462,6 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Keyframe / replay deadline | 4 s | 2 / 2.5 s | Keyframes and GOP replays survive overload |
 | Jitter buffer | 99th percentile + 120 ms, ≥ 150 ms | 95th percentile + 40 ms, ≥ 30 ms | Far fewer late or skipped frames on jittery paths |
 | Media channel retransmits | up to 3 s | up to 1 s | Lost packets are re-sent instead of lost |
-| Congestion back-off | queueing > 800 ms (swamped > 1600 ms) | queueing > 250 ms (swamped > 500 ms) | The bitrate drops only on real congestion, to just below what the uplink carried |
 | Stripe-silence detection | 1.5 s | 1 s | Fewer false reattaches |
 | Keyframe interval | 10 s | 2 s | Keyframes are expensive, and with constant bitrate each one briefly blurs the picture to fit the budget; joiners start from the cached GOP and a viewer that loses its decode chain asks for one |
 
@@ -479,53 +474,52 @@ Rate control, in both profiles:
 - **Frame-aware dropping.** When one fragment of a frame misses its deadline on a link, the rest of
   that frame's fragments on that link are dropped too, freeing upload for frames that can still
   play.
-- **Congestion control.** The publisher lowers its bitrate only when its own uplink is full
-  (`uplinkIsFull` in `session/capacity.ts`): more than half of the peers it feeds are congested at
-  once (dropping live fragments, or queueing them for long) **and** their paths show queueing in
-  the network. A peer's path queues when its RTT, from the ICE candidate pair's STUN checks
-  (`getStats`, see [Per-link stats](#per-link-stats)), is inflated above its 2-minute minimum by
-  more than max(40 ms, half the baseline) (25 ms floor with `priority=latency`; `ccRttInflationMs`).
-  Those checks share the connection's UDP socket, so they wait in a full router queue, but not
-  behind the SCTP association's own send backlog (the app's `ctl` pings do, so they aren't used).
-  Congested over a flat RTT is the connections' own ceiling (each SCTP association's congestion
-  window, or a slow receiver): lanes absorb it, and the bitrate isn't cut. Routers with
-  fq_codel/SQM keep queues short, so a full link there shows drops instead: heavy drops (≥ 10
-  fragments/s) to most peers count whatever the RTT, on peers that are congested (on most of their
-  connections: one lane's drops are that connection's). A congested peer with no RTT signal (stale
-  for 8 s, or fewer than 3 samples) counts as before, on congestion alone. With a single peer, a
-  bottleneck anywhere on its path (your uplink or its downlink) cuts, as nobody else is being
-  sent to. Under the debug upload cap (`up=`), the token bucket stands in for the router: sending
-  at 85% of the cap or more counts as a queueing path. One slow viewer congests just its own
-  link, which sheds enhancement frames for that viewer alone (and its Auto quality can fall back
-  to the preview); viewers' own losses don't move the bitrate either. A **stalled connection**
-  isn't congestion either: one whose send buffer stopped draining for 750 ms (`STALL_MS` in
-  `net/uplink.ts`). That is an SCTP association stuck in loss recovery by retransmission timeout
-  (≥ ~400 ms, doubling), typically after a burst overflowed the connection's 64 KB UDP socket
-  buffer in Chromium; the whole association delivers nothing meanwhile, while its path RTT stays
-  flat. Its stripes, and what already waits for it, move to another of the pair's connections until
-  it drains again (`Mesh.mediaLinkFor`), and its drops and queueing (for the window and the
-  backlog's lifetime after) don't count towards congestion (the Peers panel marks it *stalled*).
-  Media channels buffer at most 64 KiB (`LINK_BUFFER_HIGH`) so bursts stay small enough not to
-  cause such stalls (`e2e/diag-sctp.spec.ts` measures it). Nor is **this computer being
-  overloaded**: a window in which the page's main thread stalled for 400 ms or more doesn't count
-  as a full uplink unless path RTTs are inflated, and the presenter's upload badge says the
-  computer can't keep up (the page stalled, or the encoder drops frames) rather than blaming the
-  network. When full, it settles just below what the uplink actually carried instead of halving
-  (`session/congestion.ts`): what was sent while congested, minus the uplink's other traffic
-  (measured while uncongested: the preview, relayed channels), converted from wire to video
-  bitrate with the stripe overhead (one stripe copy per direct child, `stripeKbpsFor`), gives the
-  sustainable video rate; the bitrate goes to 90% of it (at least a 10% cut, at most a 50% one).
-  Only when nothing measurable got through does it cut blind, by 25% (by half when swamped). It
-  then waits while the backlog drains, and after 5 s clean returns to 95% of the rate where the
-  uplink filled, then probes above it by 5% every 10 s while nothing queues. Each time the uplink
-  fills again at about the same rate, it probes half as often (up to every 40 s); after a minute
-  without queueing the remembered rate expires and it climbs by 25% every 5 s. Never above the
-  chosen quality or what the audience's relay slots can carry. On one WebRTC connection that tops
-  out at 14 Mbps, a 16 Mbps stream settles at 90–105% of the 10.2 Mbps it can carry, with about
-  ten changes in three minutes (the old 25%/halving policy swung between 5.5 and 15 Mbps).
-  Catch-up replays to newly attached viewers don't count as congestion. Changes apply in place,
-  with no new capture. Topology shows each directly fed viewer's link from the presenter, so a slow
-  peer is easy to spot.
+- **Rate control.** <a id="rate-control"></a>One measured quantity, the rate each connection
+  delivered, replaces inferring "full" from proxies (`session/capacity.ts`, pure):
+  - *Windows.* Every 2 s, per connection (a mesh link or a lane): delivered = bytes handed to its
+    channels (media and `bin`) minus the growth of their `bufferedAmount`, per second. The window
+    is *backlogged* if the connection's uplink queue held something for ≥ 90% of it (data waits
+    in the app only while the 64 KiB send buffer is full), *stalled* if the connection stalled in
+    it (`STALL_MS`, below), and the whole window is ignored if the page *froze* (the main thread
+    lagged ≥ 400 ms: what queued then is this computer's doing).
+  - *Uplink capacity* (what a peer gossips as `capacityKbps`): the most delivered in total over
+    the last 10 s in windows where most active connections were backlogged at once, with no
+    stall. Between such windows it holds; any window raises it to at least what was delivered; a
+    backlogged window queueing over 1 s sets it at once (no max filter). Until one comes it is
+    unknown, and the bitrate stays at the chosen quality.
+  - *Connection capacity*: the same max filter over windows in which the connection was
+    backlogged while most were not (it alone was the bottleneck: a slow receiver, one SCTP
+    congestion window); such a connection is a *limit*. When most are backlogged together, each
+    one's share only says how the uplink was split, so it only raises the estimate. A peer's
+    capacity is the sum over its connections.
+  - *Headroom discovery*, the only probing (`session/headroom.ts`): once 1 s after the first link
+    opens, then every 30 s while no media connection is backlogged, the uplink's background slot
+    pushes bytes onto every open connection's `bin` channel for 1.5 s (64 KB buffered at most per
+    channel, refilled from buffer-low events, so it measures in a hidden tab too; a starved probe
+    is discarded), after all live media. Those windows count as backlogged. Nobody replies: the
+    receiver drops the bytes.
+  - *Bitrate* (`session/congestion.ts`, pure): the wire budget per direct child is the smaller of
+    the uplink's capacity divided by the direct children ((child, stripe) edges / stripes) and the
+    median capacity of the peers fed directly (only those that are a limit; one fed some stripes
+    counts its capacity × stripes / those stripes; of two, the larger), so one slow viewer
+    doesn't throttle the rest: its own link sheds enhancement layers and its Auto quality can
+    fall back to the preview. The target is 85% of the video bitrate that budget carries (the
+    stripe overhead of `stripeKbpsFor`), never above the chosen quality or what the audience's
+    relay slots carry. Down at once (at most every 4 s), up by at most 25% per 10 s, changes
+    under 5% ignored. On loopback the probe measures 100–300 Mbps and a 16 or 20 Mbps stream
+    keeps its preset; under the `up=` debug cap (the token bucket backs up every queue at once)
+    it settles at 85% of what the cap carries per child.
+  - *Stalls.* A connection whose send buffer stopped draining for 750 ms (`STALL_MS` in
+    `net/uplink.ts`) is an SCTP association stuck in loss recovery by retransmission timeout
+    (≥ ~400 ms, doubling), typically after a burst overflowed the connection's 64 KB UDP socket
+    buffer in Chromium; the whole association delivers nothing meanwhile. Its stripes, and what
+    already waits for it, move to another of the pair's connections until it drains again
+    (`Mesh.mediaLinkFor`), and its windows say nothing about capacity (the Peers panel and Stats
+    mark it *stalled*). Media channels buffer at most 64 KiB (`LINK_BUFFER_HIGH`) so bursts stay
+    small enough not to cause such stalls (`e2e/diag-sctp.spec.ts` measures it).
+  - Path RTTs (below) are shown, never used for decisions. Changes apply in place, with no new
+    capture. Topology shows each directly fed viewer's link from the presenter (drops, queueing,
+    what it carries), so a slow peer is easy to spot.
 - **Per-link stats.** <a id="per-link-stats"></a>Every 2 s each peer calls `getStats()` on every
   connection (mesh links and lanes) and keeps, per connection, the selected candidate pair's RTT
   (the average of the STUN round trips since the last poll), its 2-minute minimum as the
@@ -536,15 +530,18 @@ Rate control, in both profiles:
   connecting), there is **no `sctp-transport` report** (so no SCTP congestion window) and no
   `availableOutgoingBitrate` on a data-only connection; both are parsed and shown if a browser
   adds them. The **Peers** panel shows, per peer, live **Sending** and **Receiving** rates (on the
-  wire, all connections), **RTT now / base** (with "+N ms" when the path queues), and the probed
-  **Est. upload** as a secondary column (an estimate, not current use); expanding a peer lists
-  each connection: send/receive rate, RTT now / baseline, live-media queueing and drops/s, relayed,
-  and the congestion window where available. `window.__p2p.linkStatsFor(peerId)` and
-  `window.__p2p.pathQueue` expose the same for e2e.
-- **Why it's clamped.** While the bitrate is below the chosen quality, the presenter bar (and
-  Stats) say why in numbers: for example "your upload is sending about 3.0 Mbps, but 16 Mbps needs
-  at least 21 Mbps here (you send 5 stripe copies yourself …)".
-  A lower quality preset or fewer parity stripes then usually looks sharper than a starved one.
+  wire, all connections), **RTT now / base** (with "+N ms" when the path queues), what your connections to it
+  **Carry** ("limit" when they were its bottleneck), and its gossiped **Est. upload** as a
+  secondary column (its measured capacity, not current use); expanding a peer lists each
+  connection: send/receive rate, RTT now / baseline, live-media queueing and drops/s, delivered
+  rate and capacity, stalled, relayed, and the congestion window where available.
+  `window.__p2p.linkStatsFor(peerId)` and `window.__p2p.peerCapacity(peerId)` expose the same
+  for e2e.
+- **Why it's clamped.** The presenter bar (while below the chosen quality) and Stats say what
+  sets the bitrate in plain words: "limited by your upload: ~X Mbps", "limited by viewers'
+  connections: median ~Y Mbps", "limited by audience relay capacity" or "at chosen quality", and
+  how many connections stalled. A lower quality preset or fewer parity stripes then usually looks
+  sharper than a starved stream.
 
 Every place a frame can go missing is counted and shown in **Stats** (and per viewer in
 **Topology**): frames dropped by the encoder, uplink fragments dropped by temporal layer and
@@ -566,8 +563,10 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `LIVENESS_TIMEOUT_MS` | `session/channelPublisher.ts` | 1200 | The dead-parent confirmation timeout |
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
 | `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
-| `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*`, `mediaMaxPacketLifeTimeMs`, `ccQueueMs`, `ccRttInflationMs` | `tuning.ts` | see the table above | Uplink layer deadlines, jitter buffer, retransmits and congestion back-off: latency vs complete, smooth frames |
-| `CONGESTION_DEFAULTS` | `session/congestion.ts` | settle at 90% of the carried rate; return to 95%; probe +5% every 10–40 s; forget after 60 s | Higher shares and faster probing use more of the uplink but queue more often |
+| `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*`, `mediaMaxPacketLifeTimeMs` | `tuning.ts` | see the table above | Uplink layer deadlines, jitter buffer and retransmits: latency vs complete, smooth frames |
+| `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `BACKLOGGED_SHARE`, `FROZEN_LAG_MS` | `session/capacity.ts` | 10 s, 1 s, 90%, 400 ms | Capacity memory, when a backlog sets it at once, what counts as backlogged, and when a window is the page's fault |
+| `TARGET_SHARE`, `DOWN_GAP_MS`, `UP_GAP_MS`, `UP_STEP`, `DEADBAND` | `session/congestion.ts` | 0.85, 4 s, 10 s, 1.25, 5% | Share of the measured budget used, and how fast the bitrate follows it |
+| `HEADROOM_EVERY_MS`, `PROBE_DURATION_MS` | `session/peerSession.ts`, `session/headroom.ts` | 30 s, 1.5 s | How often (while nothing is backlogged) and how long the headroom probe pushes background bytes |
 
 ## Tests
 
@@ -581,19 +580,23 @@ The unit tests (`tests/`) cover:
 - media and wire format: framing, FEC, reassembly, the jitter buffer, the uplink queue, message
   validation
 - trees and sessions: the planner, capacity and budget splits, relaying, subscriptions, stage
-  selection, channel ownership, the upload probe
+  selection, channel ownership, the headroom probe
 - the mesh and security: gossip and failure detection, lobby codes, publish rights, fragment
   signing
 - per-link stats: parsing Chrome and Firefox `getStats()` shapes, RTT baseline and staleness,
-  path inflation; the uplink-full rule (inflated, flat, unknown RTT, heavy drops, single peer,
-  stalled lanes); stall detection and rerouting
+  path inflation (display); stall detection and rerouting
+- rate control: delivered rate from counters and `bufferedAmount`, the max filter (exclusions,
+  fast drop), uplink capacity from windows where most connections are backlogged, the bitrate
+  function and its pacing, and a link simulation driving estimator and controller end to end
+  (a fixed-capacity link, a shared uplink, one or all viewers slow, stalls, a frozen page, capacity
+  rising and falling, the audience cap)
 - the UI's pure logic: routes and URL parameters, stored settings, share options and stage
   messages, live rate formatting
 
 The e2e suite covers:
 - hardening: auto quality lowers the bitrate for an audience that can't carry the stream; a kicked
-  member stays out after a reload; one slow viewer doesn't throttle the stream, nor do backed-up
-  links with flat path RTTs, but backed-up links with inflated RTTs do
+  member stays out after a reload; one slow viewer doesn't throttle the stream (its link is
+  measured as its own limit), but capping the presenter's upload settles the bitrate under the cap
 - link stats: a real connection's `getStats()` (fields, RTT refresh cadence), the per-link stats,
   the presenter's live upload figure, the Peers panel's live rates and lanes, the viewer's live
   receive rate
@@ -614,10 +617,11 @@ Opt-in diagnostics (skipped unless `E2E_DIAG=1`): `e2e/diag-congestion.spec.ts` 
 presenter to one viewer on this machine with no upload cap, at a quality preset (`DIAG_PRESET`:
 `ultra`, `hi`, `4k`, `auto`) and a test pattern that keeps the encoder at its full bitrate
 (`pattern=busy`, or `bursty` for a mostly still screen), and prints a per-second timeline of what
-the congestion controller sees and does (bitrate, uplink-full signal, per-lane queueing, drops,
-send buffers, `packetsDiscardedOnSend`, path RTTs, main-thread lag on both pages);
-`DIAG_STALL=lane,ms,every` emulates SCTP association stalls and `DIAG_BLOCK=ms,every` a busy main
-thread. `tools/diag-tabs.ts` runs the same with the presenter's (or viewer's) tab really in the
+rate control sees and does (bitrate and what limits it, uplink and peer capacity, per-lane
+delivered rate, backlog and stalls, queueing, drops, send buffers, `packetsDiscardedOnSend`, path
+RTTs, headroom probes, main-thread lag on both pages); `DIAG_STALL=lane,ms,every` emulates SCTP
+association stalls, `DIAG_BLOCK=ms,every` a busy main thread and `DIAG_UP=kbps` caps the
+presenter's upload. `tools/diag-tabs.ts` runs the same with the presenter's (or viewer's) tab really in the
 background (raw CDP under a display, e.g. `xvfb-run`: Playwright keeps every page visible).
 `e2e/diag-sctp.spec.ts` measures whether a deep send buffer stalls a bare SCTP association.
 

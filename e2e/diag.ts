@@ -85,20 +85,16 @@ export function hostSampleExpr(viewerId: string): string {
     const out = {
       kbps: full ? full.kbps : null,
       ceiling: p.publishing ? p.publishing.ceilingKbps : null,
-      ccReason: p.ccReason,
-      clamp: p.bitrateClamp(),
-      full: p.uplinkFull,
+      rate: p.rateStatus(),
       localLoad: p.localLoad ?? null,
-      link: p.linkRates.get(vid) || null,
-      path: p.pathQueue.get(vid) || null,
+      link: p.linkRate(vid),
+      peerCap: p.peerCapacity(vid),
       linkStats: p.linkStatsFor(vid),
       lanes,
       up: p.uplinkStatsNow,
-      raw: { sent: u.sentBytes, drops: [...u.droppedByLayer], bg: u.droppedBackground, rep: u.droppedReplay, stalls: u.bufferStalls, queued: u.queuedBytes, fail: u.sendFailed },
-      probe: p.capacity.probeKbps,
-      est: p.capacity.estimateKbps,
-      obsCap: p.capacity.observedCapKbps,
-      lastProbeAt: p.uploadProbe ? p.uploadProbe.lastProbeAt : null,
+      raw: { sent: u.sentBytes, drops: [...u.droppedByLayer], bg: u.droppedBackground, rep: u.droppedReplay, stalls: u.bufferStalls, queued: u.queuedBytes, fail: u.sendFailed, qSum: u.queueDelaySum, qN: u.queueDelayN },
+      cap: p.capacity.uplinkKbps,
+      lastProbeAt: p.headroom ? p.headroom.lastAt : null,
       enc: p.encoderStatsNow,
       now: performance.now(),
       lag: ${TAKE_LAG},
@@ -128,7 +124,7 @@ export interface DiagRow {
 /** The per-second table (deltas of cumulative counters) and a summary line. */
 export function formatTimeline(rows: DiagRow[]): string {
   const lines: string[] = []
-  lines.push('t     kbps  enc   upKbps qMs  stall drop(t0,t1,t2) full     link(q,d,c)      rtt(l0/l1)      peakBuf(KB)   discards  laneTx(kB/s)  rx(kB/s)    fps lat  lagH lagV vis')
+  lines.push('t     kbps  limit    enc   upKbps qMs  q1s  P stall drop(t0,t1,t2) capUp  capPeer   lanes(del,B,S)        rtt(l0/l1)      peakBuf(KB)   discards  laneTx(kB/s)  rx(kB/s)    fps lat  lagH lagV vis')
   for (let i = 1; i < rows.length; i++) {
     const a = rows[i - 1]
     const b = rows[i]
@@ -144,19 +140,25 @@ export function formatTimeline(rows: DiagRow[]): string {
     })
     const drops = b.h.raw.drops.map((d: number, j: number) => d - a.h.raw.drops[j]).slice(0, 3)
     const rtt = b.h.linkStats.map((s: Any) => `${s.rttMs ?? '?'}${s.fresh ? '' : '*'}`).join('/')
-    const full = b.h.full ? `${b.h.full.signal}` : '-'
-    const link = b.h.link ? `${b.h.link.queueMs},${b.h.link.drops},${b.h.link.congested ? 'C' : '-'}${b.h.link.stalled ? 'S' : ''}` : '-'
+    const limit = b.h.rate?.limit ?? '-'
+    const capUp = b.h.cap == null ? '-' : String(Math.round(b.h.cap))
+    const capPeer = b.h.peerCap?.kbps == null ? '-' : `${Math.round(b.h.peerCap.kbps)}${b.h.peerCap.bound ? '!' : ''}`
+    const lanes = b.h.linkStats.map((l: Any) => `${l.deliveredKbps ?? '-'}${l.backlogged ? 'B' : ''}${l.stalled ? 'S' : ''}`).join('/')
     lines.push(
       [
         String(b.t).padEnd(5),
         String(b.h.kbps).padEnd(5),
+        limit.padEnd(8),
         String(b.h.enc?.kbps ?? '-').padEnd(5),
         String(b.h.up?.kbps ?? '-').padEnd(6),
         String(b.h.up?.queueMs ?? '-').padEnd(4),
+        String(b.h.raw.qN > a.h.raw.qN ? Math.round((b.h.raw.qSum - a.h.raw.qSum) / (b.h.raw.qN - a.h.raw.qN)) : '-').padEnd(4),
+        b.h.lastProbeAt !== a.h.lastProbeAt ? 'P' : ' ',
         String(b.h.raw.stalls - a.h.raw.stalls).padEnd(5),
         drops.join(',').padEnd(14),
-        full.padEnd(8),
-        link.padEnd(16),
+        capUp.padEnd(6),
+        capPeer.padEnd(9),
+        lanes.padEnd(21),
         rtt.padEnd(15),
         b.h.lanes
           .map((l: Any) => Math.round((l.peak ?? l.buf) / 1024))
@@ -180,14 +182,15 @@ export function formatTimeline(rows: DiagRow[]): string {
     )
   }
   const cuts = rows.filter((r, i) => i > 0 && r.h.kbps < rows[i - 1].h.kbps).length
-  const fullN = rows.filter((r) => r.h.full).length
-  const congested = rows.filter((r) => r.h.link?.congested).length
-  const stalled = rows.filter((r) => r.h.link?.stalled).length
+  const limited = rows.filter((r) => r.h.rate && r.h.rate.limit !== 'chosen').length
+  const backlogged = rows.filter((r) => r.h.link?.backlogged).length
+  const stalled = rows.filter((r) => r.h.linkStats.some((l: Any) => l.stalled)).length
+  const probes = new Set(rows.map((r) => r.h.lastProbeAt).filter((x) => x != null && x > -Infinity)).size
   const local = rows.filter((r) => r.h.localLoad).length
   const lowestKbps = Math.min(...rows.map((r) => r.h.kbps ?? Infinity))
   const last = rows.at(-1)
   lines.push(
-    `summary: cuts=${cuts} fullSamples=${fullN}/${rows.length} congestedSamples=${congested} stalledSamples=${stalled} localLoadSamples=${local} lowestKbps=${lowestKbps} finalKbps=${last?.h.kbps} probe=${Math.round(last?.h.probe ?? 0)} est=${Math.round(last?.h.est ?? 0)}`,
+    `summary: cuts=${cuts} limitedSamples=${limited}/${rows.length} backloggedSamples=${backlogged} stalledSamples=${stalled} localLoadSamples=${local} probes=${probes} lowestKbps=${lowestKbps} finalKbps=${last?.h.kbps} uplinkCap=${Math.round(last?.h.cap ?? 0)} peerCap=${Math.round(last?.h.peerCap?.kbps ?? 0)}`,
   )
   lines.push(`encoder last: ${JSON.stringify(last?.h.enc)}`)
   return lines.join('\n')

@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { CapacityEstimator, PROBE_DROP_CONFIRM_MS, feasibilityRatio, feasibleBitrate, rebalanceWeights, splitBudget, uplinkIsFull } from '../src/session/capacity'
+import {
+  CAPACITY_WINDOW_MS,
+  CapacityModel,
+  deliveredKbps,
+  feasibilityRatio,
+  feasibleBitrate,
+  linkWindow,
+  MaxFilter,
+  rebalanceWeights,
+  splitBudget,
+  type ConnWindow,
+  type LinkSnap,
+} from '../src/session/capacity'
 
 describe('budget split', () => {
   it('a viewer offers floor(B / stripe kbps) slots', () => {
@@ -42,79 +54,6 @@ describe('budget split', () => {
   })
 })
 
-describe('capacity estimate', () => {
-  it('caps on drops and relaxes back to the probe value', () => {
-    const e = new CapacityEstimator()
-    expect(e.estimateKbps).toBeNull()
-    e.setProbe(5000)
-    expect(e.estimateKbps).toBe(5000)
-    e.observe(2000, 0.1)
-    expect(e.estimateKbps).toBe(1800)
-    e.observe(1500, 0.1)
-    expect(e.estimateKbps).toBe(1350)
-    e.observe(1500, 0)
-    expect(e.estimateKbps).toBeCloseTo(1417.5)
-    for (let i = 0; i < 40; i++) e.observe(1500, 0)
-    expect(e.estimateKbps).toBe(5000)
-    expect(e.observedCapKbps).toBeNull()
-  })
-
-  it('probes raise the estimate freely and lower it a little at once', () => {
-    const e = new CapacityEstimator()
-    expect(e.setProbe(5000, 0)).toBe(true)
-    expect(e.setProbe(20_000, 1000)).toBe(true)
-    expect(e.estimateKbps).toBe(20_000)
-    // Down to half or more: applied on one probe.
-    expect(e.setProbe(10_000, 2000)).toBe(true)
-    expect(e.estimateKbps).toBe(10_000)
-  })
-
-  it('a single probe cannot cut the estimate below half', () => {
-    const e = new CapacityEstimator()
-    e.setProbe(10_000, 0)
-    expect(e.setProbe(1000, 1000)).toBe(false)
-    expect(e.estimateKbps).toBe(10_000)
-    expect(e.pendingDrop).toEqual({ kbps: 1000, at: 1000 })
-    // A normal probe afterwards clears the suspicion.
-    expect(e.setProbe(9000, 2000)).toBe(true)
-    expect(e.pendingDrop).toBeNull()
-    // So the next low probe needs confirming again.
-    expect(e.setProbe(1000, 3000)).toBe(false)
-    expect(e.estimateKbps).toBe(9000)
-  })
-
-  it('a second low probe within the window confirms the drop (the higher of the two)', () => {
-    const e = new CapacityEstimator()
-    e.setProbe(10_000, 0)
-    e.setProbe(2000, 1000)
-    expect(e.setProbe(3000, 60_000)).toBe(true)
-    expect(e.estimateKbps).toBe(3000)
-    expect(e.pendingDrop).toBeNull()
-  })
-
-  it('a low probe outside the window starts over', () => {
-    const e = new CapacityEstimator()
-    e.setProbe(10_000, 0)
-    e.setProbe(2000, 1000)
-    expect(e.setProbe(2000, 1000 + PROBE_DROP_CONFIRM_MS + 1)).toBe(false)
-    expect(e.estimateKbps).toBe(10_000)
-  })
-
-  it('drops on a full uplink confirm a pending drop', () => {
-    const e = new CapacityEstimator()
-    e.setProbe(10_000, 0)
-    e.setProbe(2000, 1000)
-    // No drops: nothing confirmed.
-    e.observe(1500, 0, 2000)
-    expect(e.estimateKbps).toBe(10_000)
-    e.observe(1500, 0.1, 3000)
-    expect(e.probeKbps).toBe(2000)
-    expect(e.pendingDrop).toBeNull()
-    // And the observed cap applies as usual.
-    expect(e.estimateKbps).toBe(1350)
-  })
-})
-
 describe('competing publishers', () => {
   it('moves weight towards channels with a deficit, a step at a time', () => {
     let w: Record<string, number> = { a: 1, b: 1 }
@@ -154,49 +93,148 @@ describe('feasibility and auto quality', () => {
   })
 })
 
-describe('is the uplink full?', () => {
-  /** A peer: congested?, its path RTT inflated? (null: no RTT signal), drops/s. */
-  const p = (congested: boolean, pathQueued: boolean | null, drops = congested ? 3 : 0) => ({ congested, pathQueued, drops })
+describe('delivered rate', () => {
+  it('is what was handed to the channel, less what its send buffer grew by', () => {
+    // 1 MB handed over 2 s, the buffer grew from 0 to 64 KB: 936 KB delivered.
+    expect(deliveredKbps(1_000_000, 0, 64_000, 2000)).toBeCloseTo((936_000 * 8) / 2000)
+    // A buffer that shrank delivered more than was handed meanwhile.
+    expect(deliveredKbps(100_000, 60_000, 10_000, 1000)).toBeCloseTo(1200)
+    // Nothing handed, the buffer stuck: nothing delivered (never negative).
+    expect(deliveredKbps(0, 50_000, 50_000, 2000)).toBe(0)
+    expect(deliveredKbps(0, 10_000, 60_000, 2000)).toBe(0)
+    expect(deliveredKbps(1000, 0, 0, 0)).toBe(0)
+  })
 
-  it('congested with inflated RTTs is full', () => {
-    expect(uplinkIsFull([p(true, true), p(true, true), p(false, false)])).toEqual({ congested: 2, active: 3, signal: 'rtt' })
-    expect(uplinkIsFull([p(true, true), p(true, true)])).toEqual({ congested: 2, active: 2, signal: 'rtt' })
+  it('a window between two snapshots: backlogged when the queue never emptied, stalled when it stalled', () => {
+    const a: LinkSnap = { at: 0, handed: 0, buffered: 0, busyMs: 0, items: 0, mediaBytes: 0, drops: 0, qSum: 0, qN: 0, lastStallAt: -Infinity, headAgeMs: 0 }
+    const b: LinkSnap = { ...a, at: 2000, handed: 2_000_000, buffered: 64_000, busyMs: 1900, items: 1500, mediaBytes: 1_500_000, drops: 10, qSum: 1500 * 300, qN: 1500, headAgeMs: 100 }
+    const w = linkWindow('l', 'p', a, b)
+    expect(w.kbps).toBeCloseTo(((2_000_000 - 64_000) * 8) / 2000)
+    expect(w).toMatchObject({ id: 'l', peer: 'p', active: true, backlogged: true, stalled: false, queueMs: 300, mediaKbps: 6000, dropsPerS: 5 })
+    // Busy for less than 90% of the window: not backlogged. The oldest waiting item counts as queueing.
+    expect(linkWindow('l', 'p', a, { ...b, busyMs: 1700, headAgeMs: 1200 })).toMatchObject({ backlogged: false, queueMs: 1200 })
+    expect(linkWindow('l', 'p', a, { ...b, lastStallAt: 500 }).stalled).toBe(true)
+    // Idle: no media, nothing waiting.
+    expect(linkWindow('l', 'p', a, { ...a, at: 2000 }).active).toBe(false)
   })
-  it('congested with flat RTTs is the connections’ own ceiling, not a full uplink', () => {
-    expect(uplinkIsFull([p(true, false), p(true, false), p(true, false)])).toBeNull()
-    // Only one of the congested peers shows queueing: not most of them.
-    expect(uplinkIsFull([p(true, true), p(true, false), p(true, false)])).toBeNull()
+})
+
+describe('max filter', () => {
+  it('is the most delivered while backlogged over the last 10 s, held in between', () => {
+    const f = new MaxFilter()
+    expect(f.kbps).toBeNull()
+    f.sample(0, 5000)
+    f.sample(2000, 4000)
+    expect(f.kbps).toBe(5000)
+    // The 5000 ages out: the most in the last 10 s is 4000.
+    f.sample(CAPACITY_WINDOW_MS + 1, 3000)
+    expect(f.kbps).toBe(4000)
+    f.sample(CAPACITY_WINDOW_MS + 2001, 3000)
+    expect(f.kbps).toBe(3000)
+    // No more backlogged windows: it holds.
+    expect(f.kbps).toBe(3000)
   })
-  it('no RTT signal: congestion alone decides (the majority rule)', () => {
-    expect(uplinkIsFull([p(true, null), p(true, null), p(false, null)])).toEqual({ congested: 2, active: 3, signal: 'fallback' })
-    expect(uplinkIsFull([p(true, null), p(false, null), p(false, null)])).toBeNull()
-    // Mixed: a congested peer without RTT counts, one with a flat RTT doesn't.
-    expect(uplinkIsFull([p(true, null), p(true, true), p(true, false)])).toEqual({ congested: 2, active: 3, signal: 'fallback' })
+
+  it('unbacklogged windows only raise it, and never start it', () => {
+    const f = new MaxFilter()
+    f.raise(0, 9000)
+    expect(f.kbps).toBeNull()
+    f.raise(0, 9000, true)
+    expect(f.kbps).toBe(9000)
+    f.raise(2000, 2000)
+    expect(f.kbps).toBe(9000)
+    f.raise(4000, 12_000)
+    expect(f.kbps).toBe(12_000)
+    // A backlogged window shortly after: the raise is still within the 10 s.
+    f.sample(6000, 8000)
+    expect(f.kbps).toBe(12_000)
+    f.sample(4000 + CAPACITY_WINDOW_MS + 1, 8000)
+    expect(f.kbps).toBe(8000)
   })
-  it('heavy drops to most peers are full even with flat RTTs (fq_codel / SQM routers)', () => {
-    expect(uplinkIsFull([p(true, false, 15), p(true, false, 12), p(false, false, 0)])).toEqual({ congested: 2, active: 3, signal: 'loss' })
-    // Light drops with a flat RTT are still the connections' own ceiling.
-    expect(uplinkIsFull([p(true, false, 4), p(true, false, 4)])).toBeNull()
-    // One lossy peer of two is that receiver.
-    expect(uplinkIsFull([p(true, false, 30), p(false, false, 0)])).toBeNull()
-    // Drops on a peer that isn't congested (on most of its connections) don't count: one stalled
-    // or backed-up lane of several.
-    expect(uplinkIsFull([p(false, false, 30)])).toBeNull()
-    expect(uplinkIsFull([p(false, false, 30), p(false, false, 30)])).toBeNull()
+
+  it('drops at once to a backlogged sample queueing over a second', () => {
+    const f = new MaxFilter()
+    f.sample(0, 20_000)
+    f.sample(2000, 6000, 400)
+    expect(f.kbps).toBe(20_000)
+    f.sample(4000, 6000, 1500)
+    expect(f.kbps).toBe(6000)
   })
-  it('one slow receiver among several is not a full uplink, whatever its path shows', () => {
-    expect(uplinkIsFull([p(true, true), p(false, false), p(false, false)])).toBeNull()
-    expect(uplinkIsFull([p(true, true, 40), p(false, false)])).toBeNull()
+})
+
+describe('capacity model', () => {
+  const w = (id: string, peer: string, kbps: number, o: Partial<ConnWindow> = {}): ConnWindow => ({
+    id,
+    peer,
+    kbps,
+    active: true,
+    backlogged: false,
+    stalled: false,
+    queueMs: 0,
+    ...o,
   })
-  it('a single peer: a path bottleneck anywhere counts, its own ceiling does not', () => {
-    expect(uplinkIsFull([p(true, true)])).toEqual({ congested: 1, active: 1, signal: 'rtt' })
-    expect(uplinkIsFull([p(true, false)])).toBeNull()
-    expect(uplinkIsFull([p(true, false, 20)])).toEqual({ congested: 1, active: 1, signal: 'loss' })
-    expect(uplinkIsFull([p(true, null)])).toEqual({ congested: 1, active: 1, signal: 'fallback' })
-    expect(uplinkIsFull([p(false, true)])).toBeNull() // queueing on the path, but our link keeps up
+
+  it('knows nothing until the uplink is measured; a probe (every connection backlogged) measures it', () => {
+    const m = new CapacityModel()
+    m.update(0, [w('a0', 'a', 3000), w('a1', 'a', 2000)])
+    expect(m.uplinkKbps).toBeNull()
+    expect(m.peer('a')).toEqual({ kbps: null, bound: false })
+    m.update(2000, [w('a0', 'a', 30_000, { backlogged: true }), w('a1', 'a', 25_000, { backlogged: true })], { probe: true })
+    expect(m.uplinkKbps).toBe(55_000)
+    // A probe pushes every connection at once: each one's share is a lower bound, not its limit.
+    expect(m.peer('a')).toEqual({ kbps: 55_000, bound: false })
   })
-  it('nothing congested, or no peers, is not full', () => {
-    expect(uplinkIsFull([p(false, true), p(false, null)])).toBeNull()
-    expect(uplinkIsFull([])).toBeNull()
+
+  it('the uplink: most media connections backlogged at once', () => {
+    const m = new CapacityModel()
+    m.update(0, [w('a', 'a', 4000, { backlogged: true }), w('b', 'b', 4000, { backlogged: true }), w('c', 'c', 1000)])
+    expect(m.uplinkKbps).toBe(9000)
+    // The connections only shared it: none of them is its own bottleneck.
+    expect(m.peer('a').bound).toBe(false)
+    // Unbacklogged windows only raise it.
+    m.update(2000, [w('a', 'a', 1000), w('b', 'b', 1000), w('c', 'c', 1000)])
+    expect(m.uplinkKbps).toBe(9000)
+    m.update(4000, [w('a', 'a', 5000), w('b', 'b', 5000), w('c', 'c', 1000)])
+    expect(m.uplinkKbps).toBe(11_000)
+    // Idle connections don't vote.
+    m.update(6000, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 0, { active: false }), w('c', 'c', 0, { active: false })])
+    expect(m.uplinkKbps).toBe(11_000)
+    m.update(20_000, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 0, { active: false })])
+    expect(m.uplinkKbps).toBe(3000)
+  })
+
+  it('one slow connection among several: its own capacity, not the uplink', () => {
+    const m = new CapacityModel()
+    m.update(0, [w('a', 'a', 50_000, { backlogged: true }), w('b', 'b', 50_000, { backlogged: true })], { probe: true })
+    m.update(2000, [w('a', 'a', 900, { backlogged: true, queueMs: 1400 }), w('b', 'b', 8000), w('c', 'c', 8000)])
+    expect(m.peer('a')).toEqual({ kbps: 900, bound: true })
+    expect(m.peer('b')).toEqual({ kbps: 50_000, bound: false })
+    expect(m.uplinkKbps).toBe(100_000)
+    // A headroom probe later shows it carries more now: raised.
+    m.update(30_000, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 40_000, { backlogged: true }), w('c', 'c', 40_000, { backlogged: true })], { probe: true })
+    expect(m.peer('a')).toEqual({ kbps: 3000, bound: true })
+    expect(m.uplinkKbps).toBe(83_000)
+  })
+
+  it('a peer is the sum of its connections', () => {
+    const m = new CapacityModel()
+    m.update(0, [w('a0', 'a', 9000, { backlogged: true }), w('a1', 'a', 7000), w('b0', 'b', 7000), w('b1', 'b', 7000)])
+    m.update(0, [w('a0', 'a', 9000), w('a1', 'a', 7000), w('b0', 'b', 7000), w('b1', 'b', 7000)], { probe: true })
+    expect(m.peer('a')).toEqual({ kbps: 16_000, bound: true })
+    expect(m.conn('a0')).toEqual({ kbps: 9000, bound: true })
+    m.retain(new Set(['a1']))
+    expect(m.peer('a')).toEqual({ kbps: 7000, bound: false })
+  })
+
+  it('stalled connections and frozen pages are left out', () => {
+    const m = new CapacityModel()
+    m.update(0, [w('a', 'a', 20_000, { backlogged: true }), w('b', 'b', 20_000, { backlogged: true })], { probe: true })
+    // A frozen page: everything queued, little went out. Ignored.
+    m.update(2000, [w('a', 'a', 1000, { backlogged: true, queueMs: 2000 }), w('b', 'b', 1000, { backlogged: true, queueMs: 2000 })], { frozen: true })
+    expect(m.uplinkKbps).toBe(40_000)
+    // One connection stalled, the other backed up meanwhile: not a measurement of the uplink.
+    m.update(4000, [w('a', 'a', 0, { backlogged: true, stalled: true, queueMs: 2000 }), w('b', 'b', 6000, { backlogged: true, queueMs: 1500 })])
+    expect(m.uplinkKbps).toBe(40_000)
+    expect(m.conn('a')?.kbps).toBe(20_000)
   })
 })

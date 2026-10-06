@@ -19,7 +19,7 @@
     audio: { system: boolean; mic: boolean; systemMuted: boolean; micMuted: boolean }
     /** Set while the audience's upload can't carry the stream. */
     limited?: { feasibleKbps: number } | null
-    /** Why the bitrate is below the chosen quality, if it is (overrides `limited`). */
+    /** Why the bitrate is below the chosen quality, if it is (ui/rateText.ts). */
     clamp?: string | null
     /** Live upload figure (ui/liveRates.ts uploadBadge). */
     uploading?: { text: string; warn: boolean; title: string } | null
@@ -58,7 +58,8 @@
   <span class="spacer"></span>
   {#if clamp}
     <span class="badge warn clamp" data-testid="bitrate-clamp">{clamp}</span>
-  {:else if limited}
+  {/if}
+  {#if limited}
     <span class="badge warn" data-testid="audience-limited">
       Audience upload is limited: about {fmtKbps(limited.feasibleKbps)} will play smoothly{auto ? ' (adjusting)' : ''}
     </span>

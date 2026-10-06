@@ -198,7 +198,7 @@ async function main(): Promise<void> {
     const [h, v] = await Promise.all([host.eval(hostSampleExpr(viewerId)), viewer.eval(viewerSampleExpr(hostId))])
     const prev = rows.at(-1)
     rows.push({ t: Math.round((Date.now() - t0) / 100) / 10, h, v })
-    if (prev && h.kbps !== prev.h.kbps) console.log(`[${rows.at(-1)!.t}s] bitrate ${prev.h.kbps} -> ${h.kbps}: ${h.ccReason}`)
+    if (prev && h.kbps !== prev.h.kbps) console.log(`[${rows.at(-1)!.t}s] bitrate ${prev.h.kbps} -> ${h.kbps}: ${JSON.stringify(h.rate)}`)
     await sleep(Math.max(0, 1000 - (Date.now() - tick)))
   }
   console.log(`preset ${presetName} (${preset.bitrate} kbps ${preset.res}), ${seconds} s, hidden: ${hidden}`)

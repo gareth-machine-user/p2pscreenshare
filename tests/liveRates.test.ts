@@ -1,18 +1,22 @@
 import { describe, expect, it } from 'vitest'
 import type { LinkRow } from '../src/session/peerSession'
 import { fmtMbps, livePeers, peerLive, sumKbps, uploadBadge } from '../src/ui/liveRates'
+import { rateReason, rateText, type RateStatus } from '../src/ui/rateText'
 
 const row = (lane: number, o: Partial<LinkRow> = {}): LinkRow => ({
   lane,
   sendKbps: null,
   recvKbps: null,
   mediaKbps: null,
+  deliveredKbps: null,
+  capKbps: null,
+  bound: false,
+  backlogged: false,
   rttMs: null,
   baselineMs: null,
   fresh: true,
   queueMs: null,
   drops: null,
-  congested: false,
   stalled: false,
   relayed: false,
   cwnd: null,
@@ -66,22 +70,50 @@ describe('live rates', () => {
     expect(rows[2]).toMatchObject({ name: 'far', direct: false, sendKbps: null, recvKbps: null, estKbps: 5000 })
   })
 
-  it("the presenter's upload badge warns while the uplink holds the bitrate down", () => {
-    expect(uploadBadge({ sendKbps: 2100, full: false, clamp: null, ccReason: 'raised: probing' })).toEqual({
+  it("the presenter's upload badge warns while the bitrate is held below the chosen quality", () => {
+    expect(uploadBadge({ sendKbps: 2100, capacityKbps: null, rate: null })).toEqual({
       text: 'Uploading 2.1 Mbps',
       warn: false,
-      title: 'Live upload (all connections, last 2 s)',
+      title: 'Live upload (all connections, last 2 s).',
     })
-    const full = uploadBadge({ sendKbps: 900, full: true, clamp: null, ccReason: 'lowered: your uplink is full' })
-    expect(full.warn).toBe(true)
-    expect(full.title).toContain('lowered: your uplink is full')
-    const clamped = uploadBadge({ sendKbps: 900, full: false, clamp: 'Held at 1.0 Mbps: …', ccReason: null })
-    expect(clamped).toMatchObject({ warn: true })
-    expect(clamped.title).toContain('Held at 1.0 Mbps')
+    const held = uploadBadge({ sendKbps: 900, capacityKbps: 1200, rate: 'Bitrate 0.8 Mbps of 2.5 Mbps: limited by your upload: ~1.2 Mbps.' })
+    expect(held.warn).toBe(true)
+    expect(held.title).toContain('Your upload carries about 1.2 Mbps.')
+    expect(held.title).toContain('limited by your upload')
     // This computer can't keep up: said so, and not blamed on the network.
-    const local = uploadBadge({ sendKbps: 900, full: false, clamp: null, ccReason: null, local: { stallMs: 800, encoderDroppedFps: 6 } })
+    const local = uploadBadge({ sendKbps: 900, capacityKbps: null, rate: null, local: { stallMs: 800, encoderDroppedFps: 6 } })
     expect(local.warn).toBe(true)
     expect(local.title).toContain("Your computer can't keep up (the encoder is dropping 6 frames/s, the page stalled for 0.8 s)")
-    expect(local.title).not.toContain('congested')
+  })
+
+  it("a peer's capacity adds up its connections; stalled ones are marked", () => {
+    const p = peerLive([row(0, { capKbps: 9000, bound: true }), row(1, { capKbps: 6000, stalled: true })])
+    expect(p).toMatchObject({ capKbps: 15_000, bound: true, stalled: true })
+    expect(p.breakdown).toContain('lane 1: ↑ — ↓ —, RTT —, stalled')
+    expect(peerLive([row(0)])).toMatchObject({ capKbps: null, bound: false, stalled: false })
+  })
+})
+
+describe('bitrate reason', () => {
+  const st = (o: Partial<RateStatus> = {}): RateStatus => ({
+    currentKbps: 16_000,
+    chosenKbps: 16_000,
+    limit: 'chosen',
+    targetKbps: 16_000,
+    uplinkKbps: 40_000,
+    medianPeerKbps: null,
+    feasibleKbps: null,
+    stalledLanes: 0,
+    ...o,
+  })
+
+  it('says what sets the bitrate, in plain words', () => {
+    expect(rateReason(st())).toBe('at chosen quality')
+    expect(rateText(st())).toBeNull()
+    expect(rateReason(st({ limit: 'uplink', uplinkKbps: 8000, currentKbps: 5500 }))).toBe('limited by your upload: ~8.0 Mbps')
+    expect(rateReason(st({ limit: 'viewers', medianPeerKbps: 3000, currentKbps: 2000 }))).toBe("limited by viewers' connections: median ~3.0 Mbps")
+    expect(rateReason(st({ limit: 'audience', currentKbps: 6000 }))).toBe('limited by audience relay capacity')
+    expect(rateReason(st({ currentKbps: 12_000 }))).toBe('rising back to the chosen quality')
+    expect(rateText(st({ limit: 'uplink', uplinkKbps: 8000, currentKbps: 5500 }))).toMatch(/^Bitrate 5\.5 Mbps of 16 Mbps: limited by your upload: ~8\.0 Mbps\./)
   })
 })
