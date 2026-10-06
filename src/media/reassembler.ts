@@ -25,6 +25,8 @@ interface FrameState {
   done: boolean
   /** Counted as incomplete (missing pieces for over INCOMPLETE_MS). */
   counted: boolean
+  /** Assembles an already emitted frame again from a requested replay. */
+  repeat: boolean
   firstSeenAt: number
   header: Fragment['header']
 }
@@ -61,15 +63,33 @@ export class Reassembler {
   /** Video frames still without k complete pieces 1 s after their first fragment (counted promptly,
    * so loss reports describe the present, not frames from seconds ago). */
   incomplete = 0
+  /** While a requested GOP replay is expected: its number, and until when (see expectReplay). */
+  private repairGen = 0
+  private repairUntil = -Infinity
 
   constructor(private onFrame: (frame: AssembledFrame) => void) {}
+
+  /**
+   * A GOP replay was requested to repair the decode chain: for `ms`, replayed fragments of frames
+   * already emitted assemble them once more, since the decoder must see them again from the
+   * keyframe on.
+   */
+  expectReplay(now: number, ms: number): void {
+    this.repairGen++
+    this.repairUntil = now + ms
+  }
 
   push(frag: Fragment, now: number): void {
     if (now - this.lastPrune > 250) this.prune(now)
     if (!wellFormed(frag)) return
     const h = frag.header
-    const id = `${h.channel}:${h.audio ? 'a' : 'v'}:${h.epoch}:${h.frameSeq}`
+    let id = `${h.channel}:${h.audio ? 'a' : 'v'}:${h.epoch}:${h.frameSeq}`
     let st = this.frames.get(id)
+    const again = !!st?.done && h.replay && now < this.repairUntil
+    if (again) {
+      id += `:r${this.repairGen}`
+      st = this.frames.get(id)
+    }
     if (!st) {
       st = {
         k: h.k,
@@ -81,6 +101,7 @@ export class Reassembler {
         replay: false,
         done: false,
         counted: false,
+        repeat: again,
         firstSeenAt: now,
         header: h,
       }
@@ -138,7 +159,8 @@ export class Reassembler {
   private prune(now: number): void {
     this.lastPrune = now
     for (const [id, st] of this.frames) {
-      if (!st.done && !st.counted && !st.header.audio && now - st.firstSeenAt > INCOMPLETE_MS) {
+      // A repeat that never completes is not loss: the frame made it the first time.
+      if (!st.done && !st.counted && !st.repeat && !st.header.audio && now - st.firstSeenAt > INCOMPLETE_MS) {
         st.counted = true
         this.incomplete++
       }

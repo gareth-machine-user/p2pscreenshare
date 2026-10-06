@@ -6,10 +6,10 @@ import type { Mesh } from '../mesh/mesh'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { wallClock } from '../net/clock'
 import type { Fragment } from '../proto/framing'
-import type { LossRates, PublisherMsg, StripeStat, SubscriberMsg, SubscriberStats, UplinkRates } from '../proto/messages'
+import type { LossRates, PeerMsg, PublisherMsg, StripeStat, SubscriberMsg, SubscriberStats, UplinkRates } from '../proto/messages'
 import { RateWindow, round1 } from './rates'
-import { treeKey, type RelayNode } from '../relay/relayNode'
-import { every } from '../net/ticker'
+import { REPLAY_REQUEST_MIN_MS, treeKey, type RelayNode } from '../relay/relayNode'
+import { after, every } from '../net/ticker'
 import { tuning } from '../tuning'
 
 const HEALTH_INTERVAL_MS = 250
@@ -27,6 +27,14 @@ const REATTACH_COOLDOWN_MS = 4000
 const RESUBSCRIBE_MS = 10_000
 /** At most one keyframe request per this interval (the decode chain often breaks in bursts). */
 const KEY_REQUEST_INTERVAL_MS = 500
+/**
+ * A broken decode chain is first repaired from the stripe parents' GOP caches (`need-gop`); only if
+ * the decoder still waits for a keyframe this long after asking does the publisher get `need-key`
+ * (a keyframe costs every viewer bandwidth and, in constant-bitrate mode, a blurry moment).
+ */
+export const GOP_REPLAY_TIMEOUT_MS = 1000
+/** How long replayed duplicates are assembled again after a `need-gop` (they queue behind live media). */
+const REPLAY_EXPECT_MS = tuning.replayMaxAgeMs + 1000
 
 export interface SubscriptionContext {
   readonly selfId: string
@@ -60,6 +68,9 @@ export class Subscription {
   private parentSetAt = new Map<number, number>()
   private lastReattach = new Map<number, number>()
   private lastKeyRequest = 0
+  private lastGopRequest = -Infinity
+  /** Cancels the pending check whether the replay repaired the chain. */
+  private escalation: (() => void) | null = null
   private frameFirstSeen = new Map<number, { at: number; stripes: Set<number> }>()
   private timers: (() => void)[] = []
   private closed = false
@@ -108,7 +119,8 @@ export class Subscription {
     const now = wallClock()
     this.reassembler.push(frag, now)
     const h = frag.header
-    if (!h.audio) this.trackLateness(h.frameSeq, h.stripe, performance.now())
+    // Replays are old frames arriving now: they say nothing about a stripe's lateness.
+    if (!h.audio && !h.replay) this.trackLateness(h.frameSeq, h.stripe, performance.now())
     if (this.pendingOk.get(h.stripe) === from) {
       this.pendingOk.delete(h.stripe)
       this.send({ t: 'stripe-ok', ch: this.channel, stripe: h.stripe, parent: from })
@@ -151,7 +163,44 @@ export class Subscription {
     this.ctx.onChange()
   }
 
+  /**
+   * The decode chain broke (or the decoder was rebuilt). First asks each stripe parent to replay its
+   * cached GOP; if the decoder still waits for a keyframe GOP_REPLAY_TIMEOUT_MS later, asks the
+   * publisher for one. A break while a replay was asked for recently only (re)arms that check.
+   */
   private requestKeyframe(): void {
+    if (this.closed) return
+    const now = performance.now()
+    if (now - this.lastGopRequest >= REPLAY_REQUEST_MIN_MS) {
+      if (!this.requestGop()) {
+        this.requestKeyFromPublisher() // no parents to ask
+        return
+      }
+      this.lastGopRequest = now
+      this.escalation?.()
+      this.escalation = null
+    }
+    this.escalation ??= after(GOP_REPLAY_TIMEOUT_MS, () => {
+      this.escalation = null
+      if (!this.closed && this.player.scheduler.waitingForKeyframe) this.requestKeyFromPublisher()
+    })
+  }
+
+  /** Sends `need-gop` to every current stripe parent; false if there are none. */
+  private requestGop(): boolean {
+    const byParent = new Map<string, number[]>()
+    this.parents.forEach((p, s) => {
+      if (p) byParent.set(p, [...(byParent.get(p) ?? []), s])
+    })
+    if (!byParent.size) return false
+    const stripes = [...byParent.values()].flat()
+    this.ctx.relay.expectReplay(this.channel, stripes)
+    this.reassembler.expectReplay(wallClock(), REPLAY_EXPECT_MS)
+    for (const [parent, s] of byParent) this.ctx.mesh.sendApp(parent, { t: 'need-gop', ch: this.channel, stripes: s } satisfies PeerMsg)
+    return true
+  }
+
+  private requestKeyFromPublisher(): void {
     const now = performance.now()
     if (now - this.lastKeyRequest < KEY_REQUEST_INTERVAL_MS) return
     this.lastKeyRequest = now
@@ -251,6 +300,7 @@ export class Subscription {
     this.closed = true
     this.send({ t: 'unsubscribe', ch: this.channel })
     this.timers.forEach((cancel) => cancel())
+    this.escalation?.()
     this.player.close()
     this.ctx.relay.dropChannel(this.channel)
   }

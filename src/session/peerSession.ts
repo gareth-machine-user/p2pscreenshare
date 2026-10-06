@@ -716,6 +716,10 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
         if (from === this.ownerId && this.requestState === 'waiting') this.requestState = 'denied'
         this.onChange()
         return
+      case 'need-gop':
+        // From a child on our trees (as a relay, or as the channel's publisher): the relay checks.
+        this.relay.requestReplay(msg.ch >>> 0, msg.stripes, from)
+        return
       case 'probe-end':
         this.uploadProbe.onEnd(msg.id, from)
         return

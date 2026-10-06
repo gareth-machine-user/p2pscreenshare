@@ -91,6 +91,30 @@ describe('DecodeScheduler', () => {
     expect(s.stats.skippedMissing).toBe(1)
   })
 
+  it('restarts a broken chain from a replayed GOP behind the decode position', () => {
+    let needKey = 0
+    const s = new DecodeScheduler(readyClock(), () => needKey++, 1000)
+    const replay = (seq: number) => ({ ...makeFrame(seq), replay: true })
+    for (const seq of [0, 1, 2, 3]) s.push(makeFrame(seq))
+    expect(s.poll(10_000).map((f) => f.seq)).toEqual([0, 1, 2, 3])
+    // Replayed repeats of decoded frames are dropped, and not counted as late.
+    s.push(replay(0))
+    expect(s.poll(10_000)).toEqual([])
+    expect(s.stats.droppedLate).toBe(0)
+    // T0 frame 4 was lost: 5 and 6 can't be decoded, and the chain breaks.
+    for (const seq of [5, 6]) s.push(makeFrame(seq))
+    expect(s.poll(10_000)).toEqual([])
+    expect(needKey).toBe(1)
+    // The parents' replay: the keyframe and base layer, including the lost frame.
+    for (const seq of [0, 4]) s.push(replay(seq))
+    expect(s.poll(10_000).map((f) => f.seq)).toEqual([0, 4])
+    expect(s.waitingForKeyframe).toBe(false)
+    expect(s.stats.droppedLate).toBe(0)
+    // Repeats behind the position are dropped again once decoding.
+    s.push(replay(4))
+    expect(s.poll(10_000)).toEqual([])
+  })
+
   it('ignores epochs: a restart with lower seqs needs a reset, which the player does on a new epoch', () => {
     let needKey = 0
     const s = new DecodeScheduler(readyClock(), () => needKey++, 1000)

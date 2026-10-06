@@ -2,10 +2,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { packetize } from '../src/media/packetizer'
 import type { Mesh } from '../src/mesh/mesh'
 import type { ChannelAnnouncement } from '../src/mesh/records'
-import { decodeFragment, NO_REF } from '../src/proto/framing'
-import type { SubscriberMsg } from '../src/proto/messages'
+import { decodeFragment, NO_REF, withReplayFlag } from '../src/proto/framing'
+import type { PeerMsg, SubscriberMsg } from '../src/proto/messages'
 import { treeKey, type RelayNode } from '../src/relay/relayNode'
-import { STRIPE_SILENCE_MS, Subscription, type SubscriptionContext } from '../src/session/subscription'
+import { GOP_REPLAY_TIMEOUT_MS, STRIPE_SILENCE_MS, Subscription, type SubscriptionContext } from '../src/session/subscription'
 
 // The ticker falls back to plain setInterval without workers; fake timers must be in place before
 // its first use and stay for the whole file (it starts once per module instance).
@@ -15,6 +15,23 @@ beforeAll(() => {
   // The player schedules rendering on animation frames.
   vi.stubGlobal('requestAnimationFrame', () => 0)
   vi.stubGlobal('cancelAnimationFrame', () => {})
+  // Just enough WebCodecs for the player to feed frames to a decoder.
+  vi.stubGlobal(
+    'VideoDecoder',
+    class {
+      state = 'unconfigured'
+      configure() {
+        this.state = 'configured'
+      }
+      decode() {
+        decodes++
+      }
+      close() {
+        this.state = 'closed'
+      }
+    },
+  )
+  vi.stubGlobal('EncodedVideoChunk', class {})
 })
 afterAll(() => {
   vi.unstubAllGlobals()
@@ -37,15 +54,25 @@ const ann: ChannelAnnouncement = {
 }
 
 let sent: SubscriberMsg[]
+/** Messages to stripe parents (anyone but the publisher). */
+let toParents: { to: string; m: PeerMsg }[]
+let decodes = 0
 let open: Set<string>
 let connecting: Set<string>
-let relay: { lastRecv: Map<string, number>; addChild: ReturnType<typeof vi.fn>; removeChild: ReturnType<typeof vi.fn>; dropChannel: ReturnType<typeof vi.fn>; allChildren: () => Set<string> }
+let relay: {
+  lastRecv: Map<string, number>
+  addChild: ReturnType<typeof vi.fn>
+  removeChild: ReturnType<typeof vi.fn>
+  dropChannel: ReturnType<typeof vi.fn>
+  expectReplay: ReturnType<typeof vi.fn>
+  allChildren: () => Set<string>
+}
 
 function makeSub(): Subscription {
   const mesh = {
     sendApp: (to: string, m: SubscriberMsg) => {
-      expect(to).toBe(PUB)
-      sent.push(m)
+      if (to === PUB) sent.push(m)
+      else toParents.push({ to, m })
       return true
     },
     linkFor: (id: string) => (open.has(id) && id !== PUB ? { rttMs: 10 } : undefined),
@@ -66,22 +93,25 @@ function makeSub(): Subscription {
 
 const ofType = <T extends SubscriberMsg['t']>(t: T) => sent.filter((m): m is Extract<SubscriberMsg, { t: T }> => m.t === t)
 
-/** One fragment of a video frame on `stripe`. */
-function fragment(seq: number, stripe: number) {
+/** One fragment of a video frame on `stripe` (as replayed from a GOP cache if `replay`). */
+function fragment(seq: number, stripe: number, replay = false) {
   const stripes = packetize(
     { epoch: 1, seq, gopId: 0, refSeq: seq === 0 ? NO_REF : seq - 1, key: seq === 0, layer: 0, audio: false, captureTime: 1000 + seq, data: new Uint8Array(300).fill(seq) },
     ann.k,
     ann.m,
     CH,
   )
-  return decodeFragment(stripes[stripe][0])!
+  const raw = stripes[stripe][0]
+  return decodeFragment(replay ? withReplayFlag(raw) : raw)!
 }
 
 beforeEach(() => {
   sent = []
+  toParents = []
+  decodes = 0
   open = new Set(['p1', 'p2'])
   connecting = new Set()
-  relay = { lastRecv: new Map(), addChild: vi.fn(), removeChild: vi.fn(), dropChannel: vi.fn(), allChildren: () => new Set() }
+  relay = { lastRecv: new Map(), addChild: vi.fn(), removeChild: vi.fn(), dropChannel: vi.fn(), expectReplay: vi.fn(), allChildren: () => new Set() }
 })
 
 describe('Subscription', () => {
@@ -172,6 +202,69 @@ describe('Subscription', () => {
     vi.advanceTimersByTime(1)
     sub.player.scheduler.reset()
     expect(ofType('need-key')).toHaveLength(2)
+    sub.close()
+  })
+
+  /** A subscription decoding frames 0..2 from parents p1 (stripes 0, 1) and p2 (stripe 2). */
+  function decoding(): Subscription {
+    const sub = makeSub()
+    sub.handle({ t: 'set-parent', ch: CH, stripe: 0, parent: 'p1' })
+    sub.handle({ t: 'set-parent', ch: CH, stripe: 1, parent: 'p1' })
+    sub.handle({ t: 'set-parent', ch: CH, stripe: 2, parent: 'p2' })
+    sub.player.setStreamInfo({ epoch: 1, codec: 'vp8', codedWidth: 16, codedHeight: 16 })
+    for (const seq of [0, 1, 2]) for (const stripe of [0, 1]) sub.onFragment(fragment(seq, stripe), 'p1')
+    expect(decodes).toBe(3)
+    expect(sub.player.scheduler.waitingForKeyframe).toBe(false)
+    vi.advanceTimersByTime(3000) // past earlier tests' replay requests
+    return sub
+  }
+
+  it('on a broken decode chain asks the stripe parents to replay their GOP before the publisher', () => {
+    const sub = decoding()
+    sub.player.scheduler.requireKeyframe()
+    expect(toParents).toEqual([
+      { to: 'p1', m: { t: 'need-gop', ch: CH, stripes: [0, 1] } },
+      { to: 'p2', m: { t: 'need-gop', ch: CH, stripes: [2] } },
+    ])
+    expect(relay.expectReplay).toHaveBeenCalledWith(CH, [0, 1, 2])
+    expect(ofType('need-key')).toHaveLength(0)
+    // Nothing came: the publisher is asked for a keyframe after the timeout, once.
+    vi.advanceTimersByTime(GOP_REPLAY_TIMEOUT_MS - 100)
+    expect(ofType('need-key')).toHaveLength(0)
+    vi.advanceTimersByTime(200)
+    expect(ofType('need-key')).toEqual([{ t: 'need-key', ch: CH }])
+    // Further breaks soon after don't ask the parents again but do re-arm the fallback.
+    sub.player.scheduler.reset()
+    expect(toParents).toHaveLength(2)
+    vi.advanceTimersByTime(GOP_REPLAY_TIMEOUT_MS + 100)
+    expect(ofType('need-key')).toHaveLength(2)
+    sub.close()
+  })
+
+  it('a replayed GOP repairs the chain, even from frames already decoded, and no keyframe is requested', () => {
+    const sub = decoding()
+    // Without having asked, replayed repeats of decoded frames are ignored (e.g. a new parent's).
+    for (const seq of [0, 1, 2]) for (const stripe of [0, 2]) sub.onFragment(fragment(seq, stripe, true), 'p1')
+    expect(decodes).toBe(3)
+    sub.player.scheduler.requireKeyframe()
+    expect(toParents).toHaveLength(2)
+    // The parents' replays (keyframe 0 onwards, plus the lost frame 3) restart decoding from the
+    // keyframe, although its fragments were all seen before.
+    for (const seq of [0, 1, 2, 3]) for (const stripe of [0, 2]) sub.onFragment(fragment(seq, stripe, true), stripe === 0 ? 'p1' : 'p2')
+    expect(sub.player.scheduler.waitingForKeyframe).toBe(false)
+    expect(decodes).toBe(3 + 4)
+    vi.advanceTimersByTime(GOP_REPLAY_TIMEOUT_MS * 2)
+    expect(ofType('need-key')).toHaveLength(0)
+    expect(sub.player.stats.late).toBe(0)
+    sub.close()
+  })
+
+  it('asks the publisher directly when there are no parents to ask', () => {
+    const sub = makeSub()
+    vi.advanceTimersByTime(3000)
+    sub.player.scheduler.reset()
+    expect(toParents).toEqual([])
+    expect(ofType('need-key')).toHaveLength(1)
     sub.close()
   })
 

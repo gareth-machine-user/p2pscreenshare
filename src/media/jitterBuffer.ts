@@ -119,8 +119,11 @@ export class DecodeScheduler {
   ) {}
 
   push(frame: AssembledFrame): void {
-    if (this.nextSeq !== null && frame.seq < this.nextSeq) {
-      this.stats.droppedLate++
+    // While the chain is broken, a replayed GOP (requested from the stripe parents) restarts it
+    // from its keyframe, which is older than what was already decoded. Otherwise replayed frames
+    // behind the decode position are repeats of frames already handled, not late ones.
+    if (this.nextSeq !== null && frame.seq < this.nextSeq && !(frame.replay && this.needKey)) {
+      if (!frame.replay) this.stats.droppedLate++
       return
     }
     this.buffer.set(frame.seq, frame)

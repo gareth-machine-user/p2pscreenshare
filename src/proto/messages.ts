@@ -138,6 +138,11 @@ export type PeerMsg =
   | { t: 'publish-req' }
   /** The owner said no (or the policy is closed). */
   | { t: 'publish-deny' }
+  /**
+   * A subscriber whose decode chain broke asks its parent on these stripes (a relay, or the
+   * publisher) to replay its cached GOP, before escalating to `need-key` for everyone.
+   */
+  | { t: 'need-gop'; ch: number; stripes: number[] }
   /** End of an upload probe (sent on the reliable channel, outside the uplink queue). */
   | { t: 'probe-end'; id: number }
   /** A neighbour's report of a probe it received from us: bytes, over its arrival window. */
@@ -151,6 +156,7 @@ export const PEER_MSG_TYPES = [
   ...PUBLISHER_MSG_TYPES,
   'publish-req',
   'publish-deny',
+  'need-gop',
   'probe-end',
   'probe-result',
 ] as const satisfies readonly PeerMsg['t'][]
@@ -181,6 +187,8 @@ const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFin
 const isIndex = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0
 const isNumOrNull = (v: unknown) => v === null || isNum(v)
 const isStrOrNull = (v: unknown) => v === null || typeof v === 'string'
+/** More stripes than any channel has (k + m); bounds lists of stripe indices. */
+const MAX_STRIPES = 64
 const isNumArray = (v: unknown, len?: number) => Array.isArray(v) && (len === undefined || v.length === len) && v.every(isNum)
 
 function isStripeStat(v: unknown): v is StripeStat {
@@ -271,6 +279,8 @@ const shapes: { [T in PeerMsg['t']]: (m: Obj) => boolean } = {
   reprobe: (m) => isNum(m.ch),
   'publish-req': () => true,
   'publish-deny': () => true,
+  // Bounded: a parent serves at most one replay per stripe anyway.
+  'need-gop': (m) => isNum(m.ch) && Array.isArray(m.stripes) && m.stripes.length > 0 && m.stripes.length <= MAX_STRIPES && m.stripes.every(isIndex),
   'probe-end': (m) => isNum(m.id),
   'probe-result': (m) => isNum(m.bytes) && isNum(m.ms),
 }
