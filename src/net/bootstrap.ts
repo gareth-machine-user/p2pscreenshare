@@ -7,8 +7,9 @@
 //
 // Offers and answers are sealed with a key derived from the join code (see lobby.ts), so only
 // peers holding the code can connect: anyone else on the swarm gets offers it can't open, and
-// answers that don't open are dropped before the host touches them.
-import { lobbyKeys, openSignal, sealSignal } from './lobby'
+// answers that don't open are dropped before the host touches them. Offers are also signed by
+// the host, so a viewer (who holds the code too) can't pose as the host to others.
+import { lobbyKeys, openSignal, sealSignal, signOffer, verifyOffer } from './lobby'
 import { DEFAULT_TRACKERS, randomPeerId, TrackerClient } from './tracker'
 
 export { randomPeerId }
@@ -45,6 +46,10 @@ export interface BootstrapOptions {
   /** The lobby's join code. */
   streamId: string
   role: 'host' | 'viewer'
+  /** Host: key to sign offers with. */
+  signingKey?: CryptoKey
+  /** Viewer: the host key pinned by the join code; offers not signed by it are ignored. */
+  hostKey?: CryptoKey
   trackers?: string[]
   iceServers?: RTCIceServer[]
   /** 20-character peer id (see randomPeerId). */
@@ -234,7 +239,8 @@ export async function joinStream<In, Out>(opts: BootstrapOptions): Promise<Contr
             const conn = new ControlConn(iceServers)
             await conn.pc.setLocalDescription(await conn.pc.createOffer())
             const offerId = randomPeerId()
-            const sdp = await sealSignal(keys, 'offer', offerId, { peerId: selfId, sdp: await conn.gathered() })
+            const body = await signOffer(opts.signingKey!, offerId, { peerId: selfId, sdp: await conn.gathered() })
+            const sdp = await sealSignal(keys, 'offer', offerId, body)
             return { offerId, conn, sdp }
           }),
         )
@@ -268,7 +274,8 @@ export async function joinStream<In, Out>(opts: BootstrapOptions): Promise<Contr
     tracker.onOffer = async (o) => {
       if (connected || pending) return
       const offer = await openSignal(keys, 'offer', o.offerId, o.sdp)
-      if (!offer || connected || pending) return // not from the host of this lobby (or raced)
+      if (!offer || !opts.hostKey || !(await verifyOffer(opts.hostKey, o.offerId, offer))) return // not this lobby's host
+      if (connected || pending) return // raced with another offer
       const conn = new ControlConn(iceServers)
       pending = conn
       attach(

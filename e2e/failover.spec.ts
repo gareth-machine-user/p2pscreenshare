@@ -55,8 +55,12 @@ test('deep tree: grandchildren do not blame healthy relays; departed children ar
   console.log('grandchild parents before/after', grandkids.map((g) => [parentOf(g).slice(0, 6), h1.topology.parents[g][0]?.slice(0, 6)]))
 
   // A leaf leaves: its parent should drop it from its child set promptly (not after ICE timeout).
-  const leaf = survivors.find((id) => h1.topology.home[id] === null && byId.has(h1.topology.parents[id][0]!))!
-  const parentPage = byId.get(h1.topology.parents[leaf][0]!)!
+  // Pick a leaf currently fed by another viewer (the topology may still be settling after the replan).
+  const pickLeaf = (h: typeof h1) =>
+    survivors.find((id) => h.topology.home[id] === null && byId.has(h.topology.parents[id]?.[0] ?? ''))
+  const h2 = await waitFor(() => hostSnapshot(host), (h) => pickLeaf(h) !== undefined, 15_000, 'a leaf with a viewer parent')
+  const leaf = pickLeaf(h2)!
+  const parentPage = byId.get(h2.topology.parents[leaf][0]!)!
   expect((await viewerSnapshot(parentPage)).childIds).toContain(leaf)
   await byId.get(leaf)!.context().close()
   const t1 = Date.now()

@@ -1,16 +1,19 @@
 import { joinStream, randomPeerId, type ControlChannel } from '../net/bootstrap'
+import { hostIdentity, type HostIdentity } from '../net/lobby'
 import { LinkManager } from '../net/linkManager'
 import { Uplink } from '../net/uplink'
 import { AudioPipeline } from '../media/audio'
 import { captureScreen, testPattern } from '../media/capture'
 import { VideoPipeline } from '../media/encoder'
 import { packetize, type EncodedFrame } from '../media/packetizer'
+import { signFrame } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
 import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
 import type { HostToViewer, StreamConfig, StreamInfo, ViewerStats, ViewerToHost } from '../proto/messages'
 
 export interface HostOptions {
+  /** The host's private seed; the lobby's join code and signing key derive from it. */
   streamId: string
   trackers?: string[]
   iceServers?: RTCIceServer[]
@@ -74,6 +77,8 @@ export class HostSession {
   readonly relay: RelayNode
   readonly config: StreamConfig
   totalChanges = 0
+  /** The viewer link's join code, once derived. */
+  joinCode: string | null = null
   onChange: () => void = () => {}
 
   private ctl: ControlChannel<ViewerToHost, HostToViewer> | null = null
@@ -88,6 +93,9 @@ export class HostSession {
   private lastPositions = new Map<string, string>()
   /** `${peer}:${stripe}` -> until when that peer's feed is known to be broken upstream. */
   private disruptedUntil = new Map<string, number>()
+  private identity: Promise<HostIdentity>
+  /** Frames are signed in order, so fragments leave in capture order. */
+  private signing: Promise<void> = Promise.resolve()
   private reattachQueue: { child: string; stripe: number; linkOpen: boolean }[] = []
   private reattachTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -103,12 +111,18 @@ export class HostSession {
     }
     this.relay = new RelayNode(this.uplink, (id) => this.links.get(id))
 
-    void joinStream<ViewerToHost, HostToViewer>({
-      streamId: opts.streamId,
-      role: 'host',
-      trackers: opts.trackers,
-      iceServers: opts.iceServers,
-      peerId: this.selfId,
+    this.identity = hostIdentity(opts.streamId)
+    void this.identity.then((id) => {
+      this.joinCode = id.joinCode
+      this.onChange()
+      return joinStream<ViewerToHost, HostToViewer>({
+        streamId: id.joinCode,
+        role: 'host',
+        signingKey: id.signingKey,
+        trackers: opts.trackers,
+        iceServers: opts.iceServers,
+        peerId: this.selfId,
+      })
     }).then((ctl) => {
       this.ctl = ctl
       ctl.onPeerJoin = (id) => this.onPeerJoin(id)
@@ -135,8 +149,9 @@ export class HostSession {
       hostId: this.selfId,
       k: this.opts.k,
       m: this.opts.m,
-      // Stripe = 1/k of the video plus the (duplicated) audio and framing overhead.
-      stripeKbps: (this.opts.bitrateKbps / this.opts.k) * 1.05 + (this.opts.audio ? 70 : 0),
+      // Stripe = 1/k of the video plus the (duplicated) audio and framing overhead, plus a 64-byte
+      // signature per fragment (~30 video and ~50 audio fragments per second).
+      stripeKbps: (this.opts.bitrateKbps / this.opts.k) * 1.05 + 15 + (this.opts.audio ? 70 + 26 : 0),
       hostUploadKbps: this.opts.hostUploadKbps,
       headroom: 0.75,
       maxFanout: 16,
@@ -179,7 +194,13 @@ export class HostSession {
 
   private emit(frame: EncodedFrame): void {
     if (frame.audio && this.stream && !this.stream.audio && this.audio?.info) this.setStream(this.stream)
-    for (const frags of packetize(frame, this.opts.k, this.opts.m)) for (const raw of frags) this.relay.inject(raw)
+    const stripes = packetize(frame, this.opts.k, this.opts.m)
+    this.signing = this.signing
+      .then(async () => {
+        await signFrame((await this.identity).signingKey, stripes, frame.audio)
+        for (const frags of stripes) for (const raw of frags) this.relay.inject(raw)
+      })
+      .catch((e) => console.warn('signing failed', e))
   }
 
   private send(to: string, msg: HostToViewer): void {

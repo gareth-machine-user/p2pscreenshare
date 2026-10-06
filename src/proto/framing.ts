@@ -2,11 +2,15 @@
 //
 // A frame is erasure-coded into k data + m parity pieces; stripe i carries piece i of every frame.
 // Pieces larger than MAX_FRAGMENT_PAYLOAD are split into fragments.
+//
+// Every fragment ends with the host's Ed25519 signature (see signedRegion), so relays can drop
+// anything the host didn't produce before forwarding it.
 
-export const WIRE_VERSION = 1
+export const WIRE_VERSION = 2
 export const HEADER_SIZE = 36
+export const SIG_SIZE = 64
 // Keep messages comfortably under the 16KiB cross-browser SCTP message limit.
-export const MAX_FRAGMENT_PAYLOAD = 16 * 1024 - HEADER_SIZE
+export const MAX_FRAGMENT_PAYLOAD = 16 * 1024 - HEADER_SIZE - SIG_SIZE
 export const NO_REF = 0xffffffff
 
 const FLAG_KEY = 1 << 0
@@ -42,12 +46,12 @@ export interface FragmentHeader {
 export interface Fragment {
   header: FragmentHeader
   payload: Uint8Array
-  /** The full encoded message (header + payload), forwarded verbatim by relays. */
+  /** The full encoded message (header + payload + signature), forwarded verbatim by relays. */
   raw: Uint8Array
 }
 
 export function encodeFragment(h: FragmentHeader, payload: Uint8Array): Uint8Array {
-  const buf = new Uint8Array(HEADER_SIZE + payload.byteLength)
+  const buf = new Uint8Array(HEADER_SIZE + payload.byteLength + SIG_SIZE)
   const v = new DataView(buf.buffer)
   v.setUint8(0, WIRE_VERSION)
   let flags = (h.layer << LAYER_SHIFT) & LAYER_MASK
@@ -68,11 +72,11 @@ export function encodeFragment(h: FragmentHeader, payload: Uint8Array): Uint8Arr
   v.setUint16(32, h.fragIdx, true)
   v.setUint16(34, h.fragCount, true)
   buf.set(payload, HEADER_SIZE)
-  return buf
+  return buf // signature left zeroed: see signedRegion
 }
 
 export function decodeFragment(raw: Uint8Array): Fragment | null {
-  if (raw.byteLength < HEADER_SIZE) return null
+  if (raw.byteLength < HEADER_SIZE + SIG_SIZE) return null
   const v = new DataView(raw.buffer, raw.byteOffset, raw.byteLength)
   if (v.getUint8(0) !== WIRE_VERSION) return null
   const flags = v.getUint8(1)
@@ -96,7 +100,9 @@ export function decodeFragment(raw: Uint8Array): Fragment | null {
   }
   if (header.fragCount === 0 || header.fragIdx >= header.fragCount) return null
   if (header.k === 0 || header.pieceIdx >= header.k + header.m) return null
-  return { header, payload: raw.subarray(HEADER_SIZE), raw }
+  // Video piece i only travels on stripe i (the stripe byte isn't signed, see signedRegion).
+  if (!header.audio && header.stripe !== header.pieceIdx) return null
+  return { header, payload: raw.subarray(HEADER_SIZE, raw.byteLength - SIG_SIZE), raw }
 }
 
 /** Returns a copy of `raw` with the replay flag set (used when serving from a GOP cache). */
@@ -104,6 +110,22 @@ export function withReplayFlag(raw: Uint8Array): Uint8Array {
   const copy = raw.slice()
   copy[1] |= FLAG_REPLAY
   return copy
+}
+
+/**
+ * The bytes the host signs: header and payload, with the two bytes relays may legitimately vary
+ * zeroed — the replay flag (set when serving from a GOP cache) and the stripe (audio frames go out
+ * identically on every stripe, so one signature covers every copy).
+ */
+export function signedRegion(raw: Uint8Array): Uint8Array<ArrayBuffer> {
+  const msg = raw.slice(0, raw.byteLength - SIG_SIZE)
+  msg[1] &= ~FLAG_REPLAY
+  msg[27] = 0
+  return msg
+}
+
+export function signatureOf(raw: Uint8Array): Uint8Array {
+  return raw.subarray(raw.byteLength - SIG_SIZE)
 }
 
 /** Fast header peeks for the relay hot path (no full decode). */

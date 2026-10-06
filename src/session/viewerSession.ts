@@ -1,12 +1,15 @@
 import { joinStream, randomPeerId, wallClock, type ControlChannel } from '../net/bootstrap'
+import { hostKeyFromCode } from '../net/lobby'
 import { LinkManager } from '../net/linkManager'
 import { Uplink } from '../net/uplink'
 import { Player } from '../media/player'
 import { Reassembler } from '../media/reassembler'
+import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
 import type { HostToViewer, StreamConfig, StreamInfo, ViewerStats, ViewerToHost } from '../proto/messages'
 
 export interface ViewerOptions {
+  /** The join code, which pins the host's public key. */
   streamId: string
   name: string
   trackers?: string[]
@@ -25,7 +28,7 @@ const REATTACH_COOLDOWN_MS = 4000
 const PROBE_DURATION_MS = 1500
 const PROBE_CHUNK = 16 * 1024
 
-export type ViewerState = 'joining' | 'connected' | 'host-lost'
+export type ViewerState = 'joining' | 'connected' | 'host-lost' | 'invalid-link'
 
 export class ViewerSession {
   state: ViewerState = 'joining'
@@ -88,31 +91,42 @@ export class ViewerSession {
       }
     }
 
-    void joinStream<HostToViewer, ViewerToHost>({
-      streamId: opts.streamId,
-      role: 'viewer',
-      trackers: opts.trackers,
-      iceServers: opts.iceServers,
-      peerId: this.selfId,
-    }).then((ctl) => {
-      this.ctl = ctl
-      ctl.onMessage = (msg, from) => this.handle(msg, from)
-      ctl.onPeerLeave = (id) => {
-        if (id === this.hostId) {
-          this.state = 'host-lost'
-          this.onChange()
-        }
-      }
-      ctl.onTrackerStatus = (c) => {
-        this.trackersConnected = c
+    void hostKeyFromCode(opts.streamId).then((hostKey) => {
+      if (!hostKey) {
+        this.state = 'invalid-link'
         this.onChange()
+        return
       }
+      this.relay.verifier = (raw) => verifyFragment(hostKey, raw)
+      return joinStream<HostToViewer, ViewerToHost>({
+        streamId: opts.streamId,
+        role: 'viewer',
+        hostKey,
+        trackers: opts.trackers,
+        iceServers: opts.iceServers,
+        peerId: this.selfId,
+      }).then((ctl) => this.attachControl(ctl))
     })
 
     this.timers.push(setInterval(() => this.checkHealth(), HEALTH_INTERVAL_MS))
     this.timers.push(setInterval(() => this.sendStats(), STATS_INTERVAL_MS))
     this.timers.push(setInterval(() => this.syncLinks(), 1000))
     this.timers.push(setInterval(() => void this.syncClock(), 15_000))
+  }
+
+  private attachControl(ctl: ControlChannel<HostToViewer, ViewerToHost>): void {
+    this.ctl = ctl
+    ctl.onMessage = (msg, from) => this.handle(msg, from)
+    ctl.onPeerLeave = (id) => {
+      if (id === this.hostId) {
+        this.state = 'host-lost'
+        this.onChange()
+      }
+    }
+    ctl.onTrackerStatus = (c) => {
+      this.trackersConnected = c
+      this.onChange()
+    }
   }
 
   private toHost(msg: ViewerToHost): void {

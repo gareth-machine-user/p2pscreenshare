@@ -1,5 +1,6 @@
 import type { Browser, Page } from '@playwright/test'
 import { TRACKER_URL } from '../playwright.config'
+import { hostIdentity } from '../src/net/lobby'
 
 export interface HostOpts {
   k: number
@@ -9,6 +10,7 @@ export interface HostOpts {
   res?: string
 }
 
+/** `streamId` is the host's seed (its `stream` param); viewers join with the derived join code. */
 export async function openHost(browser: Browser, streamId: string, o: HostOpts): Promise<Page> {
   const ctx = await browser.newContext()
   const page = await ctx.newPage()
@@ -46,7 +48,8 @@ export async function openViewer(browser: Browser, streamId: string, name: strin
   if (process.env.E2E_CONSOLE) page.on('console', (m) => console.log(`[${name}]`, m.text()))
   const q = new URLSearchParams({ tracker: TRACKER_URL, name, ice: 'none' })
   if (capKbps) q.set('up', String(capKbps))
-  await page.goto(`/#/watch/${streamId}?${q}`)
+  const { joinCode } = await hostIdentity(streamId)
+  await page.goto(`/#/watch/${joinCode}?${q}`)
   return page
 }
 

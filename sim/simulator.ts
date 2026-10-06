@@ -1,5 +1,6 @@
 // Discrete-time simulation of the striped-tree planner under churn.
-// Run: npm run sim [-- --peers 200 --seconds 300]
+// Run: npm run sim [-- --peers 200 --seconds 300 --lifetime 240 --repair 3500]
+//      npm run sim -- --sweep parity     (stall vs parity across churn levels)
 //
 // Model (deliberately simple):
 // - Each peer has a true upload capacity and an access latency; the planner sees a noisy estimate.
@@ -19,10 +20,13 @@ for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].replac
 const PEERS = Number(args.get('peers') ?? 200)
 const SECONDS = Number(args.get('seconds') ?? 300)
 const MEAN_LIFETIME_S = Number(args.get('lifetime') ?? 240)
+// Time from a parent vanishing to its subtree receiving again: 2s silence detection + 0.4s batching
+// + liveness ping + link setup + keyframe replay. ~3.5s matches what the e2e failover tests measure.
+const REPAIR_MS = Number(args.get('repair') ?? 3500)
 const BITRATE_KBPS = 2500
 const FPS = 30
 const HOST_UPLOAD_KBPS = Number(args.get('host') ?? 10000)
-const REPAIR_MS = 1000
+const MAX_FANOUT = Number(args.get('fanout') ?? 16)
 const TICK_MS = 100
 const REPLAN_EVERY_MS = 2000
 const ENCODE_MS = 30
@@ -44,7 +48,7 @@ interface SimPeer {
   leaveAt: number
 }
 
-function samplePeer(i: number, now: number): SimPeer {
+function samplePeer(i: number, now: number, lifetimeS: number): SimPeer {
   const r = rnd()
   // Rough residential mix: many weak uplinks, some strong.
   const trueKbps = r < 0.25 ? 500 : r < 0.6 ? 2000 : r < 0.85 ? 8000 : 30000
@@ -53,7 +57,7 @@ function samplePeer(i: number, now: number): SimPeer {
     trueKbps,
     accessMs: 5 + rnd() * 45,
     joinedAt: now,
-    leaveAt: now - Math.log(1 - rnd()) * MEAN_LIFETIME_S * 1000,
+    leaveAt: now - Math.log(1 - rnd()) * lifetimeS * 1000,
   }
 }
 
@@ -70,11 +74,14 @@ interface Result {
   p95: number
   maxDepth: number
   stallPct: number
+  /** Distinct stalls per viewer-hour, and their mean length. */
+  stallsPerHour: number
+  meanStallMs: number
   degradedPct: number
   changesPerMin: number
 }
 
-function run(k: number, m: number): Result {
+function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAIR_MS): Result {
   seed = Number(args.get('seed') ?? 42)
   const S = k + m
   const stripeKbps = (BITRATE_KBPS / k) * 1.03
@@ -85,7 +92,7 @@ function run(k: number, m: number): Result {
     stripeKbps,
     hostUploadKbps: HOST_UPLOAD_KBPS,
     headroom: 0.8,
-    maxFanout: 16,
+    maxFanout: MAX_FANOUT,
     minUptimeMsForRelay: 5000,
     switchGain: 1,
   }
@@ -96,7 +103,7 @@ function run(k: number, m: number): Result {
   let nextId = 0
   const live = new Map<string, SimPeer>()
   const add = (now: number) => {
-    const p = samplePeer(nextId++, now)
+    const p = samplePeer(nextId++, now, lifetimeS)
     live.set(p.id, p)
     access.set(p.id, p.accessMs)
     trueCap.set(p.id, p.trueKbps)
@@ -112,6 +119,8 @@ function run(k: number, m: number): Result {
   const latencies: number[] = []
   let maxDepth = 0
   let stallTicks = 0
+  let stallEvents = 0
+  const stalled = new Set<string>()
   let degradedTicks = 0
   let viewerTicks = 0
 
@@ -154,12 +163,13 @@ function run(k: number, m: number): Result {
       for (let s = 0; s < S; s++) {
         for (const d of descendants(p.id, s)) {
           const o = outage.get(d) ?? new Array(S).fill(-Infinity)
-          o[s] = Math.max(o[s], now + REPAIR_MS)
+          o[s] = Math.max(o[s], now + repairMs)
           outage.set(d, o)
         }
       }
       live.delete(p.id)
       outage.delete(p.id)
+      stalled.delete(p.id)
       departed = true
     }
     // Arrivals keep the audience roughly stable.
@@ -178,7 +188,15 @@ function run(k: number, m: number): Result {
       viewerTicks++
       const o = outage.get(p.id)
       const missing = o ? o.filter((t) => t > now).length : 0
-      if (missing > m) stallTicks++
+      if (missing > m) {
+        stallTicks++
+        if (!stalled.has(p.id)) {
+          stalled.add(p.id)
+          stallEvents++
+        }
+      } else {
+        stalled.delete(p.id)
+      }
 
       const stripeLat: number[] = []
       const stripeQuality: number[] = []
@@ -219,27 +237,62 @@ function run(k: number, m: number): Result {
     p95: quantile(latencies, 0.95),
     maxDepth,
     stallPct: (100 * stallTicks) / viewerTicks,
+    stallsPerHour: stallEvents / ((viewerTicks * TICK_MS) / 3_600_000),
+    meanStallMs: stallEvents ? (stallTicks * TICK_MS) / stallEvents : 0,
     degradedPct: (100 * degradedTicks) / viewerTicks,
     changesPerMin: changes / (SECONDS / 60),
   }
 }
 
-const configs: [number, number][] = [
-  [1, 0],
-  [2, 0],
-  [4, 0],
-  [4, 1],
-  [4, 2],
-  [8, 2],
-]
-console.log(
-  `peers=${PEERS} seconds=${SECONDS} meanLifetime=${MEAN_LIFETIME_S}s bitrate=${BITRATE_KBPS}kbps hostUpload=${HOST_UPLOAD_KBPS}kbps\n`,
-)
-console.log('k  m | p50 ms | p95 ms | max depth | stall % | degraded % | parent changes/min')
-console.log('-----+--------+--------+-----------+---------+------------+-------------------')
-for (const [k, m] of configs) {
-  const r = run(k, m)
+function fmtRow(r: Result): string {
+  return `${String(r.k).padEnd(2)} ${String(r.m).padEnd(1)} | ${r.p50.toFixed(0).padStart(6)} | ${r.p95.toFixed(0).padStart(6)} | ${String(r.maxDepth).padStart(9)} | ${r.stallPct.toFixed(3).padStart(7)} | ${r.stallsPerHour.toFixed(2).padStart(9)} | ${r.degradedPct.toFixed(2).padStart(10)} | ${r.changesPerMin.toFixed(0).padStart(18)}`
+}
+
+if (args.get('sweep') === 'parity') {
+  // How much does parity buy? Stall time (% of viewing time) for each (k, m) across churn levels.
+  const lifetimes = [60, 240, 900]
+  const configs: [number, number][] = [
+    [1, 0],
+    [2, 0],
+    [2, 1],
+    [2, 2],
+    [4, 0],
+    [4, 1],
+    [4, 2],
+    [4, 3],
+    [8, 0],
+    [8, 2],
+    [8, 4],
+  ]
+  console.log(`peers=${PEERS} seconds=${SECONDS} repair=${REPAIR_MS}ms bitrate=${BITRATE_KBPS}kbps hostUpload=${HOST_UPLOAD_KBPS}kbps`)
+  console.log('stall % of viewing time (stalls per viewer-hour) by mean viewer lifetime\n')
+  console.log(`k  m | overhead | ${lifetimes.map((l) => `life ${l}s`.padStart(16)).join(' | ')} | degraded % (240s)`)
+  console.log(`-----+----------+-${lifetimes.map(() => '-'.repeat(16)).join('-+-')}-+------------------`)
+  for (const [k, m] of configs) {
+    const cells: string[] = []
+    let degraded = 0
+    for (const l of lifetimes) {
+      const r = run(k, m, l)
+      cells.push(`${r.stallPct.toFixed(3)} (${r.stallsPerHour.toFixed(1)})`.padStart(16))
+      if (l === 240) degraded = r.degradedPct
+    }
+    console.log(`${String(k).padEnd(2)} ${m} | ${`${Math.round((100 * m) / k)}%`.padStart(8)} | ${cells.join(' | ')} | ${degraded.toFixed(2).padStart(17)}`)
+  }
+} else {
+  // --only 4:1,8:4 restricts the table to specific (k, m) pairs.
+  const only = args.get('only')?.split(',').map((x) => x.split(':').map(Number) as [number, number])
+  const configs: [number, number][] = only ?? [
+    [1, 0],
+    [2, 0],
+    [4, 0],
+    [4, 1],
+    [4, 2],
+    [8, 2],
+  ]
   console.log(
-    `${String(r.k).padEnd(2)} ${String(r.m).padEnd(1)} | ${r.p50.toFixed(0).padStart(6)} | ${r.p95.toFixed(0).padStart(6)} | ${String(r.maxDepth).padStart(9)} | ${r.stallPct.toFixed(3).padStart(7)} | ${r.degradedPct.toFixed(2).padStart(10)} | ${r.changesPerMin.toFixed(0).padStart(18)}`,
+    `peers=${PEERS} seconds=${SECONDS} meanLifetime=${MEAN_LIFETIME_S}s repair=${REPAIR_MS}ms fanout=${MAX_FANOUT} bitrate=${BITRATE_KBPS}kbps hostUpload=${HOST_UPLOAD_KBPS}kbps\n`,
   )
+  console.log('k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent changes/min')
+  console.log('-----+--------+--------+-----------+---------+-----------+------------+-------------------')
+  for (const [k, m] of configs) console.log(fmtRow(run(k, m)))
 }

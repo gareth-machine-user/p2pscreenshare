@@ -77,6 +77,8 @@
     <canvas bind:this={canvas} data-testid="video"></canvas>
     {#if snap.state === 'joining'}
       <div class="overlay-msg">Looking for the host via trackers… ({snap.trackers} connected)</div>
+    {:else if snap.state === 'invalid-link'}
+      <div class="overlay-msg">This link is incomplete — ask the host for the full viewer link.</div>
     {:else if snap.state === 'host-lost'}
       <div class="overlay-msg">The host disconnected.</div>
     {:else if snap.player.decodedFrames === 0}

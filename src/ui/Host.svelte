@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte'
   import { HostSession } from '../session/hostSession'
-  import { newJoinCode } from '../net/lobby'
+  import { newHostSeed } from '../net/lobby'
   import { fmtKbps, fmtMs, iceFrom, numParam, trackersFrom } from './route'
   import TreeView from './components/TreeView.svelte'
 
@@ -9,8 +9,9 @@
   // The page is remounted on every route change, so reading the initial props is intended.
   const params = untrack(() => props.params)
 
-  // The stream id is the lobby's join code: whoever has the viewer link can join, nobody else.
-  const streamId = params.get('stream') ?? newJoinCode()
+  // This page's `stream` param is the host's private seed: the viewer link's join code and the
+  // key that signs the stream derive from it. Share the viewer link, never this page's URL.
+  const streamId = params.get('stream') ?? newHostSeed()
   if (!params.get('stream')) {
     params.set('stream', streamId)
     history.replaceState(null, '', `#/host?${params}`)
@@ -51,7 +52,10 @@
   // Carry tracker/ICE overrides into the viewer link.
   const shared = new URLSearchParams()
   for (const key of ['tracker', 'ice']) if (params.get(key)) shared.set(key, params.get(key)!)
-  const watchUrl = `${base}#/watch/${streamId}${shared.size ? `?${shared}` : ''}`
+  const watchUrl = $derived.by(() => {
+    void tick
+    return session.joinCode ? `${base}#/watch/${session.joinCode}${shared.size ? `?${shared}` : ''}` : ''
+  })
 
   async function start() {
     error = null
@@ -119,7 +123,7 @@
     <div>
       <div class="label">Viewer link</div>
       <div class="link-row">
-        <code data-testid="watch-url">{watchUrl}</code>
+        <code data-testid="watch-url">{watchUrl || 'Preparing link…'}</code>
         <button onclick={copy}>Copy</button>
       </div>
     </div>

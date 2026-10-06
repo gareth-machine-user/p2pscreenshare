@@ -1,4 +1,4 @@
-import { decodeFragment, peekIsKey, peekLayer, withReplayFlag, type Fragment } from '../proto/framing'
+import { decodeFragment, peekIsKey, peekLayer, withReplayFlag, type Fragment, type FragmentHeader } from '../proto/framing'
 import type { PeerLink } from '../net/link'
 import type { Uplink } from '../net/uplink'
 
@@ -14,10 +14,13 @@ interface StripeCache {
   bytes: number
 }
 
+const fragId = (h: FragmentHeader) => `${h.audio ? 'a' : 'v'}${h.stripe}:${h.epoch}:${h.frameSeq}:${h.pieceIdx}:${h.fragIdx}`
+
 /**
  * Forwards fragments verbatim to children (cut-through, per stripe), de-duplicates (e.g. while two
  * parents overlap during make-before-break), and keeps a per-stripe cache of the current GOP so a
- * newly attached child can start decoding immediately.
+ * newly attached child can start decoding immediately. Received fragments are only forwarded or
+ * played once their host signature verifies.
  */
 export class RelayNode {
   private children = new Map<number, Set<string>>()
@@ -31,6 +34,12 @@ export class RelayNode {
 
   /** Called for every new (non-duplicate) fragment, for local playback. */
   onFragment: (frag: Fragment, from: string) => void = () => {}
+  /** Checks a received fragment's host signature. Unset: nothing received is accepted. */
+  verifier: ((raw: Uint8Array) => Promise<boolean>) | null = null
+  /** Received fragments dropped for a bad signature or for being stale. */
+  rejected = 0
+  /** Newest capture time among verified fragments. */
+  private newestCapture = 0
 
   constructor(
     private uplink: Uplink,
@@ -89,13 +98,25 @@ export class RelayNode {
   /** Fragment received from a parent. */
   receive(raw: Uint8Array, from: string): void {
     const frag = decodeFragment(raw)
-    if (frag) this.handle(frag, from)
+    const verifier = this.verifier
+    // Skip verifying duplicates. Only verified fragments are marked seen, so a forgery can't
+    // shadow the genuine fragment with the same id.
+    if (!frag || !verifier || this.seen.has(fragId(frag.header))) return
+    void verifier(raw).then((ok) => {
+      // Signed fragments older than the de-dup window can't be told apart from a replay.
+      if (!ok || frag.header.captureTime < this.newestCapture - SEEN_RETAIN_MS) {
+        this.rejected++
+        return
+      }
+      this.newestCapture = Math.max(this.newestCapture, frag.header.captureTime)
+      this.handle(frag, from)
+    })
   }
 
   private handle(frag: Fragment, from: string): void {
     const h = frag.header
     const now = performance.now()
-    const id = `${h.audio ? 'a' : 'v'}${h.stripe}:${h.epoch}:${h.frameSeq}:${h.pieceIdx}:${h.fragIdx}`
+    const id = fragId(h)
     if (this.seen.has(id)) return
     this.seen.set(id, now)
     if (now - this.lastSeenPrune > 1000) {
