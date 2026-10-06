@@ -1,9 +1,25 @@
+import { statfsSync } from 'node:fs'
 import { defineConfig } from '@playwright/test'
 
 // Overridable so two checkouts can run suites side by side: servers on these ports are reused
 // (reuseExistingServer), so a shared port would silently test the other checkout's code.
 const TRACKER_PORT = Number(process.env.E2E_TRACKER_PORT) || 8765
 const APP_PORT = Number(process.env.E2E_APP_PORT) || 5179
+
+// Playwright launches Chromium with --disable-dev-shm-usage (for Docker's 64 MB /dev/shm), which
+// puts its shared memory (video frames, IPC buffers) in files under /tmp. Where /tmp is on disk,
+// nine pages of video write tens of MB/s there, and under memory pressure every renderer blocks on
+// writeback for seconds at a time: all pages freeze at once and fps/latency checks fail. Keep
+// shared memory in /dev/shm when it is big enough.
+function devShmBytes(): number {
+  try {
+    const s = statfsSync('/dev/shm')
+    return s.blocks * s.bsize
+  } catch {
+    return 0
+  }
+}
+const USE_DEV_SHM = devShmBytes() >= 1024 ** 3
 
 export default defineConfig({
   testDir: './e2e',
@@ -13,6 +29,7 @@ export default defineConfig({
   use: {
     baseURL: `http://localhost:${APP_PORT}`,
     launchOptions: {
+      ignoreDefaultArgs: USE_DEV_SHM ? ['--disable-dev-shm-usage'] : undefined,
       // On systems where Playwright's bundled browser can't run (e.g. NixOS), point at a system Chromium.
       executablePath: process.env.CHROMIUM_PATH || undefined,
       // Optional LD_PRELOAD for the browser only (see tools/nosme: ARM64 VMs that advertise but trap SME).
