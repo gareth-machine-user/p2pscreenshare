@@ -209,7 +209,7 @@ membership layer handles everything else.
 | A peer leaves | Its goodbye record, or 6 s without anything fresh | Removed from every channel it watched | ≤ 6 s |
 | A relay is consistently late | Every viewer measures how far behind the first piece of each frame each stripe arrives; the publisher attributes the excess to the parent | Lateness counts as a parent-choice penalty; a parent late by more than 150 ms for 10 s loses its children there for 30 s | 10 s |
 | Several publishers compete for relays | Channel announcements carry the latest plan's `deficit` | Every 10 s each peer moves 10% of its budget weight from channels without a deficit to those with one | a few rounds |
-| The audience can't upload enough | Offered slots below 90% of the N × S needed for 10 s | The presenter sees "Audience upload is limited: about X Mbps will play smoothly"; with Auto quality the stream restarts at that bitrate | ~10 s + blip |
+| The audience can't upload enough | Offered slots below 90% of the N × S needed for 10 s | The presenter sees "Audience upload is limited: about X Mbps will play smoothly"; with Auto quality the encoder drops to that bitrate (in place, no new capture) | ~10 s |
 | Upload estimates go stale | Every 5 min while relaying lightly, or when a publisher whose channel is overcommitted asks | Re-probe | — |
 
 Measured in the e2e tests on one machine:

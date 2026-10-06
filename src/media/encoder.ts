@@ -1,4 +1,5 @@
 import { wallClock } from '../net/clock'
+import { sleep } from '../net/ticker'
 import { NO_REF } from '../proto/framing'
 import { toBase64, type StreamInfo } from '../proto/messages'
 import { frameReader } from './capture'
@@ -123,7 +124,8 @@ export class VideoPipeline {
     for (;;) {
       const res = await Promise.race([
         pending.then((f) => ({ f })),
-        new Promise<null>((r) => setTimeout(() => r(null), IDLE_REFRESH_MS)),
+        // Worker-driven: a presenter's backgrounded tab keeps refreshing (timers there are throttled).
+        sleep(IDLE_REFRESH_MS).then(() => null),
       ])
       if (this.stopped) break
       let frame: VideoFrame

@@ -42,7 +42,9 @@
   })
 
   $effect(() => {
-    if (video) video.srcObject = localStream
+    // Only on a real change: re-assigning even the same stream restarts playback (a visible blink),
+    // and Svelte re-runs this whenever the parent re-renders (object props never compare equal).
+    if (video && video.srcObject !== localStream) video.srcObject = localStream
   })
 
   $effect(() => {

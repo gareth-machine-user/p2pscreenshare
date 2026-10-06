@@ -1,5 +1,6 @@
 import { decodeFragment, peekIsKey, peekLayer, withReplayFlag, type Fragment, type FragmentHeader } from '../proto/framing'
 import type { MediaLink } from '../net/link'
+import { after } from '../net/ticker'
 import type { Uplink } from '../net/uplink'
 
 const SEEN_RETAIN_MS = 5000
@@ -106,7 +107,7 @@ export class RelayNode {
     const link = this.linkFor(child)
     if (!link || !link.isOpen) {
       if (attempt < 60 && this.children.get(key)?.has(child)) {
-        setTimeout(() => this.replayTo(key, child, attempt + 1), 200)
+        after(200, () => this.replayTo(key, child, attempt + 1))
       }
       return
     }

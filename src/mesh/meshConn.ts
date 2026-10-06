@@ -22,6 +22,8 @@ export class MeshConn implements MediaLink {
   wasOpen = false
   /** Whether the remote SDP arrived, so ICE was actually attempted. */
   haveRemote = false
+  /** Peer id of the side that made the offer (breaks ties between duplicate connections). */
+  offerer = ''
   /** Liveness: last ping sent, last pong (or any message) received. */
   pingSentAt: number | null = null
   lastHeardAt = performance.now()
@@ -38,7 +40,7 @@ export class MeshConn implements MediaLink {
 
   private pingSeq = 0
   private pongWaiters = new Map<number, { sentAt: number; resolve: (remoteClock: number) => void }>()
-  private timeout: ReturnType<typeof setTimeout>
+  private timeout: ReturnType<typeof setTimeout> | null = null
 
   constructor(
     iceServers: RTCIceServer[],
@@ -80,9 +82,17 @@ export class MeshConn implements MediaLink {
       if (this.pc.connectionState === 'failed') this.setState('failed')
       if (this.pc.connectionState === 'closed') this.setState('closed')
     }
+  }
+
+  /**
+   * Starts the connect deadline. Called once an attempt is really under way (an answer is out, or
+   * the remote SDP arrived): a door's pooled offer may wait on the tracker for much longer.
+   */
+  armTimeout(ms = CONNECT_TIMEOUT_MS): void {
+    if (this.timeout !== null || this.state !== 'connecting') return
     this.timeout = setTimeout(() => {
       if (this.state === 'connecting') this.setState('failed')
-    }, CONNECT_TIMEOUT_MS)
+    }, ms)
   }
 
   /** Waits for ICE gathering (signaling is not trickled), bounded by a timeout. */
@@ -109,6 +119,7 @@ export class MeshConn implements MediaLink {
   async acceptOffer(sdp: string): Promise<string> {
     await this.pc.setRemoteDescription({ type: 'offer', sdp })
     this.haveRemote = true
+    this.armTimeout()
     await this.pc.setLocalDescription(await this.pc.createAnswer())
     return this.gathered()
   }
@@ -116,6 +127,7 @@ export class MeshConn implements MediaLink {
   async acceptAnswer(sdp: string): Promise<void> {
     await this.pc.setRemoteDescription({ type: 'answer', sdp })
     this.haveRemote = true
+    this.armTimeout()
   }
 
   get isOpen(): boolean {
@@ -244,7 +256,7 @@ export class MeshConn implements MediaLink {
     if (this.state === state || this.state === 'closed' || this.state === 'failed') return
     this.state = state
     if (state === 'open') this.wasOpen = true
-    if (state !== 'connecting') clearTimeout(this.timeout)
+    if (state !== 'connecting' && this.timeout !== null) clearTimeout(this.timeout)
     if (state === 'closed' || state === 'failed') {
       try {
         this.pc.close()

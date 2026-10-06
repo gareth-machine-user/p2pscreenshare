@@ -16,6 +16,7 @@ import type { RelayNode } from '../relay/relayNode'
 import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
 import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
+import { after, every } from '../net/ticker'
 
 export interface ShareOptions {
   k: number
@@ -98,9 +99,9 @@ export class ChannelPublisher {
   totalChanges = 0
   stream: StreamInfo | null = null
 
-  private pendingRemovals = new Map<string, { oldParent: string; timer: ReturnType<typeof setTimeout> }>()
-  private replanTimer: ReturnType<typeof setTimeout> | null = null
-  private timers: ReturnType<typeof setInterval>[] = []
+  private pendingRemovals = new Map<string, { oldParent: string; cancel: () => void }>()
+  private replanTimer: (() => void) | null = null
+  private timers: (() => void)[] = []
   private lastKeyRequest = 0
   private lastPositions = new Map<string, string>()
   /** `${peer}:${stripe}` -> until when that peer's feed is known to be broken upstream. */
@@ -108,7 +109,7 @@ export class ChannelPublisher {
   /** Frames are signed in order, so fragments leave in capture order. */
   private signing: Promise<void> = Promise.resolve()
   private reattachQueue: { child: string; stripe: number; linkOpen: boolean }[] = []
-  private reattachTimer: ReturnType<typeof setTimeout> | null = null
+  private reattachTimer: (() => void) | null = null
   private topoWatchers = new Set<string>()
   private stopped = false
   /** Bytes emitted per stripe since the last measurement, and the smoothed result (kbps). */
@@ -129,15 +130,16 @@ export class ChannelPublisher {
     readonly kind: 'full' | 'preview',
     readonly k: number,
     readonly m: number,
-    readonly kbps: number,
+    /** Video bitrate; changed in place by quality changes and Auto quality. */
+    public kbps: number,
     readonly withAudio: boolean,
     private ctx: PublisherContext,
     private requestKeyframe: () => void,
   ) {
-    this.timers.push(setInterval(() => this.replan(), REPLAN_INTERVAL_MS))
-    this.timers.push(setInterval(() => this.checkLiveness(), 250))
-    this.timers.push(setInterval(() => void this.sendTopology(), TOPOLOGY_REPORT_MS))
-    this.timers.push(setInterval(() => this.measureStripes(), 2000))
+    this.timers.push(every(REPLAN_INTERVAL_MS, () => this.replan()))
+    this.timers.push(every(250, () => this.checkLiveness()))
+    this.timers.push(every(TOPOLOGY_REPORT_MS, () => void this.sendTopology()))
+    this.timers.push(every(2000, () => this.measureStripes()))
   }
 
   /**
@@ -314,7 +316,7 @@ export class ChannelPublisher {
     for (const [key, pr] of this.pendingRemovals) {
       const [child, stripe] = key.split(':')
       if (child === id || pr.oldParent === id) {
-        clearTimeout(pr.timer)
+        pr.cancel()
         this.pendingRemovals.delete(key)
         if (child === id) this.removeEdge(pr.oldParent, id, Number(stripe))
       }
@@ -333,7 +335,7 @@ export class ChannelPublisher {
   private queueReattach(child: string, stripe: number, linkOpen: boolean): void {
     this.reattachQueue.push({ child, stripe, linkOpen })
     if (this.reattachTimer === null) {
-      this.reattachTimer = setTimeout(() => this.processReattaches(), REATTACH_BATCH_MS)
+      this.reattachTimer = after(REATTACH_BATCH_MS, () => this.processReattaches())
     }
   }
 
@@ -424,12 +426,12 @@ export class ChannelPublisher {
   private scheduleReplan(delay = 50): void {
     if (this.replanTimer !== null) {
       if (delay > 0) return
-      clearTimeout(this.replanTimer)
+      this.replanTimer()
     }
-    this.replanTimer = setTimeout(() => {
+    this.replanTimer = after(delay, () => {
       this.replanTimer = null
       this.replan()
-    }, delay)
+    })
   }
 
   /** Slots a subscriber offered for this channel in its gossip record. */
@@ -566,7 +568,7 @@ export class ChannelPublisher {
 
     const prev = this.pendingRemovals.get(key)
     if (prev) {
-      clearTimeout(prev.timer)
+      prev.cancel()
       this.pendingRemovals.delete(key)
       // The older pending parent is superseded too.
       if (prev.oldParent !== c.to) this.removeEdge(prev.oldParent, c.peer, c.stripe)
@@ -574,8 +576,8 @@ export class ChannelPublisher {
     if (c.from !== null && (c.from === this.ctx.selfId || this.subscribers.has(c.from))) {
       // Make-before-break: keep the old parent feeding until the new one delivers.
       const oldParent = c.from
-      const timer = setTimeout(() => this.completeRemoval(c.peer, c.stripe, null), REMOVAL_TIMEOUT_MS)
-      this.pendingRemovals.set(key, { oldParent, timer })
+      const cancel = after(REMOVAL_TIMEOUT_MS, () => this.completeRemoval(c.peer, c.stripe, null))
+      this.pendingRemovals.set(key, { oldParent, cancel })
     }
   }
 
@@ -585,7 +587,7 @@ export class ChannelPublisher {
     if (!pr) return
     const current = this.topology.parents[peer]?.[stripe]
     if (deliveredBy !== null && deliveredBy !== current) return
-    clearTimeout(pr.timer)
+    pr.cancel()
     this.pendingRemovals.delete(key)
     if (pr.oldParent !== current) this.removeEdge(pr.oldParent, peer, stripe)
   }
@@ -640,10 +642,10 @@ export class ChannelPublisher {
 
   stop(): void {
     this.stopped = true
-    this.timers.forEach(clearInterval)
-    if (this.replanTimer) clearTimeout(this.replanTimer)
-    if (this.reattachTimer) clearTimeout(this.reattachTimer)
-    for (const pr of this.pendingRemovals.values()) clearTimeout(pr.timer)
+    this.timers.forEach((cancel) => cancel())
+    this.replanTimer?.()
+    this.reattachTimer?.()
+    for (const pr of this.pendingRemovals.values()) pr.cancel()
     this.ctx.relay.dropChannel(this.id)
   }
 }
@@ -757,6 +759,26 @@ export class PublishedStream {
     const small = new VideoFrame(this.previewCanvas, { timestamp: frame.timestamp })
     this.previewBusy = true
     void this.preview.encodeExternal(small).finally(() => (this.previewBusy = false))
+  }
+
+  /**
+   * Changes bitrate (and the capture size cap) in place: the encoder reconfigures and sends a
+   * keyframe, with no new capture (which would need the user to pick a screen again) and no new
+   * channel.
+   */
+  async setQuality(bitrateKbps: number, maxSize?: [number, number]): Promise<void> {
+    const full = this.full
+    if (!full || !this.video) return
+    full.kbps = bitrateKbps
+    ;(this.opts as { bitrateKbps: number }).bitrateKbps = bitrateKbps
+    this.video.setBitrate(bitrateKbps)
+    const track = this.localStream?.getVideoTracks()[0]
+    if (maxSize && track && this.opts.source !== 'test') {
+      await track.applyConstraints({ width: { max: maxSize[0] }, height: { max: maxSize[1] }, frameRate: { ideal: 30, max: 30 } }).catch(() => {})
+      ;(this.opts as { maxSize?: [number, number] }).maxSize = maxSize
+    }
+    full.limited = null
+    this.ctx.announce()
   }
 
   setSystemMuted(muted: boolean): void {

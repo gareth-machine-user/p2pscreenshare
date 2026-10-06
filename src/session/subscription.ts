@@ -8,6 +8,7 @@ import { wallClock } from '../net/clock'
 import type { Fragment } from '../proto/framing'
 import type { PublisherMsg, StripeStat, SubscriberMsg, SubscriberStats } from '../proto/messages'
 import { treeKey, type RelayNode } from '../relay/relayNode'
+import { every } from '../net/ticker'
 
 const HEALTH_INTERVAL_MS = 250
 const STATS_INTERVAL_MS = 2000
@@ -50,7 +51,7 @@ export class Subscription {
   private lastReattach = new Map<number, number>()
   private lastKeyRequest = 0
   private frameFirstSeen = new Map<number, { at: number; stripes: Set<number> }>()
-  private timers: ReturnType<typeof setInterval>[] = []
+  private timers: (() => void)[] = []
   private closed = false
 
   constructor(
@@ -64,10 +65,10 @@ export class Subscription {
     this.reassembler = new Reassembler((f) => this.player.push(f))
     this.setAnnouncement(ann)
     this.subscribe()
-    this.timers.push(setInterval(() => this.checkHealth(), HEALTH_INTERVAL_MS))
-    this.timers.push(setInterval(() => void this.sendStats(), STATS_INTERVAL_MS))
-    this.timers.push(setInterval(() => this.subscribe(), RESUBSCRIBE_MS))
-    this.timers.push(setInterval(() => void this.syncClock(), 15_000))
+    this.timers.push(every(HEALTH_INTERVAL_MS, () => this.checkHealth()))
+    this.timers.push(every(STATS_INTERVAL_MS, () => void this.sendStats()))
+    this.timers.push(every(RESUBSCRIBE_MS, () => this.subscribe()))
+    this.timers.push(every(15_000, () => void this.syncClock()))
     void this.syncClock()
   }
 
@@ -218,7 +219,7 @@ export class Subscription {
     if (this.closed) return
     this.closed = true
     this.send({ t: 'unsubscribe', ch: this.channel })
-    this.timers.forEach(clearInterval)
+    this.timers.forEach((cancel) => cancel())
     this.player.close()
     this.ctx.relay.dropChannel(this.channel)
   }

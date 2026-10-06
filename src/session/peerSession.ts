@@ -19,6 +19,7 @@ import { RelayNode } from '../relay/relayNode'
 import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor } from './capacity'
 import { PublishedStream, type ChannelPublisher, type PublisherContext, type ShareOptions } from './publisher'
 import { Subscription, type SubscriptionContext } from './subscription'
+import { after, every } from '../net/ticker'
 
 export interface PeerSessionOptions {
   joinCode: string
@@ -118,8 +119,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private probeReplies = new Map<string, (r: { bytes: number; ms: number }) => void>()
   private uplinkSampleAt = { at: performance.now(), sent: 0, sentItems: 0, dropped: 0 }
   private uplinkNow = { kbps: 0, dropRate: 0 }
-  private reconcileTimer: ReturnType<typeof setTimeout> | null = null
-  private timers: ReturnType<typeof setInterval>[] = []
+  private reconcileTimer: (() => void) | null = null
+  private timers: (() => void)[] = []
   private topoWatching = new Set<number>()
   private lastProbeAt = -Infinity
   private lastAutoRestart = -Infinity
@@ -172,13 +173,13 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   async start(): Promise<void> {
     await this.mesh.start()
-    this.timers.push(setInterval(() => this.sampleUplink(), 2000))
-    this.timers.push(setInterval(() => this.maybeProbe(), 1000))
-    this.timers.push(setInterval(() => this.checkAutoQuality(), 500))
-    this.timers.push(setInterval(() => this.rebalance(), REBALANCE_MS))
-    this.timers.push(setInterval(() => this.checkAutoBitrate(), 2000))
-    this.timers.push(setInterval(() => this.maybeReprobe(), 30_000))
-    this.timers.push(setInterval(() => this.logStage(), 100))
+    this.timers.push(every(2000, () => this.sampleUplink()))
+    this.timers.push(every(1000, () => this.maybeProbe()))
+    this.timers.push(every(500, () => this.checkAutoQuality()))
+    this.timers.push(every(REBALANCE_MS, () => this.rebalance()))
+    this.timers.push(every(2000, () => this.checkAutoBitrate()))
+    this.timers.push(every(30_000, () => this.maybeReprobe()))
+    this.timers.push(every(100, () => this.logStage()))
   }
 
   // --- channels ----------------------------------------------------------------------------------
@@ -231,12 +232,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private scheduleReconcile(delay = 50): void {
     if (this.reconcileTimer !== null) {
       if (delay > 0) return
-      clearTimeout(this.reconcileTimer)
+      this.reconcileTimer()
     }
-    this.reconcileTimer = setTimeout(() => {
+    this.reconcileTimer = after(delay, () => {
       this.reconcileTimer = null
       this.reconcile()
-    }, delay)
+    })
   }
 
   /** The preview channel of a publisher's stream, if announced. */
@@ -530,7 +531,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   /**
    * Auto quality for a presenter: when the audience's upload can't carry the stream for 10 s, the
-   * publisher's sharing controls warn, and with Auto quality the stream restarts at a bitrate it
+   * publisher's sharing controls warn, and with Auto quality the encoder drops to a bitrate it
    * can carry (a brief blip).
    */
   private checkAutoBitrate(): void {
@@ -540,7 +541,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const now = performance.now()
     if (now - this.lastAutoRestart < AUTO_RESTART_GAP_MS || full.limited.feasibleKbps >= s.opts.bitrateKbps) return
     this.lastAutoRestart = now
-    void this.share({ ...s.opts, bitrateKbps: full.limited.feasibleKbps }).catch((e) => console.warn('auto quality restart failed', e))
+    // In place: re-capturing would need the user to pick the screen again.
+    void s.setQuality(full.limited.feasibleKbps)
   }
 
   /**
@@ -809,7 +811,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   async leave(): Promise<void> {
-    this.timers.forEach(clearInterval)
+    this.timers.forEach((cancel) => cancel())
     this.stopSharing()
     for (const sub of this.subs.values()) sub.close()
     this.subs.clear()

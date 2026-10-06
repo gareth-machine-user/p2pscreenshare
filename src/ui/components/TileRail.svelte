@@ -37,7 +37,8 @@
     node.srcObject = stream
     return {
       update(s: MediaStream | null) {
-        node.srcObject = s
+        // Re-assigning the same stream restarts playback (a blink).
+        if (node.srcObject !== s) node.srcObject = s
       },
     }
   }

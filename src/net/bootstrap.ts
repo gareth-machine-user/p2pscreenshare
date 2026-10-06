@@ -18,6 +18,7 @@ import type { PeerIdentity } from '../mesh/identity'
 import { MeshConn } from '../mesh/meshConn'
 import { lobbyKeys, openJson, sealJson, type LobbyKeys } from './lobby'
 import { DEFAULT_TRACKERS, randomPeerId, TrackerClient } from './tracker'
+import { every } from './ticker'
 
 export { randomPeerId }
 
@@ -58,7 +59,7 @@ export class Rendezvous {
   private door = false
   private seeking = false
   private answering = new Set<string>()
-  private timers: ReturnType<typeof setInterval>[] = []
+  private timers: (() => void)[] = []
   private closed = false
 
   constructor(private opts: RendezvousOptions) {}
@@ -70,8 +71,8 @@ export class Rendezvous {
     this.tracker.onStatus = (c, t) => this.onTrackerStatus(c, t)
     this.tracker.onOffer = (o) => void this.onOffer(o.offerId, o.sdp, o.reply)
     this.tracker.onAnswer = (a) => void this.onAnswer(a.offerId, a.sdp)
-    this.timers.push(setInterval(() => this.announce(), ANNOUNCE_MS))
-    this.timers.push(setInterval(() => this.seeking && !this.door && this.tracker.announce({ numwant: 10 }), SEEK_ANNOUNCE_MS))
+    this.timers.push(every(ANNOUNCE_MS, () => this.announce()))
+    this.timers.push(every(SEEK_ANNOUNCE_MS, () => this.seeking && !this.door && this.tracker.announce({ numwant: 10 })))
   }
 
   get isDoor(): boolean {
@@ -120,6 +121,7 @@ export class Rendezvous {
         Array.from({ length: Math.max(0, OFFER_POOL - this.pool.size) }, async () => {
           // The remote id is filled in once an answer arrives.
           const conn = new MeshConn(this.opts.iceServers, '')
+          conn.offerer = this.opts.identity.id
           const offerId = randomPeerId()
           const sdp = await conn.createOffer()
           const env = await seal<DoorOffer>(this.opts.identity, { type: 'door-offer', peerId: this.opts.identity.id, offerId, sdp }, Infinity)
@@ -154,12 +156,11 @@ export class Rendezvous {
     const offer = await this.openSealed('offer', offerId, sealed)
     if (!offer || offer.peerId === this.opts.identity.id) return
     if (this.answering.has(offer.peerId) || !this.shouldAnswer(offer.peerId)) return
+    // Guards against answering two offers from one peer at once; the mesh takes the connection
+    // (and dedupes links) as soon as the answer is out, so the guard ends there.
     this.answering.add(offer.peerId)
     const conn = new MeshConn(this.opts.iceServers, offer.peerId)
-    const release = () => this.answering.delete(offer.peerId)
-    conn.onStateChange = (s) => {
-      if (s !== 'connecting') release()
-    }
+    conn.offerer = offer.peerId
     try {
       const sdp = await conn.acceptOffer(offer.sdp)
       const env = await seal<DoorOffer>(this.opts.identity, { type: 'door-answer', peerId: this.opts.identity.id, offerId, sdp }, Infinity)
@@ -168,7 +169,8 @@ export class Rendezvous {
     } catch (err) {
       console.warn('answering offer failed', err)
       conn.close()
-      release()
+    } finally {
+      this.answering.delete(offer.peerId)
     }
   }
 
@@ -191,7 +193,7 @@ export class Rendezvous {
 
   close(): void {
     this.closed = true
-    this.timers.forEach(clearInterval)
+    this.timers.forEach((cancel) => cancel())
     for (const o of this.pool.values()) o.conn.close()
     this.pool.clear()
     this.tracker?.announce({ event: 'stopped' })

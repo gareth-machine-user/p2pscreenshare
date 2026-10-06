@@ -190,7 +190,10 @@
   function changeQuality(q: QualityPreset) {
     settings.share.quality = q
     saveSettings()
-    void startSharing()
+    const preset = QUALITY_PRESETS[q]
+    if (session) session.autoBitrate = q === 'auto'
+    // Applied to the running stream: no new capture, no screen picker.
+    void session?.publishing?.setQuality(preset.kbps, [preset.maxWidth, preset.maxHeight]).then(onChange)
   }
 
   // --- view state --------------------------------------------------------------------------------

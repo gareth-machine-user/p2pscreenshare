@@ -20,6 +20,7 @@ import { open, seal, type Envelope, type Typed } from './envelope'
 import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn } from './meshConn'
 import { doorPeers, FailureDetector, linkSuspected, RecordStore, retryDelayMs, type Digest, type MemberRecord } from './records'
+import { every } from '../net/ticker'
 
 const HEARTBEAT_MS = 2000
 const DIGEST_MS = 2000
@@ -138,10 +139,15 @@ export class Mesh {
   /** Outgoing offers awaiting an answer, by remote id. */
   private pendingOffers = new Map<string, { conn: MeshConn; nonce: string }>()
   private seenNonces = new Map<string, number>()
-  private timers: ReturnType<typeof setInterval>[] = []
+  private timers: (() => void)[] = []
   private seekingSince = performance.now()
-  /** Since when this peer has had members but no open link (null while linked). */
+  /**
+   * Since when this peer has been cut off: no open link, though it was linked before (or knows
+   * members). Null while linked, and for the first peer of an empty lobby.
+   */
   private isolatedSince: number | null = null
+  /** Whether this peer ever had an open mesh link. */
+  private everLinked = false
   private publishing: Promise<void> = Promise.resolve()
   private publishQueued = false
   private left = false
@@ -176,7 +182,7 @@ export class Mesh {
       this.onChange()
     }
     this.rendezvous.shouldAnswer = (id) => this.shouldAnswerDoor(id)
-    this.rendezvous.admit = (id) => !this.isBlocked(id) && !this.isBannedPeer(id)
+    this.rendezvous.admit = (id) => !this.offline && !this.isBlocked(id) && !this.isBannedPeer(id)
   }
 
   async start(): Promise<void> {
@@ -193,10 +199,10 @@ export class Mesh {
     await this.publish()
     this.rendezvous.setSeeking(true)
     this.updateDoorDuty()
-    this.timers.push(setInterval(() => this.tick(), 250))
-    this.timers.push(setInterval(() => void this.publish(), HEARTBEAT_MS))
-    this.timers.push(setInterval(() => this.exchangeDigest(), DIGEST_MS))
-    this.timers.push(setInterval(() => void this.sampleRtts(), RTT_SAMPLE_MS))
+    this.timers.push(every(250, () => this.tick()))
+    this.timers.push(every(HEARTBEAT_MS, () => void this.publish()))
+    this.timers.push(every(DIGEST_MS, () => this.exchangeDigest()))
+    this.timers.push(every(RTT_SAMPLE_MS, () => void this.sampleRtts()))
   }
 
   get record(): MemberRecord {
@@ -336,6 +342,21 @@ export class Mesh {
     return true
   }
 
+  /**
+   * Debug/e2e: behave as if this machine went offline for `ms` (asleep, network down): every link
+   * drops and nothing new is accepted, while the page keeps running.
+   */
+  debugGoOffline(ms: number): void {
+    this.offlineUntil = performance.now() + ms
+    this.rendezvous.setDoor(false)
+    this.rendezvous.setSeeking(false)
+    for (const c of [...this.conns.values()]) c.close()
+  }
+  private offlineUntil = 0
+  private get offline(): boolean {
+    return performance.now() < this.offlineUntil
+  }
+
   /** Closes the link to a peer (it will be retried if the peer is still a member). */
   resetLink(id: string): void {
     this.conns.get(id)?.close()
@@ -344,7 +365,7 @@ export class Mesh {
   async leave(): Promise<void> {
     if (this.left) return
     this.left = true
-    this.timers.forEach(clearInterval)
+    this.timers.forEach((cancel) => cancel())
     this.self.left = true
     this.self.version = Math.max(this.self.version + 1, Date.now())
     try {
@@ -385,6 +406,15 @@ export class Mesh {
   private adopt(conn: MeshConn, viaTracker: boolean): void {
     const id = conn.remoteId
     const prev = this.conns.get(id)
+    // Two doors may each answer the other's offer at once. Both sides keep the connection offered
+    // by the lower id, so they agree on one.
+    if (prev && prev !== conn && prev.state !== 'closed' && prev.state !== 'failed' && prev.offerer && conn.offerer && prev.offerer !== conn.offerer && performance.now() - prev.createdAt < 15_000) {
+      const keepPrev = prev.offerer < conn.offerer
+      if (keepPrev) {
+        conn.close()
+        return
+      }
+    }
     if (prev && prev !== conn) {
       // A fresh connection replaces a stale one (e.g. the remote reloaded).
       const wasOpen = prev.isOpen
@@ -411,6 +441,7 @@ export class Mesh {
   private onOpen(conn: MeshConn, viaTracker: boolean): void {
     const id = conn.remoteId
     this.joined = true
+    this.everLinked = true
     this.retry.delete(id)
     this.detector.heard(id, performance.now())
     if (this.self.unreachable.includes(id)) this.self.unreachable = this.self.unreachable.filter((x) => x !== id)
@@ -460,11 +491,14 @@ export class Mesh {
   }
 
   private shouldAnswerDoor(id: string): boolean {
+    if (this.offline) return false
     if (this.conns.get(id)?.isOpen || this.isBlocked(id)) return false
     // A kicked peer is refused (its key is known from gossip once it was a member).
     if (this.isBannedPeer(id)) return false
-    // Joining, or cut off from everyone: answer the first offer.
-    if (!this.joined || this.isolatedSince !== null) return this.pendingDoorAnswers === 0
+    // Joining (an owner coming back to a populated lobby too), or cut off from everyone: answer
+    // the first offer.
+    const fresh = !this.everLinked && performance.now() - this.seekingSince < ALONE_DOOR_MS * 2
+    if (!this.joined || fresh || this.isolatedSince !== null) return this.pendingDoorAnswers === 0
     // Otherwise a door answers doors of a lower id it has no link to: that merges groups that
     // formed apart, and re-links a pair whose link dropped when no neighbour can relay for it.
     return this.rendezvous.isDoor && id < this.selfId && !this.conns.has(id)
@@ -480,6 +514,11 @@ export class Mesh {
 
   private tick(): void {
     const now = performance.now()
+    if (this.offline) {
+      for (const c of [...this.conns.values()]) c.close()
+      for (const id of this.detector.gone(now)) this.dropMember(id)
+      return
+    }
     // Liveness pings on idle links.
     for (const c of this.conns.values()) {
       if (!c.isOpen) continue
@@ -507,7 +546,8 @@ export class Mesh {
     }
     this.rendezvous.setDoor(door)
     const linked = [...this.conns.values()].some((c) => c.isOpen)
-    if (linked || this.store.ids().length === 0) this.isolatedSince = null
+    // A peer that dropped everyone (asleep, offline) has no members left but must look again.
+    if (linked || (this.store.ids().length === 0 && !this.everLinked)) this.isolatedSince = null
     else if (this.isolatedSince === null) this.isolatedSince = now
     const isolated = this.isolatedSince !== null && now - this.isolatedSince > ISOLATED_MS
     this.rendezvous.setSeeking(!this.joined || isolated)
@@ -543,12 +583,15 @@ export class Mesh {
       return
     }
     const conn = new MeshConn(this.opts.iceServers, id)
+    conn.offerer = this.selfId
     this.pendingOffers.set(id, { conn, nonce })
     this.adopt(conn, false)
     try {
       const sdp = await conn.createOffer()
       if (conn.state !== 'connecting') return
       await this.sendSig(id, { kind: 'offer', sdp, nonce })
+      // No answer within the deadline: signaling got lost, try again.
+      conn.armTimeout()
     } catch (err) {
       console.warn('mesh offer failed', err)
       conn.close()
@@ -595,7 +638,7 @@ export class Mesh {
     const key = `${b.from}:${b.kind}:${b.nonce}`
     if (this.seenNonces.has(key)) return
     this.seenNonces.set(key, performance.now())
-    if (this.isBlocked(b.from) || this.isBannedPeer(b.from) || this.left) return
+    if (this.isBlocked(b.from) || this.isBannedPeer(b.from) || this.left || this.offline) return
 
     if (b.kind === 'knock') {
       if (this.selfId < b.from && !this.conns.get(b.from)?.isOpen) {
@@ -608,6 +651,7 @@ export class Mesh {
       const prev = this.conns.get(b.from)
       if (prev?.isOpen && performance.now() - prev.createdAt < 2000) return
       const conn = new MeshConn(this.opts.iceServers, b.from)
+      conn.offerer = b.from
       this.adopt(conn, false)
       try {
         const sdp = await conn.acceptOffer(b.sdp)
