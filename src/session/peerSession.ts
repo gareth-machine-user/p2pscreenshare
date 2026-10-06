@@ -13,13 +13,16 @@ import { Mesh } from '../mesh/mesh'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { fromBase64Url } from '../net/lobby'
 import { Uplink } from '../net/uplink'
-import type { EncoderRates, PeerMsg, PublisherMsg, SubscriberMsg, TopologyReport, UplinkRates } from '../proto/messages'
+import { isTopologyReport, parsePeerMsg, type EncoderRates, type PeerMsg, type TopologyReport, type UplinkRates } from '../proto/messages'
 import { RateWindow, round1 } from './rates'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
 import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor } from './capacity'
 import { PublishedStream, type ChannelPublisher, type PublisherContext, type ShareOptions } from './publisher'
 import { Subscription, type SubscriptionContext } from './subscription'
+import { ChannelOwners } from './channelOwners'
+import { liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
+import { UploadProbe } from './uploadProbe'
 import { after, every } from '../net/ticker'
 import { tuning } from '../tuning'
 
@@ -41,9 +44,7 @@ export interface LiveChannel {
   publisher: string
 }
 
-export type ViewQuality = 'auto' | 'full' | 'preview'
-/** Where the stage picture comes from. */
-export type StageSource = 'local' | 'full' | 'preview' | 'none'
+export type { StageSource, ViewQuality } from './stage'
 /** A member's request to publish, as the requester sees it. */
 export type RequestState = 'idle' | 'waiting' | 'owner-away' | 'denied' | 'granted'
 
@@ -81,12 +82,17 @@ const AUTO_STALL_MS = 6000
 /** ...and returns once it plays smoothly again for this long. */
 const AUTO_RECOVER_MS = 4000
 
-const PROBE_DURATION_MS = 1500
-const PROBE_CHUNK = 16 * 1024
-const PROBE_PEERS = 3
-const PROBE_REPLY_TIMEOUT_MS = 3000
-const SUBSCRIBER_MSGS = new Set(['subscribe', 'unsubscribe', 'stripe-ok', 'reattach', 'need-key', 'stats', 'topo-req'])
-const PUBLISHER_MSGS = new Set(['set-parent', 'add-child', 'remove-child', 'position'])
+/** Uplink stats (and the congestion controller and auto bitrate that use them) run this often. */
+const UPLINK_SAMPLE_MS = 2000
+const AUTO_BITRATE_CHECK_MS = 2000
+/** Look for neighbours to run the first upload probes against this often. */
+const PROBE_CHECK_MS = 1000
+const AUTO_QUALITY_CHECK_MS = 500
+/** How often to consider a light-load reprobe (see REPROBE_EVERY_MS). */
+const REPROBE_CHECK_MS = 30_000
+/** Debug/e2e: sample the stage source this often, keeping this many changes. */
+const STAGE_LOG_MS = 100
+const STAGE_LOG_MAX = 100
 
 export class PeerSession implements PublisherContext, SubscriptionContext {
   readonly mesh: Mesh
@@ -130,10 +136,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   private channels = new Map<number, LiveChannel>()
   private rootSlotsByChannel: Record<number, number> = {}
-  private probing = false
-  private probePeersUsed = 0
-  private probeRx = new Map<string, { firstAt: number; lastAt: number; bytes: number }>()
-  private probeReplies = new Map<string, (r: { bytes: number; ms: number }) => void>()
+  private channelOwners = new ChannelOwners()
+  private uploadProbe: UploadProbe
   private uplinkSampleAt = { at: performance.now(), sent: 0, sentItems: 0, dropped: 0 }
   private uplinkNow = { kbps: 0, dropRate: 0 }
   /** This peer's uplink and (when presenting) encoder, per second over the last 2 s window. */
@@ -144,7 +148,6 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private reconcileTimer: (() => void) | null = null
   private timers: (() => void)[] = []
   private topoWatching = new Set<number>()
-  private lastProbeAt = -Infinity
   private ccLastDown = -Infinity
   private ccLastUp = -Infinity
   private ccCleanSince: number | null = null
@@ -173,12 +176,26 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.relay = new RelayNode(this.uplink, (id) => this.mesh.linkFor(id))
     this.relay.verifier = (raw, ch) => this.verify(raw, ch)
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
+    this.uploadProbe = new UploadProbe({
+      targets: () => this.mesh.conns.values(),
+      uplink: this.uplink,
+      capacity: this.capacity,
+      sendTo: (to, msg) => this.sendTo(to, msg),
+      onProbed: () => {
+        this.updateOffers()
+        this.onChange()
+      },
+    })
 
     const m = this.mesh
     m.onMedia = (data, from) => this.relay.receive(data, from)
     m.onBufferLow = () => this.uplink.kick()
-    m.onBinary = (data, from) => this.onProbeChunk(data, from)
-    m.onApp = (msg, from) => this.handle(msg as PeerMsg, from)
+    m.onBinary = (data, from) => this.uploadProbe.onChunk(data, from)
+    m.onApp = (raw, from) => {
+      const msg = parsePeerMsg(raw)
+      if (msg) this.handle(msg, from)
+      else console.debug('dropped malformed message from', from)
+    }
     m.onRecord = () => this.scheduleReconcile()
     m.onMemberJoin = () => this.scheduleReconcile()
     m.onMemberLeave = (id) => {
@@ -200,13 +217,13 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   async start(): Promise<void> {
     await this.mesh.start()
-    this.timers.push(every(2000, () => this.sampleUplink()))
-    this.timers.push(every(1000, () => this.maybeProbe()))
-    this.timers.push(every(500, () => this.checkAutoQuality()))
+    this.timers.push(every(UPLINK_SAMPLE_MS, () => this.sampleUplink()))
+    this.timers.push(every(PROBE_CHECK_MS, () => this.uploadProbe.maybeProbe()))
+    this.timers.push(every(AUTO_QUALITY_CHECK_MS, () => this.checkAutoQuality()))
     this.timers.push(every(REBALANCE_MS, () => this.rebalance()))
-    this.timers.push(every(2000, () => this.checkAutoBitrate()))
-    this.timers.push(every(30_000, () => this.maybeReprobe()))
-    this.timers.push(every(100, () => this.logStage()))
+    this.timers.push(every(AUTO_BITRATE_CHECK_MS, () => this.checkAutoBitrate()))
+    this.timers.push(every(REPROBE_CHECK_MS, () => this.maybeReprobe()))
+    this.timers.push(every(STAGE_LOG_MS, () => this.logStage()))
   }
 
   // --- channels ----------------------------------------------------------------------------------
@@ -239,47 +256,18 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   /** Publishers with a live full channel, oldest stream first. */
   liveStreams(): LiveChannel[] {
-    return this.liveChannels()
-      .filter((c) => c.ann.kind === 'full')
-      .sort((a, b) => a.ann.startedAt - b.ann.startedAt)
+    return liveStreamsOf(this.liveChannels())
   }
 
-  /**
-   * Channel ids are bound to the publisher this peer first saw claim them, for the session's
-   * lifetime. Any granted publisher can put any id in its record (and startedAt is
-   * self-reported), so a later claim by someone else must never take a channel over: this peer
-   * would verify the real publisher's fragments against the copier's key.
-   */
-  private channelOwners = new Map<number, string>()
-
+  /** Channel ids stay bound to the publisher first seen claiming them (see channelOwners.ts). */
   private rebuildChannels(): void {
-    const next = new Map<number, LiveChannel>()
-    // This peer's own channels always win, and stay bound to it after they end.
-    for (const c of this.ownChannels()) {
-      const id = c.id >>> 0
-      this.channelOwners.set(id, this.selfId)
-      if (this.mayPublish(this.selfId)) next.set(id, { ann: c.announcement(), publisher: this.selfId })
-    }
-    const claims = new Map<number, LiveChannel[]>()
-    for (const rec of this.mesh.members()) {
-      if (rec.id === this.selfId || !this.mayPublish(rec.id)) continue
-      for (const ann of rec.channels) {
-        const id = ann.id >>> 0
-        claims.set(id, [...(claims.get(id) ?? []), { ann, publisher: rec.id }])
-      }
-    }
-    for (const [id, list] of claims) {
-      const owner = this.channelOwners.get(id)
-      let pick: LiveChannel | undefined
-      if (owner !== undefined) pick = list.find((c) => c.publisher === owner)
-      else if (list.every((c) => c.publisher === list[0].publisher)) pick = list[0]
-      // Contested on first sight (e.g. by a late joiner): nothing tells the copy apart, so only
-      // the room owner's claim is trusted; otherwise the id stays unwatched until one claim is left.
-      else pick = list.find((c) => c.publisher === this.ownerId)
-      if (!pick) continue
-      this.channelOwners.set(id, pick.publisher)
-      next.set(id, pick)
-    }
+    const next = this.channelOwners.resolve({
+      selfId: this.selfId,
+      ownerId: this.ownerId,
+      mayPublish: (id) => this.mayPublish(id),
+      own: this.ownChannels().map((c) => c.announcement()),
+      members: this.mesh.members(),
+    })
     for (const ch of this.channels.keys()) if (!next.has(ch)) this.topologyReports.delete(ch)
     this.channels = next
   }
@@ -307,19 +295,16 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
    */
   private reconcile(): void {
     this.rebuildChannels()
-    const streams = this.liveStreams()
-    if (!this.selected || !streams.some((s) => s.publisher === this.selected)) {
-      this.selected = streams.find((s) => s.publisher !== this.selfId)?.publisher ?? streams[0]?.publisher ?? null
-      this.autoFallback = false
-    }
-    const want = new Map<number, LiveChannel>()
-    const add = (c: LiveChannel | undefined) => c && want.set(c.ann.id >>> 0, c)
-    const stage = streams.find((s) => s.publisher === this.selected)
-    if (stage && stage.publisher !== this.selfId) {
-      if (this.quality !== 'preview') add(stage)
-      if (this.quality === 'preview' || this.autoFallback) add(this.previewOf(stage.publisher))
-    }
-    if (streams.length >= 2) for (const s of streams) if (s.publisher !== this.selfId) add(this.previewOf(s.publisher))
+    const plan = planStage({
+      selfId: this.selfId,
+      channels: this.liveChannels(),
+      selected: this.selected,
+      quality: this.quality,
+      autoFallback: this.autoFallback,
+    })
+    this.selected = plan.selected
+    this.autoFallback = plan.autoFallback
+    const want = plan.want
 
     for (const [ch, sub] of this.subs) {
       if (!want.has(ch)) {
@@ -395,7 +380,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const last = this.stageLog.at(-1)
     if (last?.source === source && last.publisher === this.selected) return
     this.stageLog.push({ at: Date.now(), source, publisher: this.selected })
-    if (this.stageLog.length > 100) this.stageLog.shift()
+    if (this.stageLog.length > STAGE_LOG_MAX) this.stageLog.shift()
   }
 
   subFor(publisher: string, kind: 'full' | 'preview'): Subscription | null {
@@ -590,7 +575,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private maybeReprobe(): void {
     const now = performance.now()
     const est = this.capacity.estimateKbps
-    if (est === null || now - this.lastProbeAt < REPROBE_EVERY_MS) return
+    if (est === null || now - this.uploadProbe.lastProbeAt < REPROBE_EVERY_MS) return
     if (this.uplinkNow.kbps < est * 0.3) void this.probe()
   }
 
@@ -676,54 +661,66 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   private handle(msg: PeerMsg, from: string): void {
-    if (!msg || typeof msg !== 'object') return
-    if (msg.t === 'publish-req') {
-      if (!this.isOwner || this.mayPublish(from)) return
-      if (this.policy === 'closed') this.sendTo(from, { t: 'publish-deny' })
-      else if (this.policy === 'open') void this.respond(from, 'allow')
-      else this.requests.set(from, { id: from, at: Date.now() })
-      this.onChange()
-      return
-    }
-    if (msg.t === 'publish-deny') {
-      if (from === this.ownerId && this.requestState === 'waiting') this.requestState = 'denied'
-      this.onChange()
-      return
-    }
-    if (msg.t === 'probe-end') {
-      this.onProbeEnd(msg.id, from)
-      return
-    }
-    if (msg.t === 'probe-result') {
-      this.probeReplies.get(from)?.({ bytes: msg.bytes, ms: msg.ms })
-      return
-    }
-    if (SUBSCRIBER_MSGS.has(msg.t)) {
-      const m = msg as SubscriberMsg
-      this.ownChannels().find((c) => c.id === m.ch >>> 0)?.handle(m, from)
-      return
-    }
-    if (PUBLISHER_MSGS.has(msg.t)) {
-      const m = msg as PublisherMsg
-      // Tree commands for a channel come only from that channel's publisher.
-      const sub = this.subs.get(m.ch >>> 0)
-      if (sub && sub.publisher === from) sub.handle(m)
-      return
-    }
-    if (msg.t === 'reprobe') {
-      const sub = this.subs.get(msg.ch >>> 0)
-      if (sub && sub.publisher === from && performance.now() - this.lastProbeAt > REPROBE_MIN_GAP_MS) void this.probe()
-      return
-    }
-    if (msg.t === 'topo') {
-      const live = this.channels.get(msg.ch >>> 0)
-      if (!live || live.publisher !== from) return
-      void gunzip(fromBase64Url(msg.z))
-        .then((json) => {
-          this.topologyReports.set(msg.ch >>> 0, JSON.parse(json) as TopologyReport)
-          this.onChange()
-        })
-        .catch(() => {})
+    switch (msg.t) {
+      case 'publish-req':
+        if (!this.isOwner || this.mayPublish(from)) return
+        if (this.policy === 'closed') this.sendTo(from, { t: 'publish-deny' })
+        else if (this.policy === 'open') void this.respond(from, 'allow')
+        else this.requests.set(from, { id: from, at: Date.now() })
+        this.onChange()
+        return
+      case 'publish-deny':
+        if (from === this.ownerId && this.requestState === 'waiting') this.requestState = 'denied'
+        this.onChange()
+        return
+      case 'probe-end':
+        this.uploadProbe.onEnd(msg.id, from)
+        return
+      case 'probe-result':
+        this.uploadProbe.onResult(from, { bytes: msg.bytes, ms: msg.ms })
+        return
+      case 'subscribe':
+      case 'unsubscribe':
+      case 'stripe-ok':
+      case 'reattach':
+      case 'need-key':
+      case 'stats':
+      case 'topo-req':
+        this.ownChannels().find((c) => c.id === msg.ch >>> 0)?.handle(msg, from)
+        return
+      case 'set-parent':
+      case 'add-child':
+      case 'remove-child':
+      case 'position': {
+        // Tree commands for a channel come only from that channel's publisher.
+        const sub = this.subs.get(msg.ch >>> 0)
+        if (sub && sub.publisher === from) sub.handle(msg)
+        return
+      }
+      case 'reprobe': {
+        const sub = this.subs.get(msg.ch >>> 0)
+        if (sub && sub.publisher === from && performance.now() - this.uploadProbe.lastProbeAt > REPROBE_MIN_GAP_MS) void this.probe()
+        return
+      }
+      case 'topo': {
+        const ch = msg.ch >>> 0
+        const live = this.channels.get(ch)
+        if (!live || live.publisher !== from) return
+        void gunzip(fromBase64Url(msg.z))
+          .then((json) => {
+            const report: unknown = JSON.parse(json)
+            if (!isTopologyReport(report)) throw new Error('malformed report')
+            this.topologyReports.set(ch, report)
+            this.onChange()
+          })
+          // A corrupt, oversized or malformed report: keep the last good one.
+          .catch((e) => console.debug('dropped topology report from', from, e))
+        return
+      }
+      default: {
+        const unhandled: never = msg
+        return unhandled
+      }
     }
   }
 
@@ -778,108 +775,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.updateOffers()
   }
 
-  /** Probes once neighbours exist, and again once if the first probe had fewer than three. */
-  private maybeProbe(): void {
-    if (this.probing) return
-    const open = [...this.mesh.conns.values()].filter((c) => c.isOpen)
-    if (!open.length) return
-    if (this.capacity.probeKbps !== null && (this.probePeersUsed >= PROBE_PEERS || open.length <= this.probePeersUsed)) return
-    void this.probe()
-  }
-
-  /**
-   * Measures this peer's upload: a paced 1.5 s probe sent in parallel to up to 3 random
-   * neighbours, which report bytes received. Their sum, plus whatever the uplink sent meanwhile
-   * (relayed or published media share the same pipe), is the estimate. Several receivers mean we
-   * measure our own uplink, not one receiver's downlink.
-   */
-  async probe(): Promise<number | null> {
-    if (this.probing) return null
-    this.probing = true
-    this.lastProbeAt = performance.now()
-    try {
-      const targets = [...this.mesh.conns.values()]
-        .filter((c) => c.isOpen)
-        .sort(() => Math.random() - 0.5)
-        .slice(0, PROBE_PEERS)
-      if (!targets.length) return null
-      const replies = targets.map(
-        (c) =>
-          new Promise<{ bytes: number; ms: number }>((resolve) => {
-            const t = setTimeout(() => resolve({ bytes: 0, ms: 0 }), PROBE_DURATION_MS + PROBE_REPLY_TIMEOUT_MS)
-            this.probeReplies.set(c.remoteId, (r) => {
-              clearTimeout(t)
-              resolve(r)
-            })
-          }),
-      )
-      // Probe chunks join the uplink queue at background priority: they fill only the upload that
-      // media leaves spare (and go through the debug shaper), so a probe never delays the stream.
-      const start = performance.now()
-      const sentBefore = this.uplink.stats.sentBytes
-      const links = targets.map((c) => c.probeLink)
-      for (const l of links) this.uplink.setBackground(l)
-      const probeId = crypto.getRandomValues(new Uint32Array(1))[0]
-      const chunk = () => {
-        const c = new Uint8Array(PROBE_CHUNK)
-        new DataView(c.buffer).setUint32(0, probeId, true)
-        return c
-      }
-      let probeBytes = 0
-      while (performance.now() - start < PROBE_DURATION_MS) {
-        for (const l of links) {
-          for (let i = 0; i < 4 && l.isOpen && this.uplink.queued(l) < 4; i++) {
-            this.uplink.send(l, chunk(), 0, PROBE_DURATION_MS)
-            probeBytes += PROBE_CHUNK
-          }
-        }
-        await new Promise((r) => setTimeout(r, 4))
-      }
-      // The end marker goes on the reliable control channel, outside the (possibly long) uplink
-      // queue: each receiver reports what arrived until then.
-      for (const c of targets) this.sendTo(c.remoteId, { t: 'probe-end', id: probeId })
-      // Media sent meanwhile (the uplink's byte count includes the probe chunks: subtract them).
-      const mediaBytes = Math.max(0, this.uplink.stats.sentBytes - sentBefore - probeBytes)
-      const mediaKbps = (mediaBytes * 8) / Math.max(1, performance.now() - start)
-      // Receivers see the probe in bursts at different times: divide the total by the longest window.
-      const got = await Promise.all(replies)
-      const window = Math.max(...got.map((r) => r.ms))
-      const probeKbps = window > 0 ? (got.reduce((a, r) => a + r.bytes, 0) * 8) / window : 0
-      const kbps = probeKbps > 0 ? probeKbps + mediaKbps : 0
-      for (const c of targets) this.probeReplies.delete(c.remoteId)
-      if (kbps > 0) {
-        this.capacity.setProbe(kbps)
-        this.probePeersUsed = targets.length
-        this.updateOffers()
-        this.onChange()
-      }
-      return kbps
-    } finally {
-      this.probing = false
-    }
-  }
-
-  /** Receiving side of a neighbour's probe: count bytes per probe id until its end marker. */
-  private onProbeChunk(data: Uint8Array, from: string): void {
-    if (data.byteLength < 4) return
-    const key = `${from}:${new DataView(data.buffer, data.byteOffset, 4).getUint32(0, true)}`
-    const now = performance.now()
-    const st = this.probeRx.get(key)
-    if (!st) {
-      // The first chunk only starts the clock.
-      this.probeRx.set(key, { firstAt: now, lastAt: now, bytes: 0 })
-      for (const [k, v] of this.probeRx) if (now - v.lastAt > 10_000) this.probeRx.delete(k)
-    } else {
-      st.bytes += data.byteLength
-      st.lastAt = now
-    }
-  }
-
-  private onProbeEnd(id: number, from: string): void {
-    const key = `${from}:${id >>> 0}`
-    const st = this.probeRx.get(key)
-    this.probeRx.delete(key)
-    this.sendTo(from, { t: 'probe-result', bytes: st?.bytes ?? 0, ms: st ? st.lastAt - st.firstAt : 0 })
+  /** Measures this peer's upload (see uploadProbe.ts); null if a probe is already running. */
+  probe(): Promise<number | null> {
+    return this.uploadProbe.probe()
   }
 
   // --- debug / e2e -------------------------------------------------------------------------------
