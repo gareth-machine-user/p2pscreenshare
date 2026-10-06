@@ -208,7 +208,7 @@ membership layer handles everything else.
 | Event | Detection | Response | Time |
 |---|---|---|---|
 | A relay's link drops | The publisher's link to it closes or misses pings for 1.5 s | Replan at once; its parents get `remove-child`; its subtree is marked "disrupted upstream" for 6 s | ms |
-| A stripe goes silent | A child hears nothing on it for 1 s and sends `reattach` | Batched for 400 ms and handled shallowest-first; the reported parent is pinged (1.2 s) and avoided | ~1.5 s |
+| A stripe goes silent | A child hears nothing on it for 1.5 s (1 s in the latency profile) and sends `reattach` | Batched for 400 ms and handled shallowest-first; the child avoids the parent, which is blamed (ranked lower, and pinged within 1.2 s) only if the evidence points at it | ~2 s |
 | Resume | The new parent replays its cached GOP over an existing mesh link | | ~1 RTT |
 | A pair can't connect | Mesh ICE fails; both list each other as unreachable | Never a tree edge; retried with backoff | — |
 | A peer leaves | Its goodbye record, or 6 s without anything fresh | Removed from every channel it watched | ≤ 6 s |
@@ -229,6 +229,11 @@ Mechanisms that keep one failure from spreading:
 - **Liveness.** The mesh pings every idle link; pongs are answered from a message handler, so background-tab timer throttling doesn't cause false positives.
 - **Planned moves are glitch-free.** The old parent keeps feeding until the child reports `stripe-ok` from the new one (make-before-break).
 - **No startup backlog.** A new child's live fragments are queued ahead of its GOP replay, so its jitter buffer isn't inflated.
+
+One viewer with a bad connection mostly hurts only itself:
+- **Replay before keyframes.** A viewer that loses its decode chain first asks its stripe parents to replay the cached GOP; only if that fails does it send `need-key` to the publisher.
+- **Keyframe gate.** Keyframes are expensive for everyone (in constant-bitrate mode each one briefly blurs the picture), so the publisher gates requests per viewer (`KeyframeGate` in `topology/policy.ts`): a lone requester gets one at once, then one after 4 s, 8 s, then every 10 s while it keeps asking. Two or more viewers asking within 1 s mean a real upstream loss and are served at once.
+- **Corroborated blame.** A child that reports a silent parent is always moved, but the complaint lowers the parent's rank only when the evidence points at the parent: the child's other stripes still arrive, or another child of that parent complained too, and the parent's own feed isn't stale. A child complaining about several parents at once has a bad downlink.
 
 Not handled yet:
 - More than `m` relays failing within one detection window: viewers fed by all of them stall until
@@ -264,7 +269,7 @@ than its true upload. 8+2 degrades heavily because every one of its 10 stripes c
 peers that the 16-child fanout cap holds back (see below; with `--fanout 48` it is 0). Other options:
 `--lifetime`, `--repair`, `--gossip`, `--fanout`, `--audio`, `--only 4:1,8:2`, and the sweeps below.
 
-Two scenarios exercise the hardening:
+Three scenarios exercise the hardening:
 
 ```
 $ npm run sim -- --sweep late --peers 100      # relays that forward 250 ms late, 4+1 stripes
@@ -280,6 +285,43 @@ rebalancing | overcommitted A | overcommitted B | degraded % A | degraded % B
          no |             0.0 |           108.0 |         0.00 |        93.33
         yes |             7.4 |            39.8 |         0.00 |         0.00
 ```
+
+### A lossy viewer
+
+`npm run sim -- --sweep lossy --peers 100` adds viewers with a bad downlink (a model, see
+`LossyOptions` in `sim/simulator.ts`): every 6 s on average all their stripes go silent for 1–3 s,
+every 10 s a 0.1–0.4 s burst of loss hits every stripe, and each stripe also stalls on its own for
+1.5–3 s every 30 s. Losing every stripe breaks the decode chain; the viewer then sends `need-key`
+every 500 ms until a keyframe reaches it (400 ms after it is encoded). Lossy viewers never leave
+and don't relay. It compares the **old** publisher policy (every complaint about a connected but
+silent parent counts against it; any keyframe request at least 300 ms after the last one forces a
+keyframe) with the **new** one (corroborated blame and `KeyframeGate`, the app's own code), and
+optionally models parent GOP replay: after a break, the viewer recovers from its parents' cached
+GOP with probability p and asks for no keyframe. Forced keyframes count requested ones only
+(scheduled ones come every 10 s regardless). Relay failures are the planner's per-relay failure
+scores (rank = slots / (1 + failures), decaying ×0.95 per replan), sampled every second over the
+relays other than the lossy viewers. Changes, latency and stalls are for the other viewers.
+
+```
+lossy | policy | replay | forced keys/min | relay failures mean / max | others: changes/min | p50 ms | p95 ms | stall % | lossy frozen %
+------+--------+--------+-----------------+---------------------------+---------------------+--------+--------+---------+---------------
+    0 |      - |      - |               - |                         - |               736.8 |    334 |    394 |   0.262 |              -
+    1 |    old |     no |            14.8 |              0.115 / 1.39 |               756.2 |    329 |    393 |   0.290 |           43.3
+    1 |    new |     no |             2.0 |              0.008 / 0.95 |               735.6 |    329 |    402 |   0.282 |           77.2
+    1 |    new |  p=0.7 |             2.0 |              0.006 / 0.95 |               742.4 |    331 |    382 |   0.275 |           35.0
+    3 |    old |     no |            33.4 |              0.317 / 2.94 |               766.8 |    331 |    382 |   0.320 |           42.9
+    3 |    new |     no |            13.0 |              0.025 / 2.21 |               799.0 |    333 |    403 |   0.309 |           61.0
+    3 |    new |  p=0.7 |             5.6 |              0.032 / 2.04 |               793.2 |    333 |    384 |   0.306 |           33.1
+```
+
+One lossy viewer forced a keyframe on everyone 15 times a minute under the old policy and 2 under
+the new one. Three lossy viewers sometimes ask together, which the gate serves as a real upstream
+loss: 13 a minute against 33, and 6 with replay. Healthy relays' failure scores drop more than
+tenfold: what remains is blame for single-stripe stalls, which do look like the parent's fault.
+The price is paid by the lossy viewer alone: waiting for gated keyframes leaves it frozen far
+longer (77% of the time against 43%), which parent replay wins back (35%). In this model the
+other viewers' latency, stalls and parent changes barely move either way: one lossy viewer's
+complaints touch only its own few parents, and planned moves are glitch-free.
 
 ## Tuning
 

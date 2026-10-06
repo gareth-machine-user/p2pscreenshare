@@ -3,7 +3,7 @@
 // Thresholds leave a safety margin over the values measured when they were set (in comments);
 // a change that trips one should explain why the tree got worse, or move the threshold knowingly.
 import { describe, expect, it } from 'vitest'
-import { simulate, type SimMetrics, type SimOptions } from '../sim/simulator'
+import { simulate, simulateLossy, type LossyMetrics, type SimMetrics, type SimOptions } from '../sim/simulator'
 
 const SEEDS = [1, 2, 3]
 const SCENARIO = { peers: 100, seconds: 240, lifetimeS: 240 }
@@ -40,5 +40,22 @@ describe('simulator', () => {
     for (const r of handled) expect(r.p95).toBeLessThan(750) // measured 602 / 599 ms
     // measured 398 vs 537 ms
     expect(mean(handled, (r) => r.p50)).toBeLessThan(0.9 * mean(ignored, (r) => r.p50))
+  })
+
+  it('keeps one lossy viewer from forcing keyframes or demoting healthy relays', { timeout: 10_000 }, () => {
+    // One viewer whose downlink keeps failing (sim/simulator.ts LossyOptions), 60 viewers, 120 s.
+    const run = (policy: 'old' | 'new') => [1, 2, 3].map((seed) => simulateLossy({ k: 4, m: 1, peers: 60, seconds: 120, lifetimeS: 240, seed, lossy: { count: 1, policy } }))
+    const old = run('old')
+    const now = run('new')
+    const mean = (rs: LossyMetrics[], f: (r: LossyMetrics) => number) => rs.reduce((a, r) => a + f(r), 0) / rs.length
+    // Old: every need-key past a global 300 ms throttle forced a keyframe. New: KeyframeGate.
+    for (const r of now) expect(r.forcedKeysPerMin).toBeLessThanOrEqual(4) // measured 1.5 / 2.5 / 2.0
+    expect(mean(old, (r) => r.forcedKeysPerMin)).toBeGreaterThan(8) // measured 12.3
+    expect(mean(now, (r) => r.forcedKeysPerMin)).toBeLessThan(mean(old, (r) => r.forcedKeysPerMin) / 4) // measured 1/6 (2.0 vs 12.3)
+    // Old: every complaint counted against the parent. New: only corroborated ones.
+    // (What remains under new is blame for single-stripe stalls, which do look like the parent's fault.)
+    expect(mean(old, (r) => r.relayFailuresMean)).toBeGreaterThan(0.08) // measured 0.19
+    expect(mean(now, (r) => r.relayFailuresMean)).toBeLessThan(0.05) // measured 0.019
+    expect(mean(now, (r) => r.relayFailuresMean)).toBeLessThan(mean(old, (r) => r.relayFailuresMean) / 5) // measured 1/10
   })
 })
