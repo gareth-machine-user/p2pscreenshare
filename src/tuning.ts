@@ -36,7 +36,10 @@ const PROFILES: Record<Tuning['priority'], Tuning> = {
     mediaMaxPacketLifeTimeMs: 3000,
     ccQueueMs: 800,
     stripeSilenceMs: 1500,
-    keyframeIntervalMs: 3000,
+    // Keyframes are expensive (and in constant-bitrate mode each one briefly blurs the picture to
+    // fit the budget), so they come rarely: joiners start from relays' cached GOP, and a viewer
+    // that loses its decode chain asks for one.
+    keyframeIntervalMs: 10_000,
   },
   latency: {
     priority: 'latency',

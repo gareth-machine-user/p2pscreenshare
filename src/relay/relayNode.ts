@@ -5,7 +5,8 @@ import type { Uplink } from '../net/uplink'
 import { tuning } from '../tuning'
 
 const SEEN_RETAIN_MS = 5000
-const MAX_CACHE_BYTES = 6 * 1024 * 1024
+/** Per tree. A 10 s GOP of a 16 Mbps stream in 4 data stripes is about 5 MB per stripe. */
+const MAX_CACHE_BYTES = 8 * 1024 * 1024
 /** Replayed GOP fragments may wait longer in the queue than live ones. */
 const REPLAY_MAX_AGE_MS = tuning.replayMaxAgeMs
 /**

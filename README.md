@@ -354,7 +354,7 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Media channel retransmits | up to 3 s | up to 1 s | Lost packets are re-sent instead of lost |
 | Congestion back-off | queueing > 800 ms | queueing > 250 ms | The bitrate drops only on real congestion |
 | Stripe-silence detection | 1.5 s | 1 s | Fewer false reattaches |
-| Keyframe interval | 3 s | 2 s | More bits for detail at the same bitrate; joins replay the cached GOP |
+| Keyframe interval | 10 s | 2 s | Keyframes are expensive, and with constant bitrate each one briefly blurs the picture to fit the budget; joiners start from the cached GOP and a viewer that loses its decode chain asks for one |
 
 Rate control, in both profiles:
 - **Constant-bitrate encoding.** Fast motion costs a little sharpness instead of producing frames
@@ -387,7 +387,7 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `STRIPE_SILENCE_MS` | `tuning.ts` | 1500 (quality) | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
 | `REATTACH_BATCH_MS`, `LIVENESS_TIMEOUT_MS` | `session/publisher.ts` | 400, 1200 | Collateral-blame window, and the dead-parent confirmation timeout |
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
-| `keyframeIntervalMs` | `tuning.ts` | 3000 (quality) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
+| `keyframeIntervalMs` | `tuning.ts` | 10000 (quality) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | Layer deadlines, jitter buffer, retransmits | `tuning.ts` | see the table above | Latency vs complete, smooth frames |
 
 ## Tests
