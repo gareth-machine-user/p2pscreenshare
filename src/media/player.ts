@@ -1,4 +1,4 @@
-import { wallClock } from '../net/bootstrap'
+import { wallClock } from '../net/clock'
 import { fromBase64, type StreamInfo } from '../proto/messages'
 import { AudioPlayer } from './audio'
 import { DecodeScheduler, PlayoutClock } from './jitterBuffer'

@@ -1,4 +1,4 @@
-import { wallClock } from '../net/bootstrap'
+import { wallClock } from '../net/clock'
 import { NO_REF } from '../proto/framing'
 import { toBase64, type StreamInfo } from '../proto/messages'
 import { frameReader } from './capture'

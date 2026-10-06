@@ -1,5 +1,5 @@
 import { decodeFragment, peekIsKey, peekLayer, withReplayFlag, type Fragment, type FragmentHeader } from '../proto/framing'
-import type { PeerLink } from '../net/link'
+import type { MediaLink } from '../net/link'
 import type { Uplink } from '../net/uplink'
 
 const SEEN_RETAIN_MS = 5000
@@ -43,7 +43,7 @@ export class RelayNode {
 
   constructor(
     private uplink: Uplink,
-    private linkFor: (peerId: string) => PeerLink | undefined,
+    private linkFor: (peerId: string) => MediaLink | undefined,
   ) {}
 
   childrenOf(stripe: number): string[] {

@@ -1,4 +1,4 @@
-import { wallClock } from '../net/bootstrap'
+import { wallClock } from '../net/clock'
 import { NO_REF } from '../proto/framing'
 import type { StreamInfo } from '../proto/messages'
 import type { EncodedFrame } from './packetizer'

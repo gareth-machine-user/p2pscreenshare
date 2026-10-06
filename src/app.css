@@ -437,3 +437,69 @@ summary {
   gap: 8px;
   margin-top: 8px;
 }
+
+/* --- chat ---------------------------------------------------------------------------------------- */
+
+.chat {
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  max-height: calc(100vh - 90px);
+  min-height: 0;
+}
+.chat.collapsed {
+  width: auto;
+  background: none;
+  border: none;
+  padding: 0;
+}
+@media (max-width: 800px) {
+  .chat {
+    width: auto;
+    max-height: 50vh;
+  }
+}
+.chat-toggle {
+  align-self: flex-start;
+}
+.chat-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 120px;
+}
+.chat-msg {
+  font-size: 13px;
+}
+.chat-meta {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.chat-time {
+  color: var(--muted);
+  font-size: 11px;
+}
+.chat-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-msg.mine .chat-meta b {
+  color: var(--accent);
+}
+.chat-form {
+  display: flex;
+  gap: 6px;
+}
+.chat-form input {
+  flex: 1;
+  min-width: 0;
+}

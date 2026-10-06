@@ -1,4 +1,4 @@
-import { LINK_BUFFER_HIGH, type PeerLink } from './link'
+import { LINK_BUFFER_HIGH, type MediaLink } from './link'
 
 // Per-layer queueing deadlines: when the uplink can't keep up, enhancement layers (T2, then T1)
 // expire first, so overloaded relays degrade frame rate instead of stalling the base layer.
@@ -24,7 +24,7 @@ export interface UplinkStats {
  * backpressure, and layer-aware deadline dropping.
  */
 export class Uplink {
-  private queues = new Map<PeerLink, Item[]>()
+  private queues = new Map<MediaLink, Item[]>()
   private tokens = 0
   private lastRefill = performance.now()
   private timer: ReturnType<typeof setTimeout> | null = null
@@ -38,7 +38,7 @@ export class Uplink {
     return this.capKbps === null ? Infinity : (this.capKbps * 1000) / 8 / 1000
   }
 
-  send(link: PeerLink, data: Uint8Array, layer: number, maxAgeMs?: number): void {
+  send(link: MediaLink, data: Uint8Array, layer: number, maxAgeMs?: number): void {
     let q = this.queues.get(link)
     if (!q) {
       q = []
@@ -49,7 +49,7 @@ export class Uplink {
     this.drain()
   }
 
-  forget(link: PeerLink): void {
+  forget(link: MediaLink): void {
     const q = this.queues.get(link)
     if (q) for (const it of q) this.stats.queuedBytes -= it.data.byteLength
     this.queues.delete(link)

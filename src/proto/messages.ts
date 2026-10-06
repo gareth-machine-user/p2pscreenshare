@@ -53,7 +53,10 @@ export type ViewerToHost =
   | { t: 'probe-start'; bytes: number }
 
 export type HostToViewer =
-  | { t: 'welcome'; config: StreamConfig; stream: StreamInfo | null }
+  /** `session` changes when the host restarts (viewers then drop their old tree state). */
+  | { t: 'welcome'; config: StreamConfig; stream: StreamInfo | null; session: string }
+  /** The host stopped (it may restart with new settings). */
+  | { t: 'bye' }
   | { t: 'stream'; stream: StreamInfo }
   | { t: 'set-parent'; stripe: number; parent: string | null }
   | { t: 'add-child'; stripe: number; child: string }

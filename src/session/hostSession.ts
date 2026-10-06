@@ -1,5 +1,4 @@
-import { joinStream, randomPeerId, type ControlChannel } from '../net/bootstrap'
-import { hostIdentity, type HostIdentity } from '../net/lobby'
+import type { ControlChannel } from './control'
 import { LinkManager } from '../net/linkManager'
 import { Uplink } from '../net/uplink'
 import { AudioPipeline } from '../media/audio'
@@ -13,9 +12,10 @@ import { plan } from '../topology/planner'
 import type { HostToViewer, StreamConfig, StreamInfo, ViewerStats, ViewerToHost } from '../proto/messages'
 
 export interface HostOptions {
-  /** The host's private seed; the lobby's join code and signing key derive from it. */
-  streamId: string
-  trackers?: string[]
+  /** The owner's control channel to every member (the owner's mesh links). */
+  ctl: ControlChannel<ViewerToHost, HostToViewer>
+  /** The owner key, which signs the stream. */
+  signingKey: CryptoKey
   iceServers?: RTCIceServer[]
   k: number
   m: number
@@ -41,8 +41,6 @@ export interface HostPeer {
   failures: number
   /** Peers this peer should not be linked to, with expiry time. */
   avoid: Map<string, number>
-  lastSeenAt: number
-  pinging: boolean
   probe: { firstAt: number; bytes: number } | null
 }
 
@@ -50,10 +48,6 @@ const REPLAN_INTERVAL_MS = 2000
 const REMOVAL_TIMEOUT_MS = 4000
 const LINK_FAILED_AVOID_MS = 60_000
 const SILENT_PARENT_AVOID_MS = 15_000
-/** Heartbeat: ping peers we haven't heard from for this long... */
-const HEARTBEAT_IDLE_MS = 1000
-/** ...and drop them if the pong doesn't arrive within this time. */
-const HEARTBEAT_TIMEOUT_MS = 1500
 /**
  * After a relay fails, its whole subtree goes silent on that stripe. Descendants' reattach requests
  * within this window blame the upstream failure, not their (healthy) parent.
@@ -80,12 +74,11 @@ export class HostSession {
   readonly relay: RelayNode
   readonly config: StreamConfig
   totalChanges = 0
-  /** The viewer link's join code, once derived. */
-  joinCode: string | null = null
   onChange: () => void = () => {}
+  /** Changes whenever the host restarts, so viewers rebuild their tree state. */
+  readonly session = crypto.randomUUID()
 
-  private ctl: ControlChannel<ViewerToHost, HostToViewer> | null = null
-  trackersConnected = 0
+  private ctl: ControlChannel<ViewerToHost, HostToViewer>
   private video: VideoPipeline | null = null
   private audio: AudioPipeline | null = null
   private stopSource: (() => void) | null = null
@@ -96,7 +89,6 @@ export class HostSession {
   private lastPositions = new Map<string, string>()
   /** `${peer}:${stripe}` -> until when that peer's feed is known to be broken upstream. */
   private disruptedUntil = new Map<string, number>()
-  private identity: Promise<HostIdentity>
   /** Frames are signed in order, so fragments leave in capture order. */
   private signing: Promise<void> = Promise.resolve()
   private reattachQueue: { child: string; stripe: number; linkOpen: boolean }[] = []
@@ -104,7 +96,8 @@ export class HostSession {
 
   constructor(private opts: HostOptions) {
     this.config = { k: opts.k, m: opts.m, bitrateKbps: opts.bitrateKbps }
-    this.selfId = randomPeerId()
+    this.ctl = opts.ctl
+    this.selfId = opts.ctl.selfId
     this.links = new LinkManager(this.selfId, (to, signal) => this.send(to, { t: 'signal', from: this.selfId, signal }), {
       iceServers: opts.iceServers,
     })
@@ -114,29 +107,12 @@ export class HostSession {
     }
     this.relay = new RelayNode(this.uplink, (id) => this.links.get(id))
 
-    this.identity = hostIdentity(opts.streamId)
-    void this.identity.then((id) => {
-      this.joinCode = id.joinCode
-      this.onChange()
-      return joinStream<ViewerToHost, HostToViewer>({
-        streamId: id.joinCode,
-        role: 'host',
-        signingKey: id.signingKey,
-        trackers: opts.trackers,
-        iceServers: opts.iceServers,
-        peerId: this.selfId,
-      })
-    }).then((ctl) => {
-      this.ctl = ctl
-      ctl.onPeerJoin = (id) => this.onPeerJoin(id)
-      ctl.onPeerLeave = (id) => this.onPeerLeave(id)
-      ctl.onMessage = (msg, from) => this.handle(msg, from)
-      ctl.onBinary = (data, from) => this.onProbeChunk(data, from)
-      ctl.onTrackerStatus = (c) => {
-        this.trackersConnected = c
-        this.onChange()
-      }
-    })
+    const ctl = this.ctl
+    ctl.onPeerJoin = (id) => this.onPeerJoin(id)
+    ctl.onPeerLeave = (id) => this.onPeerLeave(id)
+    ctl.onMessage = (msg, from) => this.handle(msg, from)
+    ctl.onBinary = (data, from) => this.onProbeChunk(data, from)
+    for (const id of ctl.peers()) this.onPeerJoin(id)
 
     this.timers.push(setInterval(() => this.replan(), REPLAN_INTERVAL_MS))
     this.timers.push(setInterval(() => this.links.setNeeded(this.relay.allChildren()), 1000))
@@ -206,14 +182,14 @@ export class HostSession {
     const stripes = packetize(frame, this.opts.k, this.opts.m)
     this.signing = this.signing
       .then(async () => {
-        await signFrame((await this.identity).signingKey, stripes, frame.audio)
+        await signFrame(this.opts.signingKey, stripes, frame.audio)
         for (const frags of stripes) for (const raw of frags) this.relay.inject(raw)
       })
       .catch((e) => console.warn('signing failed', e))
   }
 
   private send(to: string, msg: HostToViewer): void {
-    this.ctl?.send(msg, to)
+    this.ctl.send(msg, to)
   }
 
   // --- membership -------------------------------------------------------------------------------
@@ -229,12 +205,10 @@ export class HostSession {
         stats: null,
         failures: 0,
         avoid: new Map(),
-        lastSeenAt: performance.now(),
-        pinging: false,
         probe: null,
       })
     }
-    this.send(id, { t: 'welcome', config: this.config, stream: this.stream })
+    this.send(id, { t: 'welcome', config: this.config, stream: this.stream, session: this.session })
     this.scheduleReplan()
     this.onChange()
   }
@@ -310,11 +284,9 @@ export class HostSession {
    */
   private async checkAlive(id: string): Promise<void> {
     try {
-      await this.ctl?.requestClock(id, LIVENESS_TIMEOUT_MS)
+      await this.ctl.requestClock(id, LIVENESS_TIMEOUT_MS)
     } catch {
-      if (!this.peers.has(id)) return
-      this.ctl?.disconnect(id)
-      this.onPeerLeave(id)
+      if (this.peers.has(id)) this.onPeerLeave(id)
     }
   }
 
@@ -347,29 +319,13 @@ export class HostSession {
   }
 
   /**
-   * WebRTC can take ~30s to declare a vanished peer dead. Ping idle peers over the control channel
-   * instead: pongs are answered from a message handler, so background-tab timer throttling on the
-   * viewer side doesn't cause false positives.
+   * The mesh pings every link (pongs are answered from message handlers, so background-tab timer
+   * throttling doesn't cause false positives). A peer whose link is down or silent leaves the tree
+   * at once, and rejoins it when its link recovers. The mesh link itself is left alone.
    */
   private heartbeat(): void {
-    const now = performance.now()
-    for (const p of this.peers.values()) {
-      if (p.pinging || now - p.lastSeenAt < HEARTBEAT_IDLE_MS) continue
-      p.pinging = true
-      this.ctl
-        ?.requestClock(p.id, HEARTBEAT_TIMEOUT_MS)
-        .then(() => {
-          p.lastSeenAt = performance.now()
-        })
-        .catch(() => {
-          if (!this.peers.has(p.id) || performance.now() - p.lastSeenAt < HEARTBEAT_IDLE_MS + HEARTBEAT_TIMEOUT_MS) return
-          this.ctl?.disconnect(p.id)
-          this.onPeerLeave(p.id)
-        })
-        .finally(() => {
-          p.pinging = false
-        })
-    }
+    for (const id of [...this.peers.keys()]) if (!this.ctl.isAlive(id)) this.onPeerLeave(id)
+    for (const id of this.ctl.peers()) if (!this.peers.has(id) && this.ctl.isAlive(id)) this.onPeerJoin(id)
   }
 
   // --- control messages -------------------------------------------------------------------------
@@ -377,7 +333,6 @@ export class HostSession {
   private handle(msg: ViewerToHost, from: string): void {
     const peer = this.peers.get(from)
     if (!peer) return
-    peer.lastSeenAt = performance.now()
     switch (msg.t) {
       case 'hello':
         peer.name = msg.name || peer.name
@@ -561,6 +516,7 @@ export class HostSession {
     this.audio?.stop()
     this.stopSource?.()
     this.links.closeAll()
-    await this.ctl?.leave()
+    for (const id of this.peers.keys()) this.send(id, { t: 'bye' })
+    this.ctl.close()
   }
 }

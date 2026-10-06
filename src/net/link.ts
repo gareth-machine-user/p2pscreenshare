@@ -19,7 +19,16 @@ export interface LinkOptions {
 export const LINK_BUFFER_HIGH = 512 * 1024
 export const LINK_BUFFER_LOW = 128 * 1024
 
-export class PeerLink {
+/** What the uplink and relay need from a link: an unreliable channel for media fragments. */
+export interface MediaLink {
+  readonly isOpen: boolean
+  readonly state: LinkState
+  readonly bufferedAmount: number
+  /** Sends one message. Returns false if the link is not open. */
+  send(data: Uint8Array): boolean
+}
+
+export class PeerLink implements MediaLink {
   readonly remoteId: string
   readonly pc: RTCPeerConnection
   readonly channel: RTCDataChannel

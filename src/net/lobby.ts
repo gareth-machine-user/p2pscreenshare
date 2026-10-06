@@ -85,6 +85,23 @@ export async function lobbyKeys(code: string): Promise<LobbyKeys> {
 
 /** Seals an offer or answer for the tracker. Bound to its direction and offer id. */
 export async function sealSignal(keys: LobbyKeys, kind: 'offer' | 'answer', offerId: string, body: SignalBody): Promise<string> {
+  return sealJson(keys, kind, offerId, body)
+}
+
+/** Opens a sealed offer or answer; null if it wasn't sealed with this lobby's code. */
+export async function openSignal(
+  keys: LobbyKeys,
+  kind: 'offer' | 'answer',
+  offerId: string,
+  sealed: string,
+): Promise<SignalBody | null> {
+  const body = (await openJson(keys, kind, offerId, sealed)) as Partial<SignalBody> | null
+  if (!body || typeof body.peerId !== 'string' || typeof body.sdp !== 'string') return null
+  return { peerId: body.peerId, sdp: body.sdp, ...(typeof body.sig === 'string' ? { sig: body.sig } : {}) }
+}
+
+/** Seals any JSON value for the tracker, bound to its direction and offer id (AES-GCM). */
+export async function sealJson(keys: LobbyKeys, kind: 'offer' | 'answer', offerId: string, body: unknown): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES))
   const ct = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv, additionalData: enc.encode(`${kind}:${offerId}`) },
@@ -97,13 +114,8 @@ export async function sealSignal(keys: LobbyKeys, kind: 'offer' | 'answer', offe
   return toBase64Url(out)
 }
 
-/** Opens a sealed offer or answer; null if it wasn't sealed with this lobby's code. */
-export async function openSignal(
-  keys: LobbyKeys,
-  kind: 'offer' | 'answer',
-  offerId: string,
-  sealed: string,
-): Promise<SignalBody | null> {
+/** Opens a value sealed with sealJson; null if it wasn't sealed with this lobby's code. */
+export async function openJson(keys: LobbyKeys, kind: 'offer' | 'answer', offerId: string, sealed: string): Promise<unknown> {
   try {
     const raw = fromBase64Url(sealed)
     const pt = await crypto.subtle.decrypt(
@@ -111,9 +123,7 @@ export async function openSignal(
       keys.sdp,
       raw.subarray(IV_BYTES),
     )
-    const body = JSON.parse(dec.decode(pt)) as Partial<SignalBody>
-    if (typeof body.peerId !== 'string' || typeof body.sdp !== 'string') return null
-    return { peerId: body.peerId, sdp: body.sdp, ...(typeof body.sig === 'string' ? { sig: body.sig } : {}) }
+    return JSON.parse(dec.decode(pt))
   } catch {
     return null
   }
@@ -147,13 +157,13 @@ function hkdf(info: string): HkdfParams {
   return { name: 'HKDF', hash: 'SHA-256', salt: enc.encode('p2pscreenshare:v2'), info: enc.encode(info) }
 }
 
-function toBase64Url(bytes: Uint8Array): string {
+export function toBase64Url(bytes: Uint8Array): string {
   let s = ''
   for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i])
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-function fromBase64Url(b64: string): Uint8Array<ArrayBuffer> {
+export function fromBase64Url(b64: string): Uint8Array<ArrayBuffer> {
   const s = atob(b64.replace(/-/g, '+').replace(/_/g, '/'))
   const out = new Uint8Array(s.length)
   for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i)

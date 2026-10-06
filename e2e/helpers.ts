@@ -34,6 +34,7 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
     stream: streamId,
     tracker: TRACKER_URL,
     ice: 'none',
+    name: 'owner',
   })
   await page.goto(`/#/host?${q}`)
   await page.waitForFunction(() => {
@@ -142,4 +143,60 @@ export async function waitFor<T>(fn: () => Promise<T>, ok: (v: T) => boolean, ti
 export function median(xs: number[]): number {
   const s = [...xs].sort((a, b) => a - b)
   return s[Math.floor(s.length / 2)]
+}
+
+/** Opens the owner's lobby page without sharing. */
+export async function openOwner(browser: Browser, seed: string, name = 'owner'): Promise<Page> {
+  const ctx = await browser.newContext()
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => console.log(`[${name} pageerror]`, e.message))
+  if (process.env.E2E_CONSOLE) page.on('console', (m) => console.log(`[${name}]`, m.text()))
+  const q = new URLSearchParams({ stream: seed, tracker: TRACKER_URL, ice: 'none', name })
+  await page.goto(`/#/host?${q}`)
+  return page
+}
+
+/** Opens a lobby member's page; `extra` adds URL params (e.g. `block`). */
+export async function openMember(browser: Browser, seed: string, name: string, extra: Record<string, string> = {}): Promise<Page> {
+  const ctx = await browser.newContext()
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => console.log(`[${name} pageerror]`, e.message))
+  if (process.env.E2E_CONSOLE) page.on('console', (m) => console.log(`[${name}]`, m.text()))
+  const q = new URLSearchParams({ tracker: TRACKER_URL, ice: 'none', name, ...extra })
+  const { joinCode } = await hostIdentity(seed)
+  await page.goto(`/#/lobby/${joinCode}?${q}`)
+  return page
+}
+
+export interface MeshSnapshot {
+  id: string
+  name: string
+  members: number
+  openLinks: number
+  isDoor: boolean
+  unreachable: string[]
+  /** Every member's gossiped record, as this peer sees it. */
+  records: Record<string, { name: string; unreachable: string[] }>
+  chat: string[]
+}
+
+export function meshSnapshot(page: Page): Promise<MeshSnapshot> {
+  return page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const m = window.__mesh as any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const recs = [m.record, ...m.members()] as any[]
+    return {
+      id: m.selfId,
+      name: m.record.name,
+      members: m.memberCount,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      openLinks: [...m.conns.values()].filter((c: any) => c.isOpen).length,
+      isDoor: m.isDoor,
+      unreachable: [...m.record.unreachable],
+      records: Object.fromEntries(recs.map((r) => [r.id, { name: r.name, unreachable: [...r.unreachable] }])),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      chat: m.chat.map((c: any) => `${c.name}: ${c.text}`),
+    }
+  })
 }

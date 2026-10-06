@@ -1,4 +1,4 @@
-import { wallClock } from '../net/bootstrap'
+import { wallClock } from '../net/clock'
 
 export interface CaptureOptions {
   /** Which picker tab the browser should preselect. */

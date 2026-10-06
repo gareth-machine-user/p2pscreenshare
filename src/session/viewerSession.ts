@@ -1,5 +1,6 @@
-import { joinStream, randomPeerId, wallClock, type ControlChannel } from '../net/bootstrap'
+import { wallClock } from '../net/clock'
 import { hostKeyFromCode } from '../net/lobby'
+import type { ControlChannel } from './control'
 import { LinkManager } from '../net/linkManager'
 import { Uplink } from '../net/uplink'
 import { Player } from '../media/player'
@@ -12,7 +13,10 @@ export interface ViewerOptions {
   /** The join code, which pins the host's public key. */
   streamId: string
   name: string
-  trackers?: string[]
+  /** This peer's mesh links (the host is the lobby owner). */
+  ctl: ControlChannel<HostToViewer, ViewerToHost>
+  /** The owner's peer id (from the key pinned in the join code). Only it may act as the host. */
+  ownerId: string
   iceServers?: RTCIceServer[]
   /** Debug upload cap (kbps) to emulate a constrained peer. */
   capKbps: number | null
@@ -49,8 +53,8 @@ export class ViewerSession {
   /** Invoked whenever UI-relevant state changes. */
   onChange: () => void = () => {}
 
-  private ctl: ControlChannel<HostToViewer, ViewerToHost> | null = null
-  trackersConnected = 0
+  private ctl: ControlChannel<HostToViewer, ViewerToHost>
+  private session: string | null = null
   private reassembler: Reassembler
   private pendingOk = new Map<number, string>()
   private parentSetAt = new Map<number, number>()
@@ -65,7 +69,8 @@ export class ViewerSession {
     private opts: ViewerOptions,
     canvas: HTMLCanvasElement | null,
   ) {
-    this.selfId = randomPeerId()
+    this.ctl = opts.ctl
+    this.selfId = opts.ctl.selfId
     this.uplink = new Uplink(opts.capKbps)
     this.player = new Player(canvas, () => this.requestKeyframe())
     this.links = new LinkManager(
@@ -98,14 +103,7 @@ export class ViewerSession {
         return
       }
       this.relay.verifier = (raw) => verifyFragment(hostKey, raw)
-      return joinStream<HostToViewer, ViewerToHost>({
-        streamId: opts.streamId,
-        role: 'viewer',
-        hostKey,
-        trackers: opts.trackers,
-        iceServers: opts.iceServers,
-        peerId: this.selfId,
-      }).then((ctl) => this.attachControl(ctl))
+      this.attachControl(this.ctl)
     })
 
     this.timers.push(setInterval(() => this.checkHealth(), HEALTH_INTERVAL_MS))
@@ -115,32 +113,36 @@ export class ViewerSession {
   }
 
   private attachControl(ctl: ControlChannel<HostToViewer, ViewerToHost>): void {
-    this.ctl = ctl
     ctl.onMessage = (msg, from) => this.handle(msg, from)
     ctl.onPeerLeave = (id) => {
-      if (id === this.hostId) {
-        this.state = 'host-lost'
-        this.onChange()
-      }
+      if (id === this.hostId) this.hostGone()
     }
-    ctl.onTrackerStatus = (c) => {
-      this.trackersConnected = c
-      this.onChange()
-    }
+  }
+
+  private hostGone(): void {
+    this.state = 'host-lost'
+    this.stream = null
+    this.relay.clear()
+    this.pendingOk.clear()
+    this.parents = this.parents.map(() => null)
+    this.syncLinks()
+    this.onChange()
   }
 
   private toHost(msg: ViewerToHost): void {
-    if (this.hostId) this.ctl?.send(msg, this.hostId)
+    if (this.hostId) this.ctl.send(msg, this.hostId)
   }
 
   private handle(msg: HostToViewer, from: string): void {
+    // Mesh links authenticate peer ids, and the owner's id is bound to the pinned key.
+    if (from !== this.opts.ownerId) return
     if (msg.t === 'welcome') {
-      if (this.hostId && this.hostId !== from && this.state === 'connected') return
       // A restarted host plans from scratch: forget the old tree.
-      if (this.hostId !== from) {
+      if (this.hostId !== from || this.session !== msg.session) {
         this.relay.clear()
         this.pendingOk.clear()
       }
+      this.session = msg.session
       this.hostId = from
       this.state = 'connected'
       this.config = msg.config
@@ -154,6 +156,9 @@ export class ViewerSession {
     }
     if (from !== this.hostId) return
     switch (msg.t) {
+      case 'bye':
+        this.hostGone()
+        return
       case 'stream':
         this.setStream(msg.stream)
         break
@@ -227,7 +232,7 @@ export class ViewerSession {
     for (let i = 0; i < 5; i++) {
       try {
         const t0 = wallClock()
-        const remote = await this.ctl!.requestClock(this.hostId)
+        const remote = await this.ctl.requestClock(this.hostId)
         const t1 = wallClock()
         const rtt = t1 - t0
         if (!best || rtt < best.rtt) best = { rtt, offset: remote - (t0 + t1) / 2 }
@@ -252,7 +257,7 @@ export class ViewerSession {
       chunk[4] = last ? 1 : 0
       await this.uplink.paced(chunk.byteLength)
       try {
-        await this.ctl!.sendBinary(chunk, host)
+        await this.ctl.sendBinary(chunk, host)
       } catch {
         return
       }
@@ -313,6 +318,6 @@ export class ViewerSession {
     this.timers.forEach(clearInterval)
     this.links.closeAll()
     this.player.close()
-    await this.ctl?.leave()
+    this.ctl.close()
   }
 }
