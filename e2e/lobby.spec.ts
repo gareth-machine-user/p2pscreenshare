@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { TRACKER_URL } from '../playwright.config'
-import { openHost, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
+import { meshSnapshot, openHost, openMember, openOwner, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
 
 test.afterEach(closeContexts)
 
@@ -110,4 +110,34 @@ test("a presenter sees what it shares, but only while the tab is focused", async
   })
   await expect(page.getByTestId('local-preview')).toBeVisible()
   await ctx.close()
+})
+
+test('guests must pick a name before chatting or asking to share', async ({ browser }) => {
+  const seed = `e2e-names-${Date.now()}`
+  const owner = await openOwner(browser, seed)
+  // name='' : no name in the URL or in saved settings, so they join as anonymous guests.
+  const zoe = await openMember(browser, seed, '', { name: '' })
+  const yan = await openMember(browser, seed, '', { name: '' })
+  await waitFor(() => meshSnapshot(owner), (s) => s.members === 3, 30_000, 'joined')
+
+  // First chat message: the name dialog comes first, then the message goes out under that name.
+  await zoe.getByTestId('chat-input').fill('hello')
+  await zoe.getByTestId('chat-send').click()
+  await expect(zoe.getByTestId('name-dialog')).toBeVisible()
+  await expect(zoe.getByTestId('name-save')).toBeDisabled()
+  await zoe.getByTestId('name-input').fill('Zoe')
+  await zoe.getByTestId('name-save').click()
+  await waitFor(() => meshSnapshot(owner), (s) => s.chat.includes('Zoe: hello'), 10_000, 'named chat')
+  // Named now: no dialog the second time.
+  await zoe.getByTestId('chat-input').fill('again')
+  await zoe.getByTestId('chat-send').click()
+  await expect(zoe.getByTestId('name-dialog')).toHaveCount(0)
+  await waitFor(() => meshSnapshot(owner), (s) => s.chat.includes('Zoe: again'), 10_000, 'second chat')
+
+  // Asking to share: same, and the owner's toast shows the new name.
+  await yan.getByTestId('share-screen').click()
+  await expect(yan.getByTestId('name-dialog')).toBeVisible()
+  await yan.getByTestId('name-input').fill('Yan')
+  await yan.getByTestId('name-save').click()
+  await expect(owner.getByTestId('publish-request')).toContainText('Yan', { timeout: 10_000 })
 })

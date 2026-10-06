@@ -65,6 +65,11 @@ npm run tracker             # ws://localhost:8000
   "limited connectivity") and **Topology** (the stream's relay trees, fetched from its presenter).
 - **Moderation.** The owner can stop anyone's stream from its tile menu (which revokes their right
   to share) and kick members from the Peers panel.
+- **Names.** Guests may join and watch anonymously, but pick a name (remembered) before sharing,
+  asking to share, or sending their first chat message.
+- **Names.** Guests may join and watch anonymously, but pick a name before sharing, asking to
+  share, or sending their first chat message. It is remembered; change it from the name field on
+  the home page (it applies the next time a lobby loads).
 - **Chat.** Signed, rate limited, collapsible; a joiner receives the last 50 messages.
 
 Useful URL parameters (put them in the page query or the hash query):

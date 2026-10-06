@@ -15,6 +15,7 @@
   import TileRail, { type Tile } from './components/TileRail.svelte'
   import RequestToasts from './components/RequestToasts.svelte'
   import PresenterBar from './components/PresenterBar.svelte'
+  import NameDialog from './components/NameDialog.svelte'
   import Icon from './components/Icon.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
@@ -23,7 +24,28 @@
 
   const seed = ownerSeed(joinCode)
   const isOwner = seed !== null
-  const name = params.get('name') ?? (settings.name || `guest-${randomId(4)}`)
+  const chosenName = (params.get('name') ?? settings.name).trim()
+  const name = chosenName || `guest-${randomId(4)}`
+  /** Guests join anonymously, but must pick a name before sharing or chatting. */
+  let hasName = $state(chosenName.length > 0)
+  /** What to do once the name dialog is answered. */
+  let pendingNamed = $state<{ reason: string; then: () => void } | null>(null)
+
+  /** Runs `action` now if this peer has a name, or after it picks one. */
+  function withName(reason: string, action: () => void): void {
+    if (hasName) action()
+    else pendingNamed = { reason, then: action }
+  }
+
+  function saveName(newName: string) {
+    settings.name = newName
+    saveSettings()
+    hasName = true
+    session?.mesh.updateRecord({ name: newName })
+    const next = pendingNamed?.then
+    pendingNamed = null
+    next?.()
+  }
   const link = lobbyUrl(joinCode, params)
   const iceServers = iceFrom(params) ?? DEFAULT_ICE
   /** Test/debug overrides from the URL (`share=1&source=test&k=…`); not persisted. */
@@ -151,9 +173,18 @@
   }
 
   function onShareClick() {
-    if (!session) return
-    if (session.canShare) dialogOpen = true
-    else session.requestPublish()
+    withName(session?.canShare ? 'before you share your screen' : 'before you ask to share', () => {
+      if (!session) return
+      if (session.canShare) dialogOpen = true
+      else session.requestPublish()
+    })
+  }
+
+  function sendChat(text: string): boolean {
+    if (hasName) return session?.mesh.sendChat(text) ?? false
+    // Keep the message and send it once a name is picked.
+    withName('before you chat', () => void session?.mesh.sendChat(text))
+    return true
   }
 
   function changeQuality(q: QualityPreset) {
@@ -482,11 +513,15 @@
         selfId={session.selfId}
         {badges}
         bind:open={settings.view.chatOpen}
-        onsend={(text) => session?.mesh.sendChat(text) ?? false}
+        onsend={sendChat}
       />
     {/if}
   </div>
 </div>
+
+{#if pendingNamed}
+  <NameDialog reason={pendingNamed.reason} onsave={saveName} oncancel={() => (pendingNamed = null)} />
+{/if}
 
 {#if lobby?.requests.length}
   <RequestToasts requests={lobby.requests} {nameOf} onrespond={(id, a) => void session?.respond(id, a)} />
