@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { open, seal, type Envelope } from '../src/mesh/envelope'
+import { gunzip, gzip, MAX_INFLATED_BYTES, open, seal, type Envelope } from '../src/mesh/envelope'
 import { generateIdentity, ownerIdFromCode, ownerIdentity } from '../src/mesh/identity'
-import { doorPeers, FailureDetector, linkSuspected, RecordStore, retryDelayMs, type MemberRecord } from '../src/mesh/records'
+import { doorPeers, FailureDetector, isMemberRecord, linkSuspected, RecordStore, retryDelayMs, type MemberRecord } from '../src/mesh/records'
 import { hostIdentity } from '../src/net/lobby'
 
 function rec(id: string, version: number, over: Partial<MemberRecord> = {}): MemberRecord {
@@ -128,6 +128,81 @@ describe('door duty and retries', () => {
 
   it('backs off from 60 s to 10 min', () => {
     expect([1, 2, 3, 4, 5, 6].map(retryDelayMs)).toEqual([60_000, 120_000, 240_000, 480_000, 600_000, 600_000])
+  })
+})
+
+describe('member record validation', () => {
+  const channel = { id: 7, kind: 'full', k: 4, m: 2, kbps: 2000, stripeKbps: 600, stream: null, deficit: 0, startedAt: 1 }
+  const stream = { epoch: 1, codec: 'avc1.42e01f', codedWidth: 1920, codedHeight: 1080, audio: { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 } }
+
+  it('accepts well-formed records', () => {
+    expect(isMemberRecord(rec('a', 1))).toBe(true)
+    const full = rec('a', 1, {
+      capacityKbps: 5000,
+      offers: { '7': 3 },
+      subs: [7],
+      unreachable: ['b'],
+      links: ['c'],
+      rtt: { c: 20 },
+      channels: [{ ...channel, stream } as MemberRecord['channels'][number]],
+      dropRate: 0.01,
+      left: false,
+    })
+    expect(isMemberRecord(full)).toBe(true)
+    expect(isMemberRecord(JSON.parse(JSON.stringify(full)))).toBe(true)
+  })
+
+  it('rejects records consumers would crash on', () => {
+    const bad: Record<string, unknown>[] = [
+      { unreachable: null },
+      { unreachable: [1] },
+      { offers: null },
+      { offers: [] },
+      { offers: { '7': 'x' } },
+      { rtt: null },
+      { rtt: { b: null } },
+      { channels: null },
+      { channels: [null] },
+      { channels: [{ ...channel, k: 0 }] },
+      { channels: [{ ...channel, m: -1 }] },
+      { channels: [{ ...channel, k: 200, m: 100 }] },
+      { channels: [{ ...channel, kind: 'other' }] },
+      { channels: [{ ...channel, stripeKbps: 0 }] },
+      { channels: [{ ...channel, stream: { ...stream, codec: 5 } }] },
+      { channels: [{ ...channel, stream: { ...stream, audio: null } }] },
+      { links: 'x' },
+      { subs: null },
+      { name: null },
+      { version: '9' },
+      { joinedAt: null },
+      { capacityKbps: 'fast' },
+      { dropRate: null },
+      { left: 1 },
+    ]
+    for (const over of bad) expect(isMemberRecord({ ...rec('a', 1), ...over }), JSON.stringify(over)).toBe(false)
+    expect(isMemberRecord(null)).toBe(false)
+    expect(isMemberRecord({ ...rec('a', 1), type: 'chat' })).toBe(false)
+  })
+})
+
+describe('gzip limits', () => {
+  it('inflates bodies within the limit', async () => {
+    const text = 'x'.repeat(100_000)
+    expect(await gunzip(await gzip(text))).toBe(text)
+  })
+
+  it('rejects bodies that inflate past the limit', async () => {
+    const bomb = await gzip('0'.repeat(MAX_INFLATED_BYTES + 1))
+    expect(bomb.length).toBeLessThan(MAX_INFLATED_BYTES / 100)
+    await expect(gunzip(bomb)).rejects.toThrow()
+    await expect(gunzip(await gzip('y'.repeat(2000)), 1000)).rejects.toThrow()
+  })
+
+  it('open() refuses a signed gzip bomb', async () => {
+    const { identity } = await generateIdentity()
+    const e = await seal(identity, rec(identity.id, 1, { name: 'n'.repeat(MAX_INFLATED_BYTES) }))
+    expect(e.z).toBe(1)
+    expect(await open<MemberRecord>(e, 'rec')).toBeNull()
   })
 })
 

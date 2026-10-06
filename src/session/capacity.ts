@@ -49,6 +49,10 @@ export function splitBudget(capacityKbps: number | null, own: OwnChannel[], watc
   const rest = budgetKbps - ownBudget
   const totalWeight = watched.reduce((a, c) => a + c.stripeKbps * c.weight, 0)
   for (const c of watched) {
+    if (!(c.stripeKbps > 0)) {
+      offers[c.id] = 0 // a non-finite offer would serialize as null and invalidate this peer's record
+      continue
+    }
     const share = totalWeight > 0 ? (rest * c.stripeKbps * c.weight) / totalWeight : 0
     offers[c.id] = Math.max(0, Math.min(maxFanout, Math.floor(share / c.stripeKbps)))
   }

@@ -51,6 +51,71 @@ export interface MemberRecord extends Typed {
   left?: boolean
 }
 
+/** Stripes are numbered in one byte of the fragment header. */
+const MAX_STRIPES = 256
+
+const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
+const isStr = (x: unknown): x is string => typeof x === 'string'
+const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
+const isArrayOf = <T>(x: unknown, item: (v: unknown) => v is T): x is T[] => Array.isArray(x) && x.every(item)
+const isNumMap = (x: unknown): x is Record<string, number> => isObj(x) && Object.values(x).every(isNum)
+const isCount = (x: unknown): x is number => Number.isInteger(x) && (x as number) >= 0
+
+function isStreamInfo(x: unknown): x is StreamInfo {
+  if (!isObj(x)) return false
+  if (!isNum(x.epoch) || !isStr(x.codec) || !isNum(x.codedWidth) || !isNum(x.codedHeight)) return false
+  if (x.description !== undefined && !isStr(x.description)) return false
+  if (x.audio === undefined) return true
+  const a = x.audio
+  return isObj(a) && isStr(a.codec) && isNum(a.sampleRate) && isNum(a.numberOfChannels)
+}
+
+function isChannelAnnouncement(x: unknown): x is ChannelAnnouncement {
+  if (!isObj(x)) return false
+  return (
+    isNum(x.id) &&
+    (x.kind === 'full' || x.kind === 'preview') &&
+    isCount(x.k) &&
+    (x.k as number) >= 1 &&
+    isCount(x.m) &&
+    (x.k as number) + (x.m as number) <= MAX_STRIPES &&
+    isNum(x.kbps) &&
+    // Positive: watchers divide by it, and a NaN offer would serialize as null and fail this check
+    // in every watcher's own record.
+    isNum(x.stripeKbps) &&
+    (x.stripeKbps as number) > 0 &&
+    (x.stream === null || isStreamInfo(x.stream)) &&
+    isNum(x.deficit) &&
+    isNum(x.startedAt)
+  )
+}
+
+/**
+ * Whether a (signed, so author-checked) record body has the shape every consumer relies on. A
+ * member could sign anything; a malformed record must not be stored or forwarded, or it would break
+ * every peer that reads it.
+ */
+export function isMemberRecord(x: unknown): x is MemberRecord {
+  if (!isObj(x)) return false
+  return (
+    x.type === 'rec' &&
+    isStr(x.id) &&
+    isStr(x.name) &&
+    isNum(x.joinedAt) &&
+    isNum(x.version) &&
+    isNum(x.heartbeat) &&
+    (x.capacityKbps === null || isNum(x.capacityKbps)) &&
+    isNumMap(x.offers) &&
+    isArrayOf(x.subs, isNum) &&
+    isArrayOf(x.unreachable, isStr) &&
+    (x.links === undefined || isArrayOf(x.links, isStr)) &&
+    isNumMap(x.rtt) &&
+    isArrayOf(x.channels, isChannelAnnouncement) &&
+    (x.dropRate === undefined || isNum(x.dropRate)) &&
+    (x.left === undefined || typeof x.left === 'boolean')
+  )
+}
+
 export interface StoredRecord {
   rec: MemberRecord
   env: Envelope

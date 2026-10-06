@@ -123,13 +123,22 @@ export class Rendezvous {
           const conn = new MeshConn(this.opts.iceServers, '')
           conn.offerer = this.opts.identity.id
           const offerId = randomPeerId()
-          const sdp = await conn.createOffer()
-          const env = await seal<DoorOffer>(this.opts.identity, { type: 'door-offer', peerId: this.opts.identity.id, offerId, sdp }, Infinity)
-          return { offerId, conn, sdp: await sealJson(this.keys, 'offer', offerId, env) }
+          try {
+            const sdp = await conn.createOffer()
+            const env = await seal<DoorOffer>(this.opts.identity, { type: 'door-offer', peerId: this.opts.identity.id, offerId, sdp }, Infinity)
+            return { offerId, conn, sdp: await sealJson(this.keys, 'offer', offerId, env) }
+          } catch (err) {
+            // One failed offer doesn't spoil the others.
+            console.warn('door offer failed', err)
+            conn.close()
+            return null
+          }
         }),
       )
-      for (const { offerId, ...f } of fresh) {
-        if (this.door) this.pool.set(offerId, { ...f, at: performance.now() })
+      for (const f of fresh) {
+        if (!f) continue
+        // Door duty may have ended (or the rendezvous closed) while the offers were gathering.
+        if (this.door && !this.closed) this.pool.set(f.offerId, { conn: f.conn, sdp: f.sdp, at: performance.now() })
         else f.conn.close()
       }
     } finally {

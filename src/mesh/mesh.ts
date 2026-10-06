@@ -19,7 +19,7 @@ import { emptyAuth, isBanned, type AuthDoc } from './auth'
 import { open, seal, type Envelope, type Typed } from './envelope'
 import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn } from './meshConn'
-import { doorPeers, FailureDetector, linkSuspected, RecordStore, retryDelayMs, type Digest, type MemberRecord } from './records'
+import { doorPeers, FailureDetector, isMemberRecord, linkSuspected, RecordStore, retryDelayMs, type Digest, type MemberRecord } from './records'
 import { every } from '../net/ticker'
 
 const HEARTBEAT_MS = 2000
@@ -38,6 +38,8 @@ const ALONE_DOOR_MS = 5000
 /** A member with no open links for this long goes back to the tracker to find the lobby again. */
 const ISOLATED_MS = 3000
 const SIG_MAX_AGE_MS = 120_000
+/** A knock doesn't restart an offer to the knocker made this recently (it is likely in flight). */
+const KNOCK_KEEP_OFFER_MS = 5000
 const CHAT_KEEP = 50
 const CHAT_MAX_LEN = 500
 const CHAT_RATE = { count: 5, perMs: 5000 }
@@ -134,10 +136,13 @@ export class Mesh {
   private chatEnvs: Envelope[] = []
   private chatSent: number[] = []
   private chatByAuthor = new Map<string, number[]>()
+  /** Links whose first snapshot (and its chat history) has arrived. */
+  private snapshotted = new WeakSet<MeshConn>()
   /** Per remote: failed attempts and when to try again. */
   private retry = new Map<string, { attempts: number; at: number }>()
   /** Outgoing offers awaiting an answer, by remote id. */
   private pendingOffers = new Map<string, { conn: MeshConn; nonce: string }>()
+  /** Signaling nonces already handled, with the wall-clock time after which a replay is too old anyway. */
   private seenNonces = new Map<string, number>()
   private timers: (() => void)[] = []
   private seekingSince = performance.now()
@@ -530,7 +535,8 @@ export class Mesh {
     }
     // Members not heard from (directly or through gossip) are gone.
     for (const id of this.detector.gone(now)) this.dropMember(id)
-    for (const [n, t] of this.seenNonces) if (now - t > SIG_MAX_AGE_MS) this.seenNonces.delete(n)
+    const wall = Date.now()
+    for (const [n, until] of this.seenNonces) if (wall > until) this.seenNonces.delete(n)
     this.connectMissing(now)
     this.updateDoorDuty()
   }
@@ -608,7 +614,7 @@ export class Mesh {
     }
     const relays = [...this.conns.values()]
       .filter((c) => c.isOpen && c.remoteId !== to && !this.unreachablePair(c.remoteId, to))
-      .sort((a, b) => this.relayRank(a.remoteId, to) - this.relayRank(b.remoteId, to))
+      .sort((a, b) => this.relayRank(a.remoteId, to) - this.relayRank(b.remoteId, to) || this.joinedAtOf(a.remoteId) - this.joinedAtOf(b.remoteId))
       .slice(0, 2)
     for (const r of relays) r.sendCtl({ t: 'sig', to, env })
   }
@@ -622,7 +628,12 @@ export class Mesh {
     const relay = this.store.get(id)?.rec
     if (target?.links?.includes(id) || relay?.links?.includes(to)) return 0
     if (id === this.ownerId) return 1
-    return 2 + (relay ? 1 - 1 / (1 + Math.max(0, Date.now() - relay.joinedAt)) : 1)
+    return 2
+  }
+
+  /** When a member joined (unknown ones sort last among relays). */
+  private joinedAtOf(id: string): number {
+    return this.store.get(id)?.rec.joinedAt ?? Infinity
   }
 
   private async onSig(env: Envelope, to: string, from: string): Promise<void> {
@@ -637,12 +648,16 @@ export class Mesh {
     if (b.from !== opened.author || b.to !== this.selfId || Math.abs(Date.now() - b.at) > SIG_MAX_AGE_MS) return
     const key = `${b.from}:${b.kind}:${b.nonce}`
     if (this.seenNonces.has(key)) return
-    this.seenNonces.set(key, performance.now())
+    // Kept for as long as the message's `at` passes the age check, so it can't be replayed.
+    this.seenNonces.set(key, Math.max(Date.now(), b.at) + SIG_MAX_AGE_MS)
     if (this.isBlocked(b.from) || this.isBannedPeer(b.from) || this.left || this.offline) return
 
     if (b.kind === 'knock') {
-      if (this.selfId < b.from && !this.conns.get(b.from)?.isOpen) {
-        this.conns.get(b.from)?.close()
+      const cur = this.conns.get(b.from)
+      // Our own offer may have crossed the knock: keep it rather than restart ICE gathering.
+      const offering = !!cur && this.pendingOffers.get(b.from)?.conn === cur && performance.now() - cur.createdAt < KNOCK_KEEP_OFFER_MS
+      if (this.selfId < b.from && !cur?.isOpen && !offering) {
+        cur?.close()
         this.retry.set(b.from, { attempts: this.retry.get(b.from)?.attempts ?? 0, at: performance.now() + CONNECT_ATTEMPT_MS })
         void this.initiate(b.from)
       }
@@ -688,7 +703,8 @@ export class Mesh {
 
   private async acceptRecord(env: Envelope): Promise<void> {
     const opened = await open<MemberRecord>(env, 'rec')
-    if (!opened || opened.body.id !== opened.author) return
+    // Malformed records are dropped here, so they are neither stored nor forwarded.
+    if (!opened || !isMemberRecord(opened.body) || opened.body.id !== opened.author) return
     const rec = opened.body
     if (rec.id === this.selfId) {
       // A copy from a previous session of ours: stay ahead of it.
@@ -753,18 +769,23 @@ export class Mesh {
 
   // --- chat ----------------------------------------------------------------------------------------
 
-  private async onChatEnv(env: Envelope, from: string): Promise<void> {
+  /** `history`: part of a link's initial snapshot, so not rate limited by arrival time. */
+  private async onChatEnv(env: Envelope, from: string, history = false): Promise<void> {
     const opened = await open<ChatBody>(env, 'chat')
     if (!opened) return
     const b = opened.body
-    if (b.from !== opened.author || typeof b.text !== 'string' || b.text.length > CHAT_MAX_LEN) return
+    if (b.from !== opened.author || typeof b.id !== 'string' || typeof b.name !== 'string' || typeof b.at !== 'number') return
+    if (typeof b.text !== 'string' || b.text.length > CHAT_MAX_LEN) return
+    if (this.isBannedPeer(b.from)) return
     if (this.chat.some((m) => m.id === b.id)) return
-    // Senders are rate limited by everyone, so a flooding member can't drown the chat.
-    const now = performance.now()
-    const recent = (this.chatByAuthor.get(b.from) ?? []).filter((t) => now - t < CHAT_RATE.perMs)
-    if (recent.length >= CHAT_RATE.count) return
-    recent.push(now)
-    this.chatByAuthor.set(b.from, recent)
+    if (!history) {
+      // Senders are rate limited by everyone, so a flooding member can't drown the chat.
+      const now = performance.now()
+      const recent = (this.chatByAuthor.get(b.from) ?? []).filter((t) => now - t < CHAT_RATE.perMs)
+      if (recent.length >= CHAT_RATE.count) return
+      recent.push(now)
+      this.chatByAuthor.set(b.from, recent)
+    }
     this.storeChat(b, env)
     // Forward to neighbours the sender can't reach directly.
     const unreachable = this.member(b.from)?.unreachable ?? []
@@ -783,7 +804,9 @@ export class Mesh {
 
   private handle(msg: MeshMsg, from: string, conn: MeshConn): void {
     if (this.conns.get(from) !== conn) return
-    if (msg.t !== 'auth' && msg.t !== 'snapshot' && this.isBannedPeer(from)) {
+    if (msg.t !== 'auth' && this.isBannedPeer(from)) {
+      // The owner's decisions are signed, so they are taken from anyone.
+      if (msg.t === 'snapshot' && msg.auth) void this.acceptAuth(msg.auth)
       conn.close()
       return
     }
@@ -795,18 +818,23 @@ export class Mesh {
       case 'recs':
         for (const env of msg.envs ?? []) void this.acceptRecord(env)
         break
-      case 'snapshot':
+      case 'snapshot': {
         if (msg.auth) void this.acceptAuth(msg.auth)
         for (const env of msg.recs ?? []) void this.acceptRecord(env)
-        for (const env of msg.chat ?? []) void this.onChatEnv(env, from)
+        // History is exempt from the chat rate limit (it was sent over time), but only in the one
+        // snapshot a link starts with, and only as much as anyone keeps.
+        const history = !this.snapshotted.has(conn)
+        this.snapshotted.add(conn)
+        for (const env of (msg.chat ?? []).slice(-CHAT_KEEP)) void this.onChatEnv(env, from, history)
         break
+      }
       case 'auth':
         void this.acceptAuth(msg.env)
         break
       case 'digest': {
+        // A digest is unsigned, so it is no evidence that anyone is alive: the records pulled in
+        // reply are (acceptRecord marks their authors heard).
         const { pull, push } = this.store.compare(msg.d ?? {})
-        // Evidence that those peers are alive: someone heard a newer heartbeat.
-        for (const id of pull) if (this.store.has(id)) this.detector.heard(id, performance.now())
         const ownNewer = (msg.d?.[this.selfId] ?? -Infinity) < this.self.version
         const envs = [...push, ...(ownNewer && this.selfEnv ? [this.selfEnv] : [])]
         if (envs.length) conn.sendCtl({ t: 'recs', envs })

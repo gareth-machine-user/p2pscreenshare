@@ -91,4 +91,10 @@ describe('feasibility and auto quality', () => {
     expect(feasibleBitrate(2500, 0.5)).toBe(1150)
     expect(feasibleBitrate(2500, 0.05)).toBe(300)
   })
+
+  it('offers nothing (not NaN) to a channel announcing no stripe bitrate', () => {
+    const r = splitBudget(4000, [], [{ id: 1, stripeKbps: 0, weight: 1 }, { id: 2, stripeKbps: 600, weight: 1 }])
+    expect(r.offers[1]).toBe(0)
+    expect(Number.isFinite(r.offers[2])).toBe(true)
+  })
 })

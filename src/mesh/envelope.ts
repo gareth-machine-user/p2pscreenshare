@@ -23,6 +23,11 @@ export interface Typed {
 const DOMAIN = 'p2pscreenshare:env:v1\n'
 /** Bodies above this many bytes are compressed. */
 export const COMPRESS_OVER = 1024
+/**
+ * Most bytes a gzipped body may inflate to (a member's record, chat, the owner's decisions and
+ * topology reports are all far smaller), so a tiny "gzip bomb" can't exhaust memory.
+ */
+export const MAX_INFLATED_BYTES = 4 * 1024 * 1024
 
 export async function seal<T extends Typed>(id: PeerIdentity, body: T, compressOver = COMPRESS_OVER): Promise<Envelope> {
   const json = JSON.stringify(body)
@@ -66,7 +71,27 @@ export async function gzip(text: string): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream).arrayBuffer())
 }
 
-export async function gunzip(bytes: Uint8Array): Promise<string> {
+/** Inflates gzip to text; rejects once the output would exceed `maxBytes`. */
+export async function gunzip(bytes: Uint8Array, maxBytes = MAX_INFLATED_BYTES): Promise<string> {
   const stream = new Blob([bytes as Uint8Array<ArrayBuffer>]).stream().pipeThrough(new DecompressionStream('gzip'))
-  return new Response(stream).text()
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > maxBytes) {
+      void reader.cancel().catch(() => {})
+      throw new Error(`gzip body inflates past ${maxBytes} bytes`)
+    }
+    chunks.push(value)
+  }
+  const out = new Uint8Array(total)
+  let at = 0
+  for (const c of chunks) {
+    out.set(c, at)
+    at += c.byteLength
+  }
+  return new TextDecoder().decode(out)
 }
