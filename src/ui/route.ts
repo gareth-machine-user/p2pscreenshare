@@ -4,6 +4,15 @@ export type Route =
   | { page: 'host'; params: URLSearchParams }
   | { page: 'lobby'; joinCode: string; params: URLSearchParams }
 
+/** decodeURIComponent that leaves malformed percent-encoding (e.g. `abc%`) as is instead of throwing. */
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s)
+  } catch {
+    return s
+  }
+}
+
 export function parseRoute(hash: string): Route {
   const [path, query = ''] = hash.replace(/^#/, '').split('?')
   const params = new URLSearchParams(query)
@@ -11,7 +20,7 @@ export function parseRoute(hash: string): Route {
   if (parts[0] === 'host') return { page: 'host', params }
   // `watch` is the pre-lobby viewer link.
   if ((parts[0] === 'lobby' || parts[0] === 'watch') && parts[1]) {
-    return { page: 'lobby', joinCode: decodeURIComponent(parts[1]), params }
+    return { page: 'lobby', joinCode: safeDecode(parts[1]), params }
   }
   return { page: 'home' }
 }
@@ -20,7 +29,7 @@ export function parseRoute(hash: string): Route {
 export function joinCodeFrom(text: string): string | null {
   const t = text.trim()
   const m = /#\/(?:lobby|watch)\/([^?/\s]+)/.exec(t)
-  const code = m ? decodeURIComponent(m[1]) : t
+  const code = m ? safeDecode(m[1]) : t
   return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(code) ? code : null
 }
 

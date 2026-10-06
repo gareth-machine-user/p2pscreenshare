@@ -340,10 +340,14 @@
   })
 
   // Topology reports are fetched from the publisher only while the panel is open.
+  // Primitives, so the effect below re-runs only when they change (`view` is a new object every tick,
+  // and re-subscribing would make the publisher send a full report each time).
+  const topoChannel = $derived(view?.channel ?? null)
+  const topoPresenting = $derived(view?.presenting ?? false)
   $effect(() => {
     const s = session
-    const ch = view?.channel ?? null
-    if (!s || ch === null || gearTab !== 'topology' || view?.presenting) return
+    const ch = topoChannel
+    if (!s || ch === null || gearTab !== 'topology' || topoPresenting) return
     untrack(() => s.watchTopology(ch, true))
     return () => s.watchTopology(ch, false)
   })

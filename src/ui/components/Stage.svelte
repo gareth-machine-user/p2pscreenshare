@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte'
+  import { untrack, type Snippet } from 'svelte'
   import type { Player } from '../../media/player'
   import type { ViewQuality } from '../settings.svelte'
   import Icon from './Icon.svelte'
@@ -51,6 +51,14 @@
     const onChange = () => (fullscreen = document.fullscreenElement === stage)
     document.addEventListener('fullscreenchange', onChange)
     return () => document.removeEventListener('fullscreenchange', onChange)
+  })
+
+  // Each new player starts muted: carry the user's choice over when the stage switches streams.
+  $effect(() => {
+    const p = player
+    untrack(() => {
+      if (p && p.audio.muted !== muted) p.audio.setMuted(muted)
+    })
   })
 
   function toggleMute() {

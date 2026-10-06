@@ -58,22 +58,59 @@ export function storageSet(key: string, value: string): void {
   }
 }
 
-function load(): Settings {
-  const raw = storageGet(KEY)
-  if (!raw) return structuredClone(DEFAULT_SETTINGS)
+const SOURCES: readonly SourceKind[] = ['screen', 'window', 'tab', 'test']
+const VIEW_QUALITIES: readonly ViewQuality[] = ['auto', 'full', 'preview']
+
+/** `v` if it is one of `allowed`, else `fallback`. */
+function oneOf<T>(v: unknown, allowed: readonly T[], fallback: T): T {
+  return allowed.includes(v as T) ? (v as T) : fallback
+}
+
+function bool(v: unknown, fallback: boolean): boolean {
+  return typeof v === 'boolean' ? v : fallback
+}
+
+function int(v: unknown, min: number, max: number, fallback: number): number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= min && v <= max ? v : fallback
+}
+
+function obj(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+}
+
+/**
+ * Settings from their stored JSON. Each field is checked and falls back to its default on its own,
+ * so a stale or corrupted value (an old quality preset, a bad type) can't break the share dialog.
+ */
+export function parseSettings(raw: string | null): Settings {
+  let parsed: unknown = null
   try {
-    const s = JSON.parse(raw) as Partial<Settings>
-    return {
-      name: typeof s.name === 'string' ? s.name : '',
-      share: { ...DEFAULT_SETTINGS.share, ...s.share },
-      view: { ...DEFAULT_SETTINGS.view, ...s.view },
-    }
+    parsed = raw ? JSON.parse(raw) : null
   } catch {
-    return structuredClone(DEFAULT_SETTINGS)
+    // corrupted: defaults
+  }
+  const s = obj(parsed)
+  const share = obj(s.share)
+  const view = obj(s.view)
+  const d = DEFAULT_SETTINGS
+  return {
+    name: typeof s.name === 'string' ? s.name : d.name,
+    share: {
+      source: oneOf(share.source, SOURCES, d.share.source),
+      systemAudio: bool(share.systemAudio, d.share.systemAudio),
+      mic: bool(share.mic, d.share.mic),
+      quality: Object.hasOwn(QUALITY_PRESETS, share.quality as string) ? (share.quality as QualityPreset) : d.share.quality,
+      k: int(share.k, 1, 16, d.share.k),
+      m: int(share.m, 0, 8, d.share.m),
+    },
+    view: {
+      quality: oneOf(view.quality, VIEW_QUALITIES, d.view.quality),
+      chatOpen: bool(view.chatOpen, d.view.chatOpen),
+    },
   }
 }
 
-export const settings: Settings = $state(load())
+export const settings: Settings = $state(parseSettings(storageGet(KEY)))
 
 export function saveSettings(): void {
   storageSet(KEY, JSON.stringify($state.snapshot(settings)))
