@@ -6,6 +6,11 @@ import { tuning } from '../tuning'
 // base layer.
 const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
 
+/** Layers beyond the table (none on the wire: the layer is 2 bits) get the last entry's deadline. */
+function maxAgeForLayer(layer: number): number {
+  return MAX_AGE_MS_BY_LAYER[Math.min(layer, MAX_AGE_MS_BY_LAYER.length - 1)]
+}
+
 interface Item {
   data: Uint8Array
   layer: number
@@ -65,7 +70,8 @@ export class Uplink {
 
   /** Bytes per ms allowed by the cap. */
   private get rate(): number {
-    return this.capKbps === null ? Infinity : (this.capKbps * 1000) / 8 / 1000
+    // kbps / 8 = bytes per ms
+    return this.capKbps === null ? Infinity : this.capKbps / 8
   }
 
   /** Links whose traffic only uses spare upload (e.g. probes): served when no media is waiting. */
@@ -94,7 +100,7 @@ export class Uplink {
       q = []
       this.queues.set(link, q)
     }
-    const item: Item = { data, layer, replay, frame, enqueuedAt: performance.now(), maxAge: maxAgeMs ?? MAX_AGE_MS_BY_LAYER[layer] ?? 900 }
+    const item: Item = { data, layer, replay, frame, enqueuedAt: performance.now(), maxAge: maxAgeMs ?? maxAgeForLayer(layer) }
     const firstReplay = replay ? -1 : q.findIndex((it) => it.replay)
     if (firstReplay >= 0) q.splice(firstReplay, 0, item)
     else q.push(item)
@@ -167,8 +173,10 @@ export class Uplink {
         )
         const links = [...this.queues.keys()].filter((l) => !mediaWaiting || !this.background.has(l))
         const n = links.length
+        // Fixed for the pass (the cursor moves as links are served; reading it here would skip some).
+        const start = this.cursor
         for (let i = 0; i < n; i++) {
-          const idx = (this.cursor + i) % n
+          const idx = (start + i) % n
           const link = links[idx]
           const q = this.queues.get(link)!
           if (!link.isOpen) {

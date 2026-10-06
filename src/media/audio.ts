@@ -65,7 +65,7 @@ export class AudioPipeline {
     try {
       this.encoder?.close()
     } catch {
-      // ignore
+      // Already closed (e.g. after an encoder error): nothing left to release.
     }
   }
 }
@@ -144,7 +144,7 @@ export class AudioPlayer {
     try {
       if (this.decoder && this.decoder.state !== 'closed') this.decoder.close()
     } catch {
-      // ignore
+      // Closing is best effort: the decoder is being discarded either way.
     }
     this.decoder = null
   }

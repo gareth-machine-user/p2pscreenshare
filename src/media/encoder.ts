@@ -208,12 +208,12 @@ export class VideoPipeline {
       try {
         await old.flush()
       } catch {
-        // ignore
+        // Flushing fails on an encoder that errored or closed; its pending output is lost anyway.
       }
       try {
         if (old.state !== 'closed') old.close()
       } catch {
-        // ignore
+        // Closing is best effort: the old encoder is being replaced either way.
       }
     }
     const config = await pickConfig(width, height, this.opts)
@@ -242,7 +242,7 @@ export class VideoPipeline {
       try {
         encoder.close()
       } catch {
-        // ignore
+        // A failed configure may already have closed it; the configure error is what matters.
       }
       throw err
     }
@@ -304,7 +304,7 @@ export class VideoPipeline {
     try {
       this.encoder?.close()
     } catch {
-      // ignore
+      // Already closed (e.g. after an encoder error): nothing left to release.
     }
   }
 }

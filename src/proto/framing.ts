@@ -7,9 +7,9 @@
 // fragment ends with the publisher's Ed25519 signature (see signedRegion), which covers the
 // channel id, so relays can drop anything the channel's publisher didn't produce before forwarding.
 
-export const WIRE_VERSION = 3
+const WIRE_VERSION = 3
 export const HEADER_SIZE = 40
-export const SIG_SIZE = 64
+const SIG_SIZE = 64
 // Keep messages comfortably under the 16KiB cross-browser SCTP message limit.
 export const MAX_FRAGMENT_PAYLOAD = 16 * 1024 - HEADER_SIZE - SIG_SIZE
 export const NO_REF = 0xffffffff
@@ -134,9 +134,6 @@ export function signatureOf(raw: Uint8Array): Uint8Array {
 }
 
 /** Fast header peeks for the relay hot path (no full decode). */
-export function peekStripe(raw: Uint8Array): number {
-  return raw[27]
-}
 export function peekChannel(raw: Uint8Array): number {
   return raw.byteLength < HEADER_SIZE ? -1 : new DataView(raw.buffer, raw.byteOffset + 36, 4).getUint32(0, true)
 }

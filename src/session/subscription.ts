@@ -25,6 +25,8 @@ const PARENT_GRACE_MS = 3000
 const LINK_SETUP_GRACE_MS = 8000
 const REATTACH_COOLDOWN_MS = 4000
 const RESUBSCRIBE_MS = 10_000
+/** At most one keyframe request per this interval (the decode chain often breaks in bursts). */
+const KEY_REQUEST_INTERVAL_MS = 500
 
 export interface SubscriptionContext {
   readonly selfId: string
@@ -151,7 +153,7 @@ export class Subscription {
 
   private requestKeyframe(): void {
     const now = performance.now()
-    if (now - this.lastKeyRequest < 500) return
+    if (now - this.lastKeyRequest < KEY_REQUEST_INTERVAL_MS) return
     this.lastKeyRequest = now
     this.send({ t: 'need-key', ch: this.channel })
   }
@@ -185,7 +187,7 @@ export class Subscription {
         const rtt = t1 - t0
         if (!best || rtt < best.rtt) best = { rtt, offset: remote - (t0 + t1) / 2 }
       } catch {
-        // ignore
+        // A lost or timed-out ping: the remaining attempts (or the next sync) cover it.
       }
     }
     if (best) this.player.clockOffset = best.offset

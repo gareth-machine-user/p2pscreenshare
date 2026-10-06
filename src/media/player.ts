@@ -115,7 +115,7 @@ export class Player {
       // A decoder that reported an error is already closed, and closing it again throws.
       if (this.decoder && this.decoder.state !== 'closed') this.decoder.close()
     } catch {
-      // ignore
+      // Closing is best effort: the decoder is being replaced either way.
     }
     this.renderAtByTs.clear()
     if (prev && prev.epoch !== info.epoch) this.retiredEpoch = prev.epoch
@@ -265,7 +265,7 @@ export class Player {
     try {
       this.decoder?.close()
     } catch {
-      // ignore
+      // An errored decoder is already closed, and closing it again throws.
     }
     this.audio.close()
   }

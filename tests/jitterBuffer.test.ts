@@ -90,9 +90,89 @@ describe('DecodeScheduler', () => {
     expect(s.poll(1130).map((f) => f.seq)).toEqual([12])
     expect(s.stats.skippedMissing).toBe(1)
   })
+
+  it('ignores epochs: a restart with lower seqs needs a reset, which the player does on a new epoch', () => {
+    let needKey = 0
+    const s = new DecodeScheduler(readyClock(), () => needKey++, 1000)
+    for (let seq = 16; seq < 20; seq++) s.push(makeFrame(seq))
+    expect(s.poll(10_000).map((f) => f.seq)).toEqual([16, 17, 18, 19])
+    // The publisher restarted its encoder: seqs start over in a new epoch.
+    const restarted = (seq: number) => ({ ...makeFrame(seq), epoch: 2 })
+    s.push(restarted(0))
+    expect(s.stats.droppedLate).toBe(1)
+    expect(s.poll(10_000)).toEqual([])
+    // Player.setStreamInfo for the new epoch: reset without asking for a key (one is coming).
+    s.reset(false)
+    expect(needKey).toBe(0)
+    for (const seq of [0, 1, 2]) s.push(restarted(seq))
+    expect(s.poll(10_000).map((f) => [f.epoch, f.seq])).toEqual([
+      [2, 0],
+      [2, 1],
+      [2, 2],
+    ])
+    expect(needKey).toBe(0)
+    // A reset that does request one (decoder rebuilt within an epoch).
+    s.reset()
+    expect(needKey).toBe(1)
+    expect(s.waitingForKeyframe).toBe(true)
+  })
+
+  it('requireKeyframe drops delta frames until the next keyframe, asking once', () => {
+    let needKey = 0
+    const s = new DecodeScheduler(readyClock(), () => needKey++, 1000)
+    for (const seq of [0, 1, 2]) s.push(makeFrame(seq))
+    expect(s.poll(10_000).map((f) => f.seq)).toEqual([0, 1, 2])
+    s.requireKeyframe()
+    expect(needKey).toBe(1)
+    expect(s.waitingForKeyframe).toBe(true)
+    // Already waiting: no duplicate request.
+    s.requireKeyframe()
+    expect(needKey).toBe(1)
+    for (const seq of [3, 4, 5]) s.push(makeFrame(seq))
+    expect(s.poll(10_000)).toEqual([])
+    for (const seq of [8, 9]) s.push(makeFrame(seq))
+    expect(s.poll(10_000).map((f) => f.seq)).toEqual([8, 9])
+    expect(s.stats.droppedUndecodable).toBe(3)
+    expect(s.waitingForKeyframe).toBe(false)
+  })
 })
 
 describe('PlayoutClock', () => {
+  it('is not ready until it has a sample', () => {
+    const c = new PlayoutClock()
+    expect(c.ready).toBe(false)
+    expect(c.renderAt(1000)).toBeNull()
+    expect(c.bufferMs).toBe(0)
+    c.addSample(1000, 1100)
+    expect(c.ready).toBe(true)
+  })
+
+  it('keeps at least minDelay of buffer and at most maxDelay', () => {
+    const c = new PlayoutClock({ safetyMs: 0, minDelayMs: 150, maxDelayMs: 300, slewMsPerSec: 1e9 })
+    for (let i = 0; i < 10; i++) c.addSample(i * 10, i * 10 + 100)
+    expect(c.renderAt(0)).toBe(250)
+    expect(c.bufferMs).toBe(150)
+    // A slow outlier above the quantile cut is capped at maxDelay beyond the fastest path.
+    const d = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, maxDelayMs: 300, slewMsPerSec: 1e9 })
+    d.addSample(0, 100)
+    d.addSample(10, 2010)
+    expect(d.bufferMs).toBe(300)
+  })
+
+  it('slews the delay: up at 4x the rate, down at the rate', () => {
+    const c = new PlayoutClock({ quantile: 0.5, safetyMs: 0, minDelayMs: 0, windowMs: 500, slewMsPerSec: 100 })
+    c.addSample(0, 100)
+    expect(c.renderAt(0)).toBe(100)
+    // Target jumps to 1000 ms; one second allows +400.
+    c.addSample(100, 1100)
+    expect(c.renderAt(0)).toBe(500)
+    // The slow samples age out; target falls back to 100 but the delay only drops 100 ms/s.
+    c.addSample(2000, 2100)
+    expect(c.renderAt(0)).toBeCloseTo(400, 6)
+    c.addSample(3000, 3100)
+    expect(c.renderAt(0)).toBeCloseTo(300, 6)
+  })
+
   it('targets the configured quantile of transit times', () => {
     const c = new PlayoutClock({ safetyMs: 0, slewMsPerSec: 1e9, minDelayMs: 0 })
     for (let i = 0; i < 100; i++) c.addSample(i * 10, i * 10 + 100 + (i % 10 === 0 ? 300 : 0))
