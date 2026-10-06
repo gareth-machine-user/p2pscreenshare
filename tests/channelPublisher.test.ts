@@ -387,8 +387,7 @@ describe('ChannelPublisher: make-before-break', () => {
     expect(hasEdge('b', 'c', 0)).toBe(true)
   })
 
-  // Bug: fixed in the next commit.
-  it.fails('a second switch before the first delivered keeps the parent that still feeds', async () => {
+  it('a second switch before the first delivered keeps the parent that still feeds', async () => {
     await promoteC()
     // Before the root delivers anything, the plan changes again: c moves on to a.
     h.mesh.setSlots('a', 2)

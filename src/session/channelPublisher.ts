@@ -578,15 +578,20 @@ export class ChannelPublisher {
     this.send(c.peer, { t: 'set-parent', ch: this.id, stripe: c.stripe, parent: c.to })
 
     const prev = this.pendingRemovals.get(key)
+    let from = c.from
     if (prev) {
       prev.cancel()
       this.pendingRemovals.delete(key)
-      // The older pending parent is superseded too.
-      if (prev.oldParent !== c.to) this.removeEdge(prev.oldParent, c.peer, c.stripe)
+      if (prev.oldParent !== c.to) {
+        // The parent being replaced never reported delivering (no stripe-ok yet), while the one
+        // before it may still be feeding: drop the former, keep the latter until the new one delivers.
+        if (c.from !== null && c.from !== prev.oldParent) this.removeEdge(c.from, c.peer, c.stripe)
+        from = prev.oldParent
+      }
     }
-    if (c.from !== null && (c.from === this.ctx.selfId || this.subscribers.has(c.from))) {
+    if (from !== null && (from === this.ctx.selfId || this.subscribers.has(from))) {
       // Make-before-break: keep the old parent feeding until the new one delivers.
-      const oldParent = c.from
+      const oldParent = from
       const cancel = after(REMOVAL_TIMEOUT_MS, () => this.completeRemoval(c.peer, c.stripe, null))
       this.pendingRemovals.set(key, { oldParent, cancel })
     }
