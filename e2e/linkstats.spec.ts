@@ -85,9 +85,24 @@ test('getStats: real fields, RTT refresh cadence, and the per-link stats the app
   await expect(upload).toHaveText(/Uploading (?!0\.0 )\d+\.\d+ Mbps/, { timeout: 10_000 })
   console.log('presenter bar:', await upload.textContent())
 
-  // The Peers panel: live sending / receiving per peer, and a row per connection when expanded.
+  // Stats (the gear's default tab): every member with its estimated upload, and live rates to the
+  // directly connected viewer.
   await host.getByTestId('stage').hover()
   await host.getByTestId('gear').click()
+  const rateRow = host.locator(`[data-testid="peer-rate-row"][data-peer="${viewerId}"]`)
+  await expect(rateRow).toHaveAttribute('data-direct', 'true')
+  await expect(rateRow).toContainText(/\d\.\d+ Mbps/)
+  await expect(rateRow).toContainText('est.')
+  console.log('stats peer row:', (await rateRow.textContent())?.replace(/\s+/g, ' '))
+
+  // Topology: numbered nodes (P for the publisher) matching the numbered table.
+  await host.getByTestId('tab-topology').click()
+  await expect(host.locator(`[data-testid="tree-node"][data-peer="${viewerId}"] [data-testid="tree-label"]`).first()).toHaveText('1')
+  await expect(host.locator('[data-testid="tree-node"]').first()).toBeVisible()
+  await expect(host.locator(`[data-testid="topo-row"][data-peer="${viewerId}"] [data-testid="topo-num"]`)).toHaveText('#1')
+  expect(await host.locator('[data-testid="tree-label"]').allTextContents()).toContain('P')
+
+  // The Peers panel: live sending / receiving per peer, and a row per connection when expanded.
   await host.getByTestId('tab-peers').click()
   const row = host.locator(`[data-testid="peer-row"][data-peer="${viewerId}"]`)
   await expect(row.getByTestId('live-send')).toHaveText(/\d\.\d+ Mbps/)

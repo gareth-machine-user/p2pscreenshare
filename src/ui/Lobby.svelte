@@ -19,7 +19,8 @@
   import NameDialog from './components/NameDialog.svelte'
   import FrameStats from './components/FrameStats.svelte'
   import { clampText } from './clamp'
-  import { fmtMbps, uploadBadge } from './liveRates'
+  import { fmtMbps, sessionPeers, uploadBadge } from './liveRates'
+  import PeerRates from './components/PeerRates.svelte'
   import Icon from './components/Icon.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
@@ -303,6 +304,7 @@
       hasAudio: !!sub?.ann.stream?.audio,
       capacity: s.capacity.estimateKbps,
       live: s.liveRates(),
+      peers: gearTab === 'stats' ? sessionPeers(s) : [],
       loss: sub?.loss ?? null,
       uplinkRates: s.uplinkStatsNow,
       encoderRates: s.encoderStatsNow,
@@ -424,7 +426,7 @@
               {#if gearTab === 'peers' && session}
                 <PeersPanel {session} {badges} {tick} onkick={isOwner ? (id) => void session?.kick(id) : null} />
               {:else if gearTab === 'topology'}
-                <TopologyPanel report={view.report} {nameOf} />
+                <TopologyPanel report={view.report} {nameOf} joinedAt={(id) => session?.mesh.member(id)?.joinedAt} />
               {:else if view.presenting && view.pub}
                 <div class="stats-grid" data-testid="publisher-stats">
                   <div><span>Viewers</span><b data-testid="viewer-count">{view.pub.subscribers}</b></div>
@@ -436,6 +438,7 @@
                   <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
                 </div>
                 <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.ccReason} clamp={lobby?.clamp ?? null} />
+                <PeerRates rows={view.peers} />
               {:else}
                 <div class="stats-grid" data-testid="viewer-stats">
                   <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
@@ -451,6 +454,7 @@
                   <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
                 </div>
                 <FrameStats loss={view.loss} renderedFps={view.playerStats?.fps ?? null} uplink={view.uplinkRates} />
+                <PeerRates rows={view.peers} />
                 {#if view.stats}
                   <table class="stripes">
                     <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th><th>Late</th></tr></thead>

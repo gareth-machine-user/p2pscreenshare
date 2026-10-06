@@ -1,7 +1,7 @@
 // Live bandwidth figures for the UI: what is being sent and received right now, as opposed to the
 // upload estimate from the last probe. Rates are per second over the 2 s sampling window (getStats
 // polls, uplink counters), so they don't flicker. Pure, for unit tests.
-import type { LinkRow } from '../session/peerSession'
+import type { LinkRow, PeerSession } from '../session/peerSession'
 import { fmtKbps, fmtMs } from './route'
 
 /** A live rate in Mbps (one decimal; two below 1 Mbps so small rates don't read as 0). */
@@ -40,6 +40,60 @@ export function peerLive(links: LinkRow[]): PeerLive {
       .map((l) => `${l.lane === 0 ? 'mesh link' : `lane ${l.lane}`}: ↑ ${fmtKbps(l.sendKbps)} ↓ ${fmtKbps(l.recvKbps)}, RTT ${fmtMs(l.rttMs)}`)
       .join('\n'),
   }
+}
+
+/** A lobby member as gossip describes it. */
+export interface MemberInfo {
+  id: string
+  name: string
+  joinedAt: number
+  /** Probed upload capacity (an estimate, not current use). */
+  capacityKbps: number | null
+}
+
+/** One member's row: its estimated upload, and (when directly connected) live rates to and from it. */
+export interface LivePeerRow extends PeerLive {
+  id: string
+  name: string
+  self: boolean
+  estKbps: number | null
+  /** Connections to it (getStats rows); empty for yourself or members you have no link to. */
+  links: LinkRow[]
+  /** You have an open connection with live stats to it. */
+  direct: boolean
+}
+
+/**
+ * Every member in join order, yourself included (Peers panel, Stats): estimated upload from its
+ * gossiped probe, live sending / receiving / RTT from this peer's own per-connection stats. Your
+ * own row carries your totals.
+ */
+export function livePeers(o: {
+  selfId: string
+  members: MemberInfo[]
+  linksFor: (id: string) => LinkRow[]
+  totals: { sendKbps: number | null; recvKbps: number | null }
+}): LivePeerRow[] {
+  return [...o.members]
+    .sort((a, b) => a.joinedAt - b.joinedAt || (a.id < b.id ? -1 : 1))
+    .map((m) => {
+      const self = m.id === o.selfId
+      const links = self ? [] : o.linksFor(m.id)
+      const live = self
+        ? { sendKbps: o.totals.sendKbps, recvKbps: o.totals.recvKbps, rttMs: null, baselineMs: null, breakdown: 'Your totals across all connections' }
+        : peerLive(links)
+      return { id: m.id, name: m.name || m.id.slice(0, 6), self, estKbps: m.capacityKbps, links, direct: links.length > 0, ...live }
+    })
+}
+
+/** livePeers for a running session: every member, with this peer's per-connection stats. */
+export function sessionPeers(s: PeerSession): LivePeerRow[] {
+  return livePeers({
+    selfId: s.mesh.selfId,
+    members: [s.mesh.record, ...s.mesh.members()],
+    linksFor: (id) => s.linkStatsFor(id),
+    totals: s.liveRates(),
+  })
 }
 
 /** The presenter's live upload badge: its rate, and a warning when the uplink holds the bitrate down. */

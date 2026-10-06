@@ -2,15 +2,29 @@
   import type { TopologyReport } from '../../proto/messages'
   import { fmtKbps, fmtMs } from '../route'
   import { fmtMbps } from '../liveRates'
+  import { assignNumbers, peerLabel, shortName } from '../peerNumbers'
   import TreeView from './TreeView.svelte'
   import FrameStats from './FrameStats.svelte'
 
-  let { report, nameOf }: { report: TopologyReport | null; nameOf: (id: string) => string } = $props()
+  let {
+    report,
+    nameOf,
+    joinedAt = () => undefined,
+  }: { report: TopologyReport | null; nameOf: (id: string) => string; joinedAt?: (id: string) => number | undefined } = $props()
+
+  /** Stable numbers (#1, #2, … in join order; the publisher is P), shared by the tree and the table. */
+  let numbering = new Map<string, number>()
+  const numbers = $derived.by(() => {
+    if (report) numbering = assignNumbers(numbering, report.peers.map((p) => ({ id: p.id, joinedAt: joinedAt(p.id) })))
+    return numbering
+  })
 
   const rows = $derived(
     report
       ? report.peers.map((p) => ({
           ...p,
+          label: peerLabel(p.id, report.publisher, numbers),
+          num: numbers.get(p.id) ?? Infinity,
           home: report.topology.home[p.id] ?? null,
           depth: report.depth[p.id] ?? [],
           slots: report.slots[p.id] ?? 0,
@@ -18,7 +32,7 @@
           lost: p.stats?.loss ? p.stats.loss.incomplete + p.stats.loss.late + p.stats.loss.undecodable + p.stats.loss.skipped : null,
           drops: p.stats?.uplinkRates ? p.stats.uplinkRates.drops : null,
           queueMs: p.stats?.uplinkRates?.queueMs ?? null,
-        }))
+        })).sort((a, b) => a.num - b.num)
       : [],
   )
 </script>
@@ -42,13 +56,14 @@
     topology={report.topology}
     hostId={report.publisher}
     stripes={report.k + report.m}
-    names={new Map(rows.map((r) => [r.id, nameOf(r.id)]))}
+    names={new Map([[report.publisher, nameOf(report.publisher)], ...rows.map((r): [string, string] => [r.id, nameOf(r.id)])])}
+    labels={new Map([[report.publisher, 'P'], ...rows.map((r): [string, string] => [r.id, peerLabel(r.id, report.publisher, numbers, true)])])}
   />
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th>Peer</th><th title="Live: what this peer's uplink sends (relaying, probes), from its last stats report (2 s average)">Sending</th><th title="Measured upload capacity from the last probe; not current use">Est. upload</th><th>Home</th><th>Slots</th><th>Children</th><th>Depth</th><th>Latency</th><th>FPS</th><th>Late</th>
+          <th title="The number on this peer's node in the trees above (P = the publisher)">#</th><th>Peer</th><th title="Live: what this peer's uplink sends (relaying, probes), from its last stats report (2 s average)">Sending</th><th title="Measured upload capacity from the last probe; not current use">Est. upload</th><th>Home</th><th>Slots</th><th>Children</th><th>Depth</th><th>Latency</th><th>FPS</th><th>Late</th>
           <th title="Frames in per second, and frames lost per second (incomplete, late, undecodable or skipped)">In / lost /s</th>
           <th title="Uplink fragments dropped per second for missing their deadline, by temporal layer">Drops T0/T1/T2</th>
           <th title="Average time fragments wait in this peer's uplink queue">Queue</th>
@@ -57,8 +72,9 @@
       </thead>
       <tbody>
         {#each rows as r (r.id)}
-          <tr>
-            <td title={r.id}>{nameOf(r.id)}</td>
+          <tr data-testid="topo-row" data-peer={r.id}>
+            <td class="num" data-testid="topo-num">{r.label}</td>
+            <td title="{nameOf(r.id)} ({r.id})">{shortName(nameOf(r.id))}</td>
             <td data-testid="topo-live-send">{fmtMbps(r.stats?.uplinkRates?.kbps)}</td>
             <td class="secondary">{fmtKbps(r.stats?.capacityKbps)}{r.stats && r.stats.uplinkDropRate > 0.01 ? ` ⚠ ${(r.stats.uplinkDropRate * 100).toFixed(0)}%` : ''}</td>
             <td>{r.home ?? '—'}</td>
@@ -78,3 +94,10 @@
     </table>
   </div>
 {/if}
+
+<style>
+  .num {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+</style>

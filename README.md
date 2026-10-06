@@ -72,8 +72,11 @@ npm run tracker             # ws://localhost:8000
 - **Watching.** With two or more streams live, a tile rail shows live previews; click one to put it
   on the stage. Hover the player for mute (every stream starts muted), quality (Auto, Full or
   Preview), fullscreen, and a gear with **Stats** (including what you receive and upload right
-  now), **Peers** (who is connected; see [Per-link stats](#per-link-stats)) and **Topology** (the
-  stream's relay trees, fetched from its presenter, with each peer's live send rate).
+  now, and a per-peer list: every member's estimated upload, marked "est.", and for peers you're
+  connected to the live sending / receiving rates and RTT), **Peers** (who is connected; see
+  [Per-link stats](#per-link-stats)) and **Topology** (the stream's relay trees, fetched from its
+  presenter; every node carries a number, P for the publisher and #1, #2, … in join order, that
+  matches the table below it, which also shows each peer's live send rate).
 - **Moderation.** The owner can stop anyone's stream from its tile menu (which revokes their right
   to share) and kick members from the Peers panel.
 - **Names.** Guests may join and watch anonymously, but pick a name before sharing, asking to

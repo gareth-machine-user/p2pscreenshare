@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { PeerSession } from '../../session/peerSession'
   import { fmtKbps, fmtMs } from '../route'
-  import { fmtMbps, peerLive } from '../liveRates'
+  import { fmtMbps, sessionPeers } from '../liveRates'
 
   let {
     session,
@@ -24,32 +24,31 @@
   const rows = $derived.by(() => {
     void tick
     const mesh = session.mesh
-    const all = [mesh.record, ...mesh.members()].sort((a, b) => a.joinedAt - b.joinedAt)
+    const recs = new Map([mesh.record, ...mesh.members()].map((r) => [r.id, r]))
+    const all = [...recs.values()]
     const n = all.length
-    const totals = session.liveRates()
-    return all.map((r) => {
-      const self = r.id === mesh.selfId
+    return sessionPeers(session).map((p) => {
+      const r = recs.get(p.id)!
+      const self = p.self
       const unreachable = new Set([...r.unreachable, ...all.filter((o) => o.unreachable.includes(r.id)).map((o) => o.id)])
-      const links = self ? [] : session.linkStatsFor(r.id)
-      const live = peerLive(links)
       const path = self ? undefined : session.pathQueue.get(r.id)
       return {
-        id: r.id,
-        name: r.name || r.id.slice(0, 6),
+        id: p.id,
+        name: p.name,
         self,
         status: self ? 'you' : mesh.linkStatus(r.id),
         // Media lanes: open connections to this peer (mesh/lanes.ts); TURN-relayed pairs use one.
         lanes: self ? 0 : mesh.laneCount(r.id),
         turn: !self && mesh.lanes.relayed(r.id),
         // Path RTT from getStats; before the first poll, the gossiped one.
-        rtt: self ? null : (live.rttMs ?? mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
-        baseline: live.baselineMs,
-        capacity: r.capacityKbps,
+        rtt: self ? null : (p.rttMs ?? mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
+        baseline: p.baselineMs,
+        capacity: p.estKbps,
         // Live, on the wire: you → that peer and back; for "you", your totals.
-        send: self ? totals.sendKbps : live.sendKbps,
-        recv: self ? totals.recvKbps : live.recvKbps,
-        breakdown: self ? 'Your totals across all connections' : live.breakdown,
-        links,
+        send: p.sendKbps,
+        recv: p.recvKbps,
+        breakdown: p.breakdown,
+        links: p.links,
         inflationMs: path?.inflationMs ?? null,
         pathQueued: path?.queued ?? null,
         unreachable: unreachable.size,
