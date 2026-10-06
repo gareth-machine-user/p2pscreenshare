@@ -28,6 +28,23 @@ interface FrameState {
 }
 
 const RETAIN_MS = 6000
+/** Largest frame accepted (bytes); bounds what a bogus header can make us allocate. */
+export const MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+/**
+ * Checks a fragment's header is self-consistent with how the packetizer splits frames, so a
+ * corrupt or hostile header can't make us allocate huge buffers or write out of bounds.
+ */
+function wellFormed(frag: Fragment): boolean {
+  const h = frag.header
+  if (h.k === 0 || h.frameLen > MAX_FRAME_BYTES || h.pieceIdx >= h.k + h.m) return false
+  const P = pieceLength(h.frameLen, h.k)
+  const fragCount = Math.max(1, Math.ceil(P / MAX_FRAGMENT_PAYLOAD))
+  if (h.fragCount !== fragCount || h.fragIdx >= fragCount) return false
+  const len = frag.payload.byteLength
+  if (h.fragIdx * MAX_FRAGMENT_PAYLOAD + len > P) return false
+  return h.fragIdx === fragCount - 1 || len === MAX_FRAGMENT_PAYLOAD
+}
 
 /**
  * Collects fragments (from any stripe, any order, with duplicates) and emits each frame once,
@@ -42,6 +59,8 @@ export class Reassembler {
   constructor(private onFrame: (frame: AssembledFrame) => void) {}
 
   push(frag: Fragment, now: number): void {
+    if (now - this.lastPrune > 1000) this.prune(now)
+    if (!wellFormed(frag)) return
     const h = frag.header
     const id = `${h.channel}:${h.audio ? 'a' : 'v'}:${h.epoch}:${h.frameSeq}`
     let st = this.frames.get(id)
@@ -61,6 +80,8 @@ export class Reassembler {
       this.frames.set(id, st)
     }
     if (st.done || st.pieces[h.pieceIdx]) return
+    // Drop fragments whose shape disagrees with the frame's first fragment.
+    if (h.k !== st.k || h.m !== st.m || h.frameLen !== st.frameLen) return
 
     let ps = st.partial.get(h.pieceIdx)
     if (!ps) {
@@ -81,8 +102,6 @@ export class Reassembler {
       st.completePieces++
       if (st.completePieces >= st.k) this.complete(st, now)
     }
-
-    if (now - this.lastPrune > 1000) this.prune(now)
   }
 
   private complete(st: FrameState, now: number): void {

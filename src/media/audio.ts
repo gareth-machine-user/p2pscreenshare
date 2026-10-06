@@ -5,6 +5,9 @@ import type { EncodedFrame } from './packetizer'
 
 type AudioInfo = NonNullable<StreamInfo['audio']>
 
+/** Minimum time between AudioDecoder rebuilds after errors. */
+const REBUILD_INTERVAL_MS = 1000
+
 /** Encodes an audio track to Opus (Chromium: needs MediaStreamTrackProcessor). */
 export class AudioPipeline {
   onFrame: (f: EncodedFrame) => void = () => {}
@@ -75,6 +78,8 @@ export class AudioPlayer {
   muted = true
   private decoder: AudioDecoder | null = null
   private configured = ''
+  private info: AudioInfo | null = null
+  private lastBuildAt = -Infinity
   private renderAtByTs = new Map<number, number>()
   private lastSeq = -1
 
@@ -103,22 +108,61 @@ export class AudioPlayer {
     const key = JSON.stringify(info)
     if (key === this.configured || typeof AudioDecoder === 'undefined') return
     this.configured = key
-    this.decoder?.close()
-    this.decoder = new AudioDecoder({
+    this.info = info
+    this.lastBuildAt = -Infinity
+    this.build()
+  }
+
+  /** (Re)creates the decoder; a decoder error closes it, so it's rebuilt on the next frame. */
+  private build(): boolean {
+    const info = this.info
+    if (!info) return false
+    const now = wallClock()
+    if (now - this.lastBuildAt < REBUILD_INTERVAL_MS) return false
+    this.lastBuildAt = now
+    this.closeDecoder()
+    this.renderAtByTs.clear()
+    const decoder = new AudioDecoder({
       output: (data) => this.play(data),
-      error: (e) => console.warn('AudioDecoder error', e),
+      error: (e) => {
+        console.warn('AudioDecoder error; rebuilding', e)
+        if (this.decoder === decoder) this.decoder = null
+      },
     })
-    this.decoder.configure({ codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.numberOfChannels })
+    this.decoder = decoder
+    try {
+      decoder.configure({ codec: info.codec, sampleRate: info.sampleRate, numberOfChannels: info.numberOfChannels })
+    } catch (err) {
+      console.warn('AudioDecoder configure failed', err)
+      this.closeDecoder()
+      return false
+    }
+    return true
+  }
+
+  private closeDecoder(): void {
+    try {
+      if (this.decoder && this.decoder.state !== 'closed') this.decoder.close()
+    } catch {
+      // ignore
+    }
+    this.decoder = null
   }
 
   /** `renderAt` is the local wall-clock time this frame should be heard. */
   push(f: EncodedFrame, renderAt: number | null): void {
-    if (!this.decoder || !this.enabled || renderAt === null) return
+    if (!this.info || !this.enabled || renderAt === null) return
     if (f.seq <= this.lastSeq) return
     this.lastSeq = f.seq
+    if ((!this.decoder || this.decoder.state === 'closed') && !this.build()) return
     const ts = Math.round(f.captureTime * 1000)
     this.renderAtByTs.set(ts, renderAt)
-    this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data: f.data }))
+    if (this.renderAtByTs.size > 300) this.renderAtByTs.clear()
+    try {
+      this.decoder!.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data: f.data }))
+    } catch (err) {
+      console.warn('audio decode error', err)
+    }
   }
 
   private play(data: AudioData): void {
@@ -148,7 +192,8 @@ export class AudioPlayer {
   }
 
   close(): void {
-    this.decoder?.close()
-    void this.ctx?.close()
+    this.info = null
+    this.closeDecoder()
+    void this.ctx?.close().catch(() => {})
   }
 }

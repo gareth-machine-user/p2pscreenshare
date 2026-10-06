@@ -4,6 +4,14 @@ import { AudioPlayer } from './audio'
 import { DecodeScheduler, PlayoutClock } from './jitterBuffer'
 import type { AssembledFrame } from './reassembler'
 
+/** Most frames of a not-yet-announced epoch kept while waiting for its StreamInfo. */
+const MAX_EARLY_FRAMES = 120
+
+/** The StreamInfo fields the video decoder is configured from. */
+function videoKey(info: StreamInfo): string {
+  return JSON.stringify([info.epoch, info.codec, info.codedWidth, info.codedHeight, info.description ?? null])
+}
+
 interface Pending {
   frame: VideoFrame
   renderAt: number
@@ -42,6 +50,9 @@ export class Player {
   private renderQueue: Pending[] = []
   private renderAtByTs = new Map<number, number>()
   private captureByTs = new Map<number, number>()
+  /** Video frames of an epoch whose StreamInfo hasn't arrived yet, and the last epoch replaced. */
+  private early: AssembledFrame[] = []
+  private retiredEpoch: number | null = null
   private raf = 0
   private interval: ReturnType<typeof setInterval>
   private renderedTimes: number[] = []
@@ -91,21 +102,42 @@ export class Player {
 
   setStreamInfo(info: StreamInfo, force = false): void {
     if (!force && this.info && JSON.stringify(this.info) === JSON.stringify(info)) return
+    const prev = this.info
     this.info = info
     if (info.audio) this.audio.configure(info.audio)
-    this.decoder?.close()
-    this.decoder = new VideoDecoder({
+    // Only the video fields feed the decoder; e.g. audio being added later must not reset video.
+    if (!force && prev && videoKey(prev) === videoKey(info)) return
+    this.rebuildDecoder(info, prev)
+  }
+
+  private rebuildDecoder(info: StreamInfo, prev: StreamInfo | null): void {
+    try {
+      // A decoder that reported an error is already closed, and closing it again throws.
+      if (this.decoder && this.decoder.state !== 'closed') this.decoder.close()
+    } catch {
+      // ignore
+    }
+    this.renderAtByTs.clear()
+    if (prev && prev.epoch !== info.epoch) this.retiredEpoch = prev.epoch
+    // Frames of this epoch that arrived before its StreamInfo (often including its keyframe).
+    const held = this.early.filter((f) => f.epoch === info.epoch)
+    if (held.length) this.early = []
+    // A new decoder needs a keyframe. A new epoch starts with one, so only ask when rebuilding
+    // within an epoch (decoder error, config change) and none is already in hand.
+    this.scheduler.reset(prev !== null && prev.epoch === info.epoch && !held.some((f) => f.key))
+    for (const f of held) this.scheduler.push(f)
+    const decoder = new VideoDecoder({
       output: (f) => this.onDecoded(f),
       error: (e) => {
         console.warn('VideoDecoder error; resetting', e)
         // A decoder error closes the decoder: rebuild it and resume from the next keyframe.
         setTimeout(() => {
-          if (this.closed || this.info !== info) return
-          this.setStreamInfo(info, true)
-          this.scheduler.requireKeyframe()
+          if (this.closed || this.decoder !== decoder || !this.info) return
+          this.rebuildDecoder(this.info, this.info)
         }, 0)
       },
     })
+    this.decoder = decoder
     const config: VideoDecoderConfig = {
       codec: info.codec,
       codedWidth: info.codedWidth,
@@ -113,7 +145,11 @@ export class Player {
       optimizeForLatency: true,
       ...(info.description ? { description: fromBase64(info.description) } : {}),
     }
-    this.decoder.configure(config)
+    try {
+      decoder.configure(config)
+    } catch (err) {
+      console.warn('VideoDecoder configure failed', err)
+    }
   }
 
   push(f: AssembledFrame): void {
@@ -122,15 +158,28 @@ export class Player {
       this.audio.push(f, this.clock.renderAt(f.captureTime))
       return
     }
-    if (!this.info || f.epoch !== this.info.epoch) return
+    if (!this.info || f.epoch !== this.info.epoch) {
+      this.holdEarly(f)
+      return
+    }
     this.scheduler.push(f)
     this.pump()
+  }
+
+  /** Keeps frames of an epoch whose StreamInfo hasn't arrived yet (only the latest such epoch). */
+  private holdEarly(f: AssembledFrame): void {
+    if (f.epoch === this.retiredEpoch) return
+    if (this.early.length && this.early[0].epoch !== f.epoch) this.early = []
+    this.early.push(f)
+    if (this.early.length > MAX_EARLY_FRAMES) this.early.shift()
   }
 
   private pump(): void {
     if (!this.decoder || this.decoder.state !== 'configured') return
     for (const f of this.scheduler.poll(wallClock())) {
       const ts = Math.round(f.captureTime * 1000)
+      // Entries are removed on output; failed decodes would otherwise leak them.
+      if (this.renderAtByTs.size >= 300) this.renderAtByTs.clear()
       this.renderAtByTs.set(ts, this.clock.renderAt(f.captureTime) ?? wallClock())
       this.captureByTs.set(ts, f.captureTime)
       try {
@@ -212,6 +261,7 @@ export class Player {
     clearInterval(this.interval)
     this.renderQueue.forEach((p) => p.frame.close())
     this.lastRendered?.close()
+    this.early = []
     try {
       this.decoder?.close()
     } catch {

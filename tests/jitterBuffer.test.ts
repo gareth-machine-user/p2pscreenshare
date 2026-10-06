@@ -72,6 +72,24 @@ describe('DecodeScheduler', () => {
     expect(s.poll(10_000).map((f) => f.seq)).toEqual([0, 2, 4, 6, 8])
     expect(s.stats.droppedUndecodable).toBe(0)
   })
+
+  it('gives out-of-order replayed frames time to arrive before skipping', () => {
+    const s = new DecodeScheduler(readyClock(), undefined, 15, 100)
+    // GOP-cache replay: captured long ago (already past due), arriving now from several parents.
+    const replay = (seq: number, at: number) => ({ ...makeFrame(seq, seq * 33 - 10_000), replay: true, completedAt: at })
+    s.push(replay(8, 1000))
+    expect(s.poll(1000).map((f) => f.seq)).toEqual([8])
+    s.push(replay(10, 1005)) // refs 8; 9 still in flight on another stripe parent
+    expect(s.poll(1005).map((f) => f.seq)).toEqual([])
+    s.push(replay(9, 1020))
+    expect(s.poll(1020).map((f) => f.seq)).toEqual([9, 10])
+    expect(s.stats.skippedMissing).toBe(0)
+    // A replayed frame that really is missing is skipped once the grace has passed.
+    s.push(replay(12, 1030))
+    expect(s.poll(1100).map((f) => f.seq)).toEqual([])
+    expect(s.poll(1130).map((f) => f.seq)).toEqual([12])
+    expect(s.stats.skippedMissing).toBe(1)
+  })
 })
 
 describe('PlayoutClock', () => {

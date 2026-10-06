@@ -6,6 +6,7 @@ import { frameReader } from './capture'
 import type { EncodedFrame } from './packetizer'
 
 const IDLE_REFRESH_MS = 400
+const ERROR_RETRY_MS = 1000
 
 export interface VideoEncoderOptions {
   bitrateKbps: number
@@ -77,6 +78,8 @@ export class VideoPipeline {
   private reader: ReturnType<typeof frameReader> | null = null
   private captureTimes = new Map<number, number>()
   private lastInfoKey = ''
+  /** When the encoder last failed (it is rebuilt after ERROR_RETRY_MS). */
+  private failedAt = -Infinity
   /** Counters (cumulative): frames captured, dropped because the encoder was behind, encoded. */
   framesIn = 0
   framesDropped = 0
@@ -127,6 +130,7 @@ export class VideoPipeline {
     this.opts.bitrateKbps = kbps
     if (this.encoder && this.config) {
       this.config = { ...this.config, bitrate: kbps * 1000 }
+      if (this.encoder.state !== 'configured') return
       this.encoder.configure(this.config)
       this.keyRequested = true
     }
@@ -174,9 +178,15 @@ export class VideoPipeline {
     const width = frame.displayWidth & ~1
     const height = frame.displayHeight & ~1
     if (!this.encoder || !this.config || this.config.width !== width || this.config.height !== height) {
+      // After an encoder error, wait a little before building a new one (avoids a hot loop).
+      if (!this.encoder && wallClock() - this.failedAt < ERROR_RETRY_MS) {
+        this.framesDropped++
+        return
+      }
       await this.reconfigure(width, height)
     }
-    const enc = this.encoder!
+    const enc = this.encoder
+    if (this.stopped || !enc || enc.state !== 'configured') return
     if (enc.encodeQueueSize > 2) {
       this.framesDropped++
       return
@@ -192,22 +202,50 @@ export class VideoPipeline {
   }
 
   private async reconfigure(width: number, height: number): Promise<void> {
-    if (this.encoder) {
+    const old = this.encoder
+    this.encoder = null
+    if (old) {
       try {
-        await this.encoder.flush()
+        await old.flush()
       } catch {
         // ignore
       }
-      this.encoder.close()
+      try {
+        if (old.state !== 'closed') old.close()
+      } catch {
+        // ignore
+      }
     }
-    this.config = await pickConfig(width, height, this.opts)
+    const config = await pickConfig(width, height, this.opts)
+    if (this.stopped) return
+    this.config = config
     this.epoch = (this.epoch + 1) & 0xffff
     this.keyRequested = true
-    this.encoder = new VideoEncoder({
+    const encoder = new VideoEncoder({
       output: (chunk, meta) => this.handleChunk(chunk, meta),
-      error: (e) => console.error('VideoEncoder error', e),
+      error: (e) => {
+        // An error closes the encoder: drop it so the next frame builds a new one (new epoch,
+        // starting with a keyframe).
+        console.error('VideoEncoder error; rebuilding', e)
+        if (this.encoder === encoder) {
+          this.encoder = null
+          this.failedAt = wallClock()
+        }
+      },
     })
-    this.encoder.configure(this.config)
+    this.encoder = encoder
+    try {
+      encoder.configure(config)
+    } catch (err) {
+      this.encoder = null
+      this.failedAt = wallClock()
+      try {
+        encoder.close()
+      } catch {
+        // ignore
+      }
+      throw err
+    }
   }
 
   private handleChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {

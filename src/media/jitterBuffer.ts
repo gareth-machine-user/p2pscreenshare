@@ -110,6 +110,12 @@ export class DecodeScheduler {
     private onNeedKeyframe: () => void = () => {},
     /** Give up on a missing frame once the next available frame is this close to its render time. */
     private giveUpMarginMs = 15,
+    /**
+     * Replayed (GOP-cache) frames are already past their render time and arrive in bursts from
+     * several stripe parents, out of order; wait this long after the next available replayed
+     * frame arrived before skipping a missing one.
+     */
+    private replayReorderMs = 100,
   ) {}
 
   push(frame: AssembledFrame): void {
@@ -123,6 +129,18 @@ export class DecodeScheduler {
   /** Forces a wait for the next keyframe (e.g. after a decoder reset). */
   requireKeyframe(): void {
     if (!this.needKey) this.breakChain()
+  }
+
+  /**
+   * Forgets buffered frames and decode history and waits for a keyframe (a new decoder). Requests a
+   * keyframe unless `requestKey` is false (e.g. the caller is about to supply one).
+   */
+  reset(requestKey = true): void {
+    this.buffer.clear()
+    this.decoded.clear()
+    this.nextSeq = null
+    this.needKey = true
+    if (requestKey) this.onNeedKeyframe()
   }
 
   get waitingForKeyframe(): boolean {
@@ -166,6 +184,7 @@ export class DecodeScheduler {
       const laterFrame = this.buffer.get(later)!
       const due = this.clock.renderAt(laterFrame.captureTime)
       if (due !== null && due - now > this.giveUpMarginMs) break
+      if (laterFrame.replay && now - laterFrame.completedAt < this.replayReorderMs) break
       this.stats.skippedMissing += later - this.nextSeq
       this.nextSeq = later
       // A missing frame may have been a reference; dependency checks on later frames handle it.
