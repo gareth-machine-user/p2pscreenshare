@@ -688,6 +688,7 @@ export class PublishedStream {
   private lastPreviewAt = -Infinity
   private previewCanvas: OffscreenCanvas | null = null
   private previewBusy = false
+  private stopped = false
 
   constructor(
     readonly opts: ShareOptions,
@@ -721,10 +722,13 @@ export class PublishedStream {
       this.stopSource = () => stream.getTracks().forEach((t) => t.stop())
     }
     this.localStream = stream
+    // stop() may have run while the screen picker was open: release what it couldn't see yet.
+    if (this.stopped) return this.stop()
 
     // System/tab audio and the microphone are mixed into one track.
     const systemTrack = o.audio ? (stream.getAudioTracks()[0] ?? null) : null
     this.micTrack = o.mic ? await captureMic() : null
+    if (this.stopped) return this.stop()
     const canEncodeAudio = AudioPipeline.supported()
     if (canEncodeAudio && (systemTrack || this.micTrack)) this.mixer = new AudioMixer(systemTrack, this.micTrack)
     this.audio = { system: !!systemTrack, mic: !!this.micTrack, systemMuted: false, micMuted: false }
@@ -850,6 +854,7 @@ export class PublishedStream {
   onEnded: () => void = () => {}
 
   stop(): void {
+    this.stopped = true
     this.video?.stop()
     this.preview?.stop()
     this.audioPipe?.stop()

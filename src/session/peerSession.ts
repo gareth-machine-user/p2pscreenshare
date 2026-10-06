@@ -244,14 +244,42 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       .sort((a, b) => a.ann.startedAt - b.ann.startedAt)
   }
 
+  /**
+   * Channel ids are bound to the publisher this peer first saw claim them, for the session's
+   * lifetime. Any granted publisher can put any id in its record (and startedAt is
+   * self-reported), so a later claim by someone else must never take a channel over: this peer
+   * would verify the real publisher's fragments against the copier's key.
+   */
+  private channelOwners = new Map<number, string>()
+
   private rebuildChannels(): void {
     const next = new Map<number, LiveChannel>()
-    const add = (publisher: string, anns: ChannelAnnouncement[]) => {
-      if (!this.mayPublish(publisher)) return
-      for (const ann of anns) next.set(ann.id >>> 0, { ann, publisher })
+    // This peer's own channels always win, and stay bound to it after they end.
+    for (const c of this.ownChannels()) {
+      const id = c.id >>> 0
+      this.channelOwners.set(id, this.selfId)
+      if (this.mayPublish(this.selfId)) next.set(id, { ann: c.announcement(), publisher: this.selfId })
     }
-    for (const rec of this.mesh.members()) add(rec.id, rec.channels)
-    add(this.selfId, this.ownChannels().map((c) => c.announcement()))
+    const claims = new Map<number, LiveChannel[]>()
+    for (const rec of this.mesh.members()) {
+      if (rec.id === this.selfId || !this.mayPublish(rec.id)) continue
+      for (const ann of rec.channels) {
+        const id = ann.id >>> 0
+        claims.set(id, [...(claims.get(id) ?? []), { ann, publisher: rec.id }])
+      }
+    }
+    for (const [id, list] of claims) {
+      const owner = this.channelOwners.get(id)
+      let pick: LiveChannel | undefined
+      if (owner !== undefined) pick = list.find((c) => c.publisher === owner)
+      else if (list.every((c) => c.publisher === list[0].publisher)) pick = list[0]
+      // Contested on first sight (e.g. by a late joiner): nothing tells the copy apart, so only
+      // the room owner's claim is trusted; otherwise the id stays unwatched until one claim is left.
+      else pick = list.find((c) => c.publisher === this.ownerId)
+      if (!pick) continue
+      this.channelOwners.set(id, pick.publisher)
+      next.set(id, pick)
+    }
     for (const ch of this.channels.keys()) if (!next.has(ch)) this.topologyReports.delete(ch)
     this.channels = next
   }
@@ -471,10 +499,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     try {
       await stream.start()
     } catch (e) {
-      this.publishing = null
+      if (this.publishing === stream) this.publishing = null
       stream.stop()
       throw e
     }
+    // Stopped (or replaced by a newer share) while the capture prompt was open.
+    if (this.publishing !== stream) return
     this.selected = this.selfId
     this.updateOffers()
     this.announce()
