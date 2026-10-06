@@ -1,10 +1,8 @@
-// The publisher side of a peer: capture and encoding (PublishedStream), and for each channel the
-// tree planner and its commands (ChannelPublisher). Each publisher plans its own channels' trees,
-// so the planner fails together with the tree's source: no leader election, no handover.
-import { AudioPipeline } from '../media/audio'
-import { captureScreen, testPattern } from '../media/capture'
-import { AudioMixer, captureMic } from '../media/mixer'
-import { VideoPipeline } from '../media/encoder'
+// The publisher side of one channel: its subscribers, the tree planner and its commands, and the
+// failure handling around them (reattach batching, blame, make-before-break switches). Each
+// publisher plans its own channels' trees, so the planner fails together with the tree's source:
+// no leader election, no handover. Capture and encoding live in publishedStream.ts; nothing here
+// needs WebCodecs or MediaStream, so the policy can be unit-tested (tests/channelPublisher.test.ts).
 import { packetize, type EncodedFrame } from '../media/packetizer'
 import type { Mesh } from '../mesh/mesh'
 import type { ChannelAnnouncement } from '../mesh/records'
@@ -12,42 +10,25 @@ import { gzip } from '../mesh/envelope'
 import { toBase64Url } from '../net/lobby'
 import { signFrame } from '../proto/signing'
 import type { EncoderRates, PublisherMsg, StreamInfo, SubscriberMsg, SubscriberStats, TopologyReport, UplinkRates } from '../proto/messages'
-import { RateWindow, round1 } from './rates'
 import type { RelayNode } from '../relay/relayNode'
 import { emptyTopology, subtree, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
 import {
-  blameInput,
-  childStripeEvidence,
   ComplaintLog,
   defaultPlannerConfig,
+  judgeComplaints,
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
   LateParentTracker,
+  PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
-  shouldBlameParent,
+  type Accusation,
   type LatenessSample,
   type StatsSnapshot,
 } from '../topology/policy'
 import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
 import { after, every } from '../net/ticker'
 import { tuning } from '../tuning'
-
-export interface ShareOptions {
-  k: number
-  m: number
-  bitrateKbps: number
-  source: 'screen' | 'test'
-  /** Picker hint for screen capture. */
-  surface?: 'monitor' | 'window' | 'browser'
-  maxSize?: [number, number]
-  /** Capture system/tab audio (or the test tone). */
-  audio: boolean
-  /** Mix in the microphone. */
-  mic?: boolean
-  /** Test pattern size, e.g. [1280, 720]. */
-  testSize?: [number, number]
-}
 
 /** What a publisher needs from the session it belongs to. */
 export interface PublisherContext {
@@ -80,16 +61,9 @@ const LIVENESS_TIMEOUT_MS = 1200
 /** A peer that failed a liveness ping stays out of the plan this long (or until it answers again). */
 const SUSPECT_HOLD_MS = 3000
 const TOPOLOGY_REPORT_MS = 3000
-/** Capture and encoding frame rate of the full channel. */
-const CAPTURE_FPS = 30
-/** Congestion control never takes the encoder below this, and moves it in these steps (kbps). */
-const MIN_ADAPTIVE_KBPS = 300
-const BITRATE_STEP_KBPS = 50
 /** Stripe rates are sampled this often, and the last STRIPE_SAMPLES samples (10 s) are kept. */
 const STRIPE_SAMPLE_MS = 250
 const STRIPE_SAMPLES = 40
-/** Test pattern size when none is given. */
-const DEFAULT_TEST_SIZE: [number, number] = [1280, 720]
 /** Audience upload counts as short when supply is below 90% of demand for this long. */
 const SHORT_SUPPLY_FOR_MS = 10_000
 /** At most this often, an overcommitted channel asks its subscribers to re-measure their upload. */
@@ -132,7 +106,9 @@ export class ChannelPublisher {
   private disruptedUntil = new Map<string, number>()
   /** Frames are signed in order, so fragments leave in capture order. */
   private signing: Promise<void> = Promise.resolve()
-  private reattachQueue: { child: string; stripe: number; linkOpen: boolean }[] = []
+  private reattachQueue: { child: string; stripe: number; linkOpen: boolean; at: number }[] = []
+  /** `${peer}:${stripe}` -> when that peer's parent there last changed. */
+  private parentChangedAt = new Map<string, number>()
   private reattachTimer: (() => void) | null = null
   private topoWatchers = new Set<string>()
   private stopped = false
@@ -304,6 +280,7 @@ export class ChannelPublisher {
     if (!sub) return
     this.deactivate(sub)
     this.subscribers.delete(id)
+    for (let s = 0; s < this.stripes; s++) this.parentChangedAt.delete(`${id}:${s}`)
     this.keyGate.forget(id)
     this.complaints.forget(id)
     this.topoWatchers.delete(id)
@@ -364,7 +341,7 @@ export class ChannelPublisher {
   // --- failure handling --------------------------------------------------------------------------
 
   private queueReattach(child: string, stripe: number, linkOpen: boolean): void {
-    this.reattachQueue.push({ child, stripe, linkOpen })
+    this.reattachQueue.push({ child, stripe, linkOpen, at: performance.now() })
     if (this.reattachTimer === null) {
       this.reattachTimer = after(REATTACH_BATCH_MS, () => this.processReattaches())
     }
@@ -378,10 +355,12 @@ export class ChannelPublisher {
     const now = performance.now()
     let changed = false
     /** linkOpen complaints about relays, judged once the whole batch is known. */
-    const accused: { child: string; parent: string; stripe: number; now: number }[] = []
-    for (const { child, stripe, linkOpen } of batch) {
+    const accused: Accusation[] = []
+    for (const { child, stripe, linkOpen, at } of batch) {
       const sub = this.subscribers.get(child)
       if (!sub?.active) continue
+      // Sent before the child heard of its new parent: it is about the old one, and handled.
+      if (at - (this.parentChangedAt.get(`${child}:${stripe}`) ?? -Infinity) < PARENT_GRACE_MS) continue
       const parent = this.topology.parents[child]?.[stripe]
       // The parent is itself starved by an upstream failure that is already being handled:
       // keep this child where it is (the parent's feed will resume).
@@ -404,29 +383,18 @@ export class ChannelPublisher {
 
   /**
    * One child's complaint lowers a relay's rank for everyone, so it must not come from the child's
-   * own bad downlink: a parent is blamed only on corroboration (shouldBlameParent). Returns the
+   * own bad downlink: a parent is blamed only on corroboration (judgeComplaints). Returns the
    * blamed parents, to be pinged.
    */
-  private judgeParents(accused: { child: string; parent: string; stripe: number; now: number }[]): Set<string> {
-    const freshMs = tuning.stripeSilenceMs / 2
+  private judgeParents(accused: Accusation[]): Set<string> {
     const snapshot = (id: string): StatsSnapshot | null => {
       const sub = this.subscribers.get(id)
       return sub?.stats ? { at: sub.statsAt, stripes: sub.stats.stripes } : null
     }
-    const now = performance.now()
-    // Record the whole batch first: a child complaining about several parents at once is its own
-    // downlink's fault, and siblings in the same batch corroborate each other.
-    const batch = [...this.complaints.recent(now), ...accused.map((c) => ({ ...c, at: c.now, excused: false }))]
-    for (const c of accused) {
-      const input = blameInput(c, snapshot(c.child), snapshot(c.parent), batch, freshMs)
-      const excused = input.parentFeedStale || childStripeEvidence(c, snapshot(c.child), batch, freshMs) === 'stale'
-      this.complaints.add({ ...c, at: c.now, excused })
-    }
-    const recent = this.complaints.recent(now)
     const blamed = new Set<string>()
-    for (const c of accused) {
+    for (const c of judgeComplaints(accused, this.complaints, snapshot, performance.now(), tuning.stripeSilenceMs / 2)) {
       const pp = this.subscribers.get(c.parent)
-      if (!pp || !shouldBlameParent(blameInput(c, snapshot(c.child), snapshot(c.parent), recent, freshMs))) continue
+      if (!pp) continue
       // The parent is unreliable: rank it lower, and check that it's still there.
       pp.failures++
       blamed.add(c.parent)
@@ -600,19 +568,25 @@ export class ChannelPublisher {
 
   private apply(c: ParentChange): void {
     const key = `${c.peer}:${c.stripe}`
+    this.parentChangedAt.set(key, performance.now())
     if (c.to !== null) this.addEdge(c.to, c.peer, c.stripe)
     this.send(c.peer, { t: 'set-parent', ch: this.id, stripe: c.stripe, parent: c.to })
 
     const prev = this.pendingRemovals.get(key)
+    let from = c.from
     if (prev) {
       prev.cancel()
       this.pendingRemovals.delete(key)
-      // The older pending parent is superseded too.
-      if (prev.oldParent !== c.to) this.removeEdge(prev.oldParent, c.peer, c.stripe)
+      if (prev.oldParent !== c.to) {
+        // The parent being replaced never reported delivering (no stripe-ok yet), while the one
+        // before it may still be feeding: drop the former, keep the latter until the new one delivers.
+        if (c.from !== null && c.from !== prev.oldParent) this.removeEdge(c.from, c.peer, c.stripe)
+        from = prev.oldParent
+      }
     }
-    if (c.from !== null && (c.from === this.ctx.selfId || this.subscribers.has(c.from))) {
+    if (from !== null && (from === this.ctx.selfId || this.subscribers.has(from))) {
       // Make-before-break: keep the old parent feeding until the new one delivers.
-      const oldParent = c.from
+      const oldParent = from
       const cancel = after(REMOVAL_TIMEOUT_MS, () => this.completeRemoval(c.peer, c.stripe, null))
       this.pendingRemovals.set(key, { oldParent, cancel })
     }
@@ -691,212 +665,5 @@ export class ChannelPublisher {
     this.reattachTimer?.()
     for (const pr of this.pendingRemovals.values()) pr.cancel()
     this.ctx.relay.dropChannel(this.id)
-  }
-}
-
-/** Draws a random u32 channel id. */
-function newChannelId(): number {
-  return crypto.getRandomValues(new Uint32Array(1))[0]
-}
-
-/** The low-resolution preview channel every stream also publishes (tiles, weak downlinks). */
-const PREVIEW = { width: 320, height: 180, fps: 5, kbps: 120 }
-
-/**
- * A shared screen: one capture, encoded once per channel. The full-resolution channel carries the
- * audio; the preview channel gets a downscaled copy of every 5th-of-a-second frame.
- */
-export class PublishedStream {
-  localStream: MediaStream | null = null
-  readonly channels: ChannelPublisher[] = []
-  /** What audio the stream carries (the browser may give no system audio, e.g. for windows). */
-  audio = { system: false, mic: false, systemMuted: false, micMuted: false }
-  private video: VideoPipeline | null = null
-  private preview: VideoPipeline | null = null
-  private audioPipe: AudioPipeline | null = null
-  private mixer: AudioMixer | null = null
-  private micTrack: MediaStreamTrack | null = null
-  private stopSource: (() => void) | null = null
-  private lastPreviewAt = -Infinity
-  private previewCanvas: OffscreenCanvas | null = null
-  private previewBusy = false
-  private stopped = false
-
-  constructor(
-    readonly opts: ShareOptions,
-    private ctx: PublisherContext,
-  ) {
-    this.ceilingKbps = opts.bitrateKbps
-  }
-
-  get full(): ChannelPublisher | undefined {
-    return this.channels.find((c) => c.kind === 'full')
-  }
-
-  get previewChannel(): ChannelPublisher | undefined {
-    return this.channels.find((c) => c.kind === 'preview')
-  }
-
-  get codec(): string | null {
-    return this.video?.codec ?? null
-  }
-
-  async start(): Promise<void> {
-    const o = this.opts
-    let stream: MediaStream
-    if (o.source === 'test') {
-      const [w, h] = o.testSize ?? DEFAULT_TEST_SIZE
-      const tp = testPattern(w, h, CAPTURE_FPS, o.audio)
-      stream = tp.stream
-      this.stopSource = tp.stop
-    } else {
-      stream = await captureScreen({ surface: o.surface, audio: o.audio, maxWidth: o.maxSize?.[0], maxHeight: o.maxSize?.[1] })
-      this.stopSource = () => stream.getTracks().forEach((t) => t.stop())
-    }
-    this.localStream = stream
-    // stop() may have run while the screen picker was open: release what it couldn't see yet.
-    if (this.stopped) return this.stop()
-
-    // System/tab audio and the microphone are mixed into one track.
-    const systemTrack = o.audio ? (stream.getAudioTracks()[0] ?? null) : null
-    this.micTrack = o.mic ? await captureMic() : null
-    if (this.stopped) return this.stop()
-    const canEncodeAudio = AudioPipeline.supported()
-    if (canEncodeAudio && (systemTrack || this.micTrack)) this.mixer = new AudioMixer(systemTrack, this.micTrack)
-    this.audio = { system: !!systemTrack, mic: !!this.micTrack, systemMuted: false, micMuted: false }
-    const withAudio = !!this.mixer
-
-    const full = new ChannelPublisher(newChannelId(), 'full', o.k, o.m, o.bitrateKbps, withAudio, this.ctx, () => this.video?.requestKeyframe())
-    const preview = new ChannelPublisher(newChannelId(), 'preview', 1, 0, PREVIEW.kbps, false, this.ctx, () => this.preview?.requestKeyframe())
-    this.channels.push(full, preview)
-
-    const vt = stream.getVideoTracks()[0]
-    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: CAPTURE_FPS, keyframeIntervalMs: tuning.keyframeIntervalMs })
-    this.video.onFrame = (f) => full.emit(f)
-    this.video.onStreamInfo = (info) => full.setStream({ ...info, audio: this.audioPipe?.info ?? undefined })
-    this.video.onRawFrame = (frame) => this.feedPreview(frame)
-    void this.video.start()
-
-    this.preview = new VideoPipeline(null, { bitrateKbps: PREVIEW.kbps, fps: PREVIEW.fps, keyframeIntervalMs: tuning.keyframeIntervalMs })
-    this.preview.onFrame = (f) => preview.emit(f)
-    this.preview.onStreamInfo = (info) => preview.setStream(info)
-
-    if (this.mixer) {
-      this.audioPipe = new AudioPipeline(this.mixer.track)
-      this.audioPipe.onFrame = (f) => {
-        // The decoder config learns about audio once the encoder is configured.
-        if (full.stream && !full.stream.audio && this.audioPipe?.info) full.setStream({ ...full.stream, audio: this.audioPipe.info })
-        full.emit(f)
-      }
-      this.audioPipe.start().catch((e) => console.warn('audio disabled', e))
-    }
-    // Ending the capture from the browser's own "Stop sharing" bar ends the stream too.
-    vt.addEventListener('ended', () => this.onEnded())
-    this.ctx.announce()
-  }
-
-  /** Downscales a captured frame for the preview channel, at most PREVIEW.fps times a second. */
-  private feedPreview(frame: VideoFrame): void {
-    const now = performance.now()
-    if (!this.preview || this.previewBusy || now - this.lastPreviewAt < 1000 / PREVIEW.fps) return
-    this.lastPreviewAt = now
-    const scale = Math.min(PREVIEW.width / frame.displayWidth, PREVIEW.height / frame.displayHeight, 1)
-    const w = Math.max(2, Math.round((frame.displayWidth * scale) / 2) * 2)
-    const h = Math.max(2, Math.round((frame.displayHeight * scale) / 2) * 2)
-    if (!this.previewCanvas || this.previewCanvas.width !== w || this.previewCanvas.height !== h) this.previewCanvas = new OffscreenCanvas(w, h)
-    const g = this.previewCanvas.getContext('2d')!
-    g.drawImage(frame, 0, 0, w, h)
-    const small = new VideoFrame(this.previewCanvas, { timestamp: frame.timestamp })
-    this.previewBusy = true
-    void this.preview.encodeExternal(small).finally(() => (this.previewBusy = false))
-  }
-
-  /**
-   * Changes bitrate (and the capture size cap) in place: the encoder reconfigures and sends a
-   * keyframe, with no new capture (which would need the user to pick a screen again) and no new
-   * channel.
-   */
-  async setQuality(bitrateKbps: number, maxSize?: [number, number]): Promise<void> {
-    const full = this.full
-    if (!full || !this.video) return
-    this.ceilingKbps = bitrateKbps
-    full.kbps = bitrateKbps
-    ;(this.opts as { bitrateKbps: number }).bitrateKbps = bitrateKbps
-    this.video.setBitrate(bitrateKbps)
-    const track = this.localStream?.getVideoTracks()[0]
-    if (maxSize && track && this.opts.source !== 'test') {
-      await track
-        .applyConstraints({ width: { max: maxSize[0] }, height: { max: maxSize[1] }, frameRate: { ideal: CAPTURE_FPS, max: CAPTURE_FPS } })
-        .catch((e) => console.warn('capture size change failed', e))
-      ;(this.opts as { maxSize?: [number, number] }).maxSize = maxSize
-    }
-    full.limited = null
-    this.ctx.announce()
-  }
-
-  /** The most the bitrate may go up to: the quality the presenter chose. */
-  ceilingKbps: number
-
-  /** Adapts the encoder's bitrate (congestion control) without changing the chosen quality. */
-  adaptBitrate(kbps: number): void {
-    const full = this.full
-    if (!full || !this.video) return
-    const next = Math.round(Math.min(this.ceilingKbps, Math.max(MIN_ADAPTIVE_KBPS, kbps)) / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS
-    if (next === full.kbps) return
-    full.kbps = next
-    this.video.setBitrate(next)
-    this.ctx.announce()
-  }
-
-  private encoderWindow = new RateWindow<{ captured: number; encoded: number; dropped: number; keyframes: number; bytes: number }>()
-
-  /** The full channel's encoder over the window since the previous call. */
-  sampleEncoder(): EncoderRates | null {
-    const v = this.video
-    if (!v) return null
-    const r = this.encoderWindow.sample({
-      captured: v.framesIn,
-      encoded: v.framesEncoded,
-      dropped: v.framesDropped,
-      keyframes: v.keyframes,
-      bytes: v.bytesOut,
-    })
-    return {
-      codec: v.codec,
-      targetKbps: this.full?.kbps ?? this.opts.bitrateKbps,
-      ceilingKbps: this.ceilingKbps,
-      kbps: Math.round((r.bytes * 8) / 1000),
-      captureFps: round1(r.captured),
-      encodedFps: round1(r.encoded),
-      droppedFps: round1(r.dropped),
-      keyframes: round1(r.keyframes),
-      encodeMs: round1(v.encodeMs),
-      maxFrameKB: round1(v.takeMaxFrameBytes() / 1024),
-    }
-  }
-
-  setSystemMuted(muted: boolean): void {
-    this.mixer?.setSystemMuted(muted)
-    this.audio = { ...this.audio, systemMuted: muted }
-  }
-
-  setMicMuted(muted: boolean): void {
-    this.mixer?.setMicMuted(muted)
-    this.audio = { ...this.audio, micMuted: muted }
-  }
-
-  onEnded: () => void = () => {}
-
-  stop(): void {
-    this.stopped = true
-    this.video?.stop()
-    this.preview?.stop()
-    this.audioPipe?.stop()
-    this.mixer?.close()
-    this.micTrack?.stop()
-    this.stopSource?.()
-    for (const c of this.channels) c.stop()
-    this.channels.length = 0
-    this.ctx.announce()
   }
 }

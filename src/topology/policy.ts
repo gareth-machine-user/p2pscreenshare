@@ -1,7 +1,7 @@
 // Publisher-side tree policy that is independent of networking: the planner's tuning, how long
 // reattach requests are batched, when a late parent loses its children, which keyframe requests
 // are honoured, and when a child's complaint counts against its parent. ChannelPublisher
-// (session/publisher.ts) runs it for real; the simulator (sim/simulator.ts) runs the same code.
+// (session/channelPublisher.ts) runs it for real; the simulator (sim/simulator.ts) runs the same code.
 import type { PlannerConfig } from './model'
 
 /** Peers must have subscribed this long before they are trusted as relays (ms). */
@@ -29,6 +29,13 @@ export function defaultPlannerConfig(
  * parent and the rest are recognized as collateral.
  */
 export const REATTACH_BATCH_MS = 400
+
+/**
+ * A subscriber gives a new parent this long (from its set-parent) before asking to reattach. So a
+ * reattach request the publisher gets sooner than this after changing that parent is about the
+ * previous one: the child has been moved already.
+ */
+export const PARENT_GRACE_MS = 3000
 
 /** A parent whose children's pieces arrive this much later than its own (ms)... */
 export const LATE_PARENT_MS = 150
@@ -322,4 +329,35 @@ export function blameInput(
     ),
     parentFeedStale: parentSt !== undefined && !fresh(parentSt.lastRecvAgoMs, freshMs),
   }
+}
+
+/** A child's linkOpen reattach request, as the publisher batches them. */
+export interface Accusation {
+  child: string
+  parent: string
+  stripe: number
+  now: number
+}
+
+/**
+ * Judges a batch of reattach complaints (ChannelPublisher's, and the simulator's): records each in
+ * `log`, excused or not, and returns those that count against their parent (shouldBlameParent).
+ * The whole batch is recorded first: a child complaining about several parents at once is its own
+ * downlink's fault, and siblings in the same batch corroborate each other.
+ */
+export function judgeComplaints(
+  accused: readonly Accusation[],
+  log: ComplaintLog,
+  statsOf: (id: string) => StatsSnapshot | null,
+  now: number,
+  freshMs: number,
+): Accusation[] {
+  const batch = [...log.recent(now), ...accused.map((c) => ({ ...c, at: c.now, excused: false }))]
+  for (const c of accused) {
+    const input = blameInput(c, statsOf(c.child), statsOf(c.parent), batch, freshMs)
+    const excused = input.parentFeedStale || childStripeEvidence(c, statsOf(c.child), batch, freshMs) === 'stale'
+    log.add({ ...c, at: c.now, excused })
+  }
+  const recent = log.recent(now)
+  return accused.filter((c) => shouldBlameParent(blameInput(c, statsOf(c.child), statsOf(c.parent), recent, freshMs)))
 }

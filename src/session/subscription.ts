@@ -10,6 +10,7 @@ import type { LossRates, PeerMsg, PublisherMsg, StripeStat, SubscriberMsg, Subsc
 import { RateWindow, round1 } from './rates'
 import { REPLAY_REQUEST_MIN_MS, treeKey, type RelayNode } from '../relay/relayNode'
 import { after, every } from '../net/ticker'
+import { PARENT_GRACE_MS } from '../topology/policy'
 import { tuning } from '../tuning'
 
 const HEALTH_INTERVAL_MS = 250
@@ -20,7 +21,6 @@ const STATS_INTERVAL_MS = 2000
  * every 400 ms while the screen is idle, so a live stripe is never this quiet.
  */
 export const STRIPE_SILENCE_MS = tuning.stripeSilenceMs
-const PARENT_GRACE_MS = 3000
 /** Extra time allowed for a parent whose mesh link is still connecting. */
 const LINK_SETUP_GRACE_MS = 8000
 const REATTACH_COOLDOWN_MS = 4000

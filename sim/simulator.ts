@@ -26,15 +26,14 @@ import type { PlannerConfig, PlannerPeer, Topology } from '../src/topology/model
 import { emptyTopology, subtree } from '../src/topology/model'
 import { plan } from '../src/topology/planner'
 import {
-  blameInput,
-  childStripeEvidence,
   ComplaintLog,
   defaultPlannerConfig,
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
+  judgeComplaints,
   LateParentTracker,
   REATTACH_BATCH_MS,
-  shouldBlameParent,
+  type Accusation,
   type LatenessSample,
   type StatsSnapshot,
 } from '../src/topology/policy'
@@ -62,7 +61,7 @@ const BUFFER_MS = 60
 const LATE_EXTRA_MS = 250
 
 // Lossy viewers (simulateLossy). Subscriber-side constants mirror session/subscription.ts,
-// publisher-side ones session/publisher.ts.
+// publisher-side ones session/channelPublisher.ts.
 const PARENT_GRACE_MS = 3000
 const REATTACH_COOLDOWN_MS = 4000
 const KEY_REQUEST_INTERVAL_MS = 500
@@ -453,7 +452,7 @@ class Simulation {
   /** ChannelPublisher.processReattaches for linkOpen complaints: move the child, maybe blame the parent. */
   private processReattaches(now: number): void {
     this.reattachDueAt = Infinity
-    const accused: { child: string; parent: string; stripe: number; now: number }[] = []
+    const accused: Accusation[] = []
     for (const { child, parent, stripe } of this.reattachQueue.splice(0)) {
       if (this.topo.parents[child]?.[stripe] !== parent || parent === HOST) continue
       // The parent is starved by a departure being repaired: the child stays (as the publisher does).
@@ -464,30 +463,14 @@ class Simulation {
       this.avoidUntil.set(child, m)
     }
     if (this.o.lossy!.policy === 'new') {
-      for (const p of this.judgeParents(accused, now)) this.failures.set(p, (this.failures.get(p) ?? 0) + 1)
+      // The publisher's own judgement (topology/policy.ts), one entry per blamed complaint.
+      const blamed = judgeComplaints(accused, this.complaints, (id) => this.statsOf(id, now), now, tuning.stripeSilenceMs / 2)
+      for (const { parent: p } of blamed) this.failures.set(p, (this.failures.get(p) ?? 0) + 1)
     } else {
       // Before corroboration: every complaint counted against the parent.
       for (const c of accused) this.failures.set(c.parent, (this.failures.get(c.parent) ?? 0) + 1)
     }
     this.replan(now)
-  }
-
-  /**
-   * ChannelPublisher.judgeParents with the same policy functions: returns one entry per blamed
-   * complaint (a parent may appear twice).
-   */
-  private judgeParents(accused: { child: string; parent: string; stripe: number; now: number }[], now: number): string[] {
-    const freshMs = tuning.stripeSilenceMs / 2
-    const batch = [...this.complaints.recent(now), ...accused.map((c) => ({ ...c, at: c.now, excused: false }))]
-    for (const c of accused) {
-      const input = blameInput(c, this.statsOf(c.child, now), this.statsOf(c.parent, now), batch, freshMs)
-      const excused = input.parentFeedStale || childStripeEvidence(c, this.statsOf(c.child, now), batch, freshMs) === 'stale'
-      this.complaints.add({ ...c, at: c.now, excused })
-    }
-    const recent = this.complaints.recent(now)
-    return accused
-      .filter((c) => shouldBlameParent(blameInput(c, this.statsOf(c.child, now), this.statsOf(c.parent, now), recent, freshMs)))
-      .map((c) => c.parent)
   }
 
   /** A peer's latest stats as the publisher has them (sent every 2 s). */
