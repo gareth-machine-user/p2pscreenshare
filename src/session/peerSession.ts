@@ -29,6 +29,7 @@ import { ChannelOwners } from './channelOwners'
 import { liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { HeadroomProbe } from './headroom'
 import { after, every, takeMainThreadLag } from '../net/ticker'
+import type { Buffering } from '../media/jitterBuffer'
 
 export interface PeerSessionOptions {
   joinCode: string
@@ -152,6 +153,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   readonly topologyReports = new Map<number, TopologyReport>()
   /** Main player quality: Auto (full, falling back to the preview when it stalls), Full or Preview. */
   quality: ViewQuality = 'auto'
+  /** Playback buffering for every stream this peer watches. */
+  buffering: Buffering = 'auto'
   /** Auto quality is showing the preview because the full stream stalled. */
   autoFallback = false
   /** This member's request to publish. */
@@ -367,6 +370,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       else this.subs.set(ch, new Subscription(ch, live.publisher, live.ann, this))
     }
     this.updateOffers()
+    this.onChange()
+  }
+
+  setBuffering(b: Buffering): void {
+    this.buffering = b
+    for (const sub of this.subs.values()) sub.player.clock.setBuffering(b)
     this.onChange()
   }
 

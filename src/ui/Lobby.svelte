@@ -191,6 +191,7 @@
   $effect(() => {
     void settings.view.chatOpen
     void settings.view.quality
+    void settings.view.buffering
     saveSettings()
   })
 
@@ -351,6 +352,13 @@
     const s = session
     if (s && s.quality !== q) untrack(() => s.setQuality(q))
   })
+
+  // Playback buffering, for every stream watched.
+  $effect(() => {
+    const b = settings.view.buffering
+    const s = session
+    if (s && s.buffering !== b) untrack(() => s.setBuffering(b))
+  })
 </script>
 
 <div class="lobby">
@@ -421,6 +429,7 @@
             hasAudio={view.hasAudio}
             qualityOptions={view.presenting || !view.sub ? null : ['auto', 'full', 'preview']}
             bind:quality={settings.view.quality}
+            bind:buffering={settings.view.buffering}
             bind:muted
           >
             {#snippet panel()}

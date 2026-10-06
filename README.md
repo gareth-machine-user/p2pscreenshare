@@ -21,8 +21,10 @@ only to find the lobby; no media server is involved.
   stronger peers nearer the root, prefers closer parents (RTT), and switches parents
   make-before-break. The planner fails together with the stream it plans, so there is no leader.
 - **Cut-through forwarding and low latency.** Relays forward each fragment as soon as it arrives.
-  A jitter buffer that tracks reference dependencies plays out at the 95th percentile of frame
-  arrival times. The default profile favours complete frames over delay (see
+  A jitter buffer that tracks reference dependencies plays out at a high percentile of frame
+  arrival times, per viewer, so a laggy viewer buffers more without delaying anyone else. It keeps
+  the buffer a delay spike needed for a minute and shrinks it gently, so a connection that
+  hiccups every half minute doesn't stall on each hiccup. The default profile favours complete frames over delay (see
   [Quality versus latency](#quality-versus-latency)); the low-latency profile measured about
   **70 ms** glass-to-glass in local e2e tests.
 - **Gapless audio.** 192 kbps Opus tuned for music, in 40 ms frames erasure coded across the full
@@ -71,7 +73,8 @@ npm run tracker             # ws://localhost:8000
   either way).
 - **Watching.** With two or more streams live, a tile rail shows live previews; click one to put it
   on the stage. Hover the player for mute (every stream starts muted), quality (Auto, Full or
-  Preview), fullscreen, and a gear with **Stats** (including what you receive and upload right
+  Preview), buffering (Low latency, Auto, or Extra smooth, which adds 1.5 s for flaky
+  connections), fullscreen, and a gear with **Stats** (including what you receive and upload right
   now, and a per-peer list: every member's measured upload capacity, marked "est.", and for peers you're
   connected to the live sending / receiving rates and RTT), **Peers** (who is connected; see
   [Per-link stats](#per-link-stats)) and **Topology** (the stream's relay trees, fetched from its
@@ -461,6 +464,7 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Uplink deadlines T0 / T1 / T2+ | 2500 / 1500 / 800 ms | 900 / 350 / 180 ms | Bursts drain from the queue instead of costing frames |
 | Keyframe / replay deadline | 4 s | 2 / 2.5 s | Keyframes and GOP replays survive overload |
 | Jitter buffer | 99th percentile + 120 ms, ≥ 150 ms | 95th percentile + 40 ms, ≥ 30 ms | Far fewer late or skipped frames on jittery paths |
+| Jitter buffer memory | a spike's buffer is kept 60 s, then shrinks ≤ 8 ms/s | 5 s, then ≤ 250 ms/s | Periodic hiccups don't stall each time; shrinking slower than audio's 1% catch-up keeps sound gapless |
 | Media channel retransmits | up to 3 s | up to 1 s | Lost packets are re-sent instead of lost |
 | Stripe-silence detection | 1.5 s | 1 s | Fewer false reattaches |
 | Keyframe interval | 10 s | 2 s | Keyframes are expensive, and with constant bitrate each one briefly blurs the picture to fit the budget; joiners start from the cached GOP and a viewer that loses its decode chain asks for one |

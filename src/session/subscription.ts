@@ -12,6 +12,7 @@ import { REPLAY_REQUEST_MIN_MS, treeKey, type RelayNode } from '../relay/relayNo
 import { after, every } from '../net/ticker'
 import { PARENT_GRACE_MS } from '../topology/policy'
 import { tuning } from '../tuning'
+import type { Buffering } from '../media/jitterBuffer'
 
 const HEALTH_INTERVAL_MS = 250
 const STATS_INTERVAL_MS = 2000
@@ -42,6 +43,8 @@ export interface SubscriptionContext {
   readonly relay: RelayNode
   /** Debug upload cap, reported in stats. */
   readonly capKbps: number | null
+  /** The viewer's playback buffering choice. */
+  readonly buffering: Buffering
   capacityKbps(): number | null
   uplinkSample(): { kbps: number; dropRate: number }
   /** This peer's uplink over the last window (drops by layer, queueing delay). */
@@ -83,6 +86,7 @@ export class Subscription {
   ) {
     this.ann = ann
     this.player = new Player(null, () => this.requestKeyframe())
+    this.player.clock.setBuffering(ctx.buffering)
     this.reassembler = new Reassembler((f) => {
       if (!f.audio) this.framesIn++
       this.player.push(f)

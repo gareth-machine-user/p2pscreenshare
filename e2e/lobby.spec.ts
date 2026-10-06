@@ -68,6 +68,18 @@ test('player overlay: starts muted, mute toggles, fullscreen targets the stage, 
   await expect(mute).toHaveAttribute('aria-pressed', 'true')
   expect(await viewer.evaluate(() => (window.__p2p as { player: { audio: { muted: boolean } } }).player.audio.muted)).toBe(false)
 
+  // Extra smooth buffering adds a cushion to the playout delay (and is remembered).
+  type Clock = { player: { clock: { bufferMs: number } } }
+  const buffered = () => viewer.evaluate(() => (window.__p2p as unknown as Clock).player.clock.bufferMs)
+  expect(await buffered()).toBeLessThan(1500)
+  await viewer.getByTestId('buffering').selectOption('extra')
+  await expect.poll(buffered, { timeout: 5000 }).toBeGreaterThanOrEqual(1500)
+  expect(await viewer.evaluate(() => JSON.parse(localStorage.getItem('p2pss:settings') ?? '{}').view?.buffering)).toBe('extra')
+  // Back to Auto: straight down, no gliding.
+  await viewer.getByTestId('buffering').selectOption('auto')
+  await expect.poll(buffered, { timeout: 2000 }).toBeLessThan(1500)
+  await stage.hover()
+
   await viewer.getByTestId('fullscreen').click()
   await expect.poll(() => viewer.evaluate(() => document.fullscreenElement?.getAttribute('data-testid') ?? null)).toBe('stage')
   // The overlay lives inside the fullscreen element, so it stays usable.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DecodeScheduler, PlayoutClock } from '../src/media/jitterBuffer'
+import { DecodeScheduler, EXTRA_BUFFER_MS, PlayoutClock } from '../src/media/jitterBuffer'
 import type { AssembledFrame } from '../src/media/reassembler'
 import { NO_REF } from '../src/proto/framing'
 
@@ -184,7 +184,7 @@ describe('PlayoutClock', () => {
   })
 
   it('slews the delay: up at 4x the rate, down at the rate', () => {
-    const c = new PlayoutClock({ quantile: 0.5, safetyMs: 0, minDelayMs: 0, windowMs: 500, slewMsPerSec: 100 })
+    const c = new PlayoutClock({ quantile: 0.5, safetyMs: 0, minDelayMs: 0, windowMs: 500, slewMsPerSec: 100, slewDownMsPerSec: 100, holdMs: 0 })
     c.addSample(0, 100)
     expect(c.renderAt(0)).toBe(100)
     // Target jumps to 1000 ms; one second allows +400.
@@ -195,6 +195,48 @@ describe('PlayoutClock', () => {
     expect(c.renderAt(0)).toBeCloseTo(400, 6)
     c.addSample(3000, 3100)
     expect(c.renderAt(0)).toBeCloseTo(300, 6)
+  })
+
+  it('keeps the buffer a spike needed for holdMs, then glides down', () => {
+    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000 })
+    // Steady 100 ms transit, then one 600 ms spike at t=1 s.
+    for (let t = 0; t <= 1000; t += 20) c.addSample(t, t + 100)
+    c.addSample(1000, 1600)
+    expect(c.bufferMs).toBe(500)
+    // The spike leaves the 1 s window at t=2 s, but the buffer stays for the 30 s hold.
+    for (let t = 1020; t <= 30_000; t += 20) c.addSample(t, t + 100)
+    expect(c.bufferMs).toBe(500)
+    // The hold counts from when the spike was last needed: its sample (completed at 1.6 s) leaves
+    // the 1 s window at 2.6 s, so the hold ends at 32.6 s. Then the buffer falls at 100 ms/s.
+    for (let t = 30_020; t <= 34_600; t += 20) c.addSample(t, t + 100)
+    expect(c.bufferMs).toBeGreaterThan(280)
+    expect(c.bufferMs).toBeLessThan(320)
+    // Eventually back to the steady need.
+    for (let t = 34_620; t <= 40_000; t += 20) c.addSample(t, t + 100)
+    expect(c.bufferMs).toBe(0)
+  })
+
+  it('a repeated spike within the hold never lets the buffer shrink', () => {
+    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000 })
+    let min = Infinity
+    for (let t = 0; t <= 120_000; t += 20) {
+      // A 400 ms hiccup every 25 s.
+      c.addSample(t, t + 100 + (t % 25_000 === 0 ? 400 : 0))
+      if (t > 1000) min = Math.min(min, c.bufferMs)
+    }
+    expect(min).toBe(400)
+  })
+
+  it('buffering choices: extra adds a cushion; going lower jumps straight down', () => {
+    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, slewMsPerSec: 1e9, slewDownMsPerSec: 10 })
+    for (let t = 0; t <= 1000; t += 20) c.addSample(t, t + 100)
+    expect(c.bufferMs).toBe(0)
+    c.setBuffering('extra')
+    c.addSample(1020, 1120)
+    expect(c.bufferMs).toBeGreaterThanOrEqual(EXTRA_BUFFER_MS)
+    // Back to low: no gliding down at 10 ms/s, the viewer asked for less delay.
+    c.setBuffering('low')
+    expect(c.bufferMs).toBeLessThan(100)
   })
 
   it('targets the configured quantile of transit times', () => {

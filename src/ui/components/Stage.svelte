@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack, type Snippet } from 'svelte'
   import type { Player } from '../../media/player'
-  import type { ViewQuality } from '../settings.svelte'
+  import type { Buffering, ViewQuality } from '../settings.svelte'
   import Icon from './Icon.svelte'
 
   let {
@@ -12,6 +12,7 @@
     muted = $bindable(true),
     quality = $bindable<ViewQuality>('auto'),
     qualityOptions = null,
+    buffering = $bindable<Buffering>('auto'),
     panel,
   }: {
     /** Remote stream to draw. */
@@ -22,8 +23,10 @@
     hasAudio?: boolean
     muted?: boolean
     quality?: ViewQuality
-    /** Quality choices for this stream, or null to hide the control. */
+    /** Quality choices for this stream, or null to hide the control (and the buffering one). */
     qualityOptions?: ViewQuality[] | null
+    /** Playback buffering: less delay or fewer stalls. */
+    buffering?: Buffering
     /** Contents of the gear panel. */
     panel?: Snippet
   } = $props()
@@ -73,6 +76,12 @@
   }
 
   const QUALITY_LABELS: Record<ViewQuality, string> = { auto: 'Auto', full: 'Full', preview: 'Preview' }
+  const BUFFERING_LABELS: Record<Buffering, string> = { low: 'Low latency', auto: 'Auto buffer', extra: 'Extra smooth' }
+  const BUFFERING_TITLES: Record<Buffering, string> = {
+    low: 'Play as soon as possible: least delay, more stutter on a bad connection',
+    auto: 'Buffer adapts to the connection',
+    extra: 'Adds 1.5 s of buffer: fewest stalls on a flaky connection',
+  }
 </script>
 
 <div
@@ -104,6 +113,9 @@
     {#if qualityOptions}
       <select data-testid="quality" bind:value={quality} aria-label="Quality">
         {#each qualityOptions as q}<option value={q}>{QUALITY_LABELS[q]}</option>{/each}
+      </select>
+      <select data-testid="buffering" bind:value={buffering} aria-label="Buffering" title={BUFFERING_TITLES[buffering]}>
+        {#each Object.keys(BUFFERING_LABELS) as Buffering[] as b}<option value={b}>{BUFFERING_LABELS[b]}</option>{/each}
       </select>
     {/if}
     <span class="spacer"></span>

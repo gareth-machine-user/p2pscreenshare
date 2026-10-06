@@ -80,6 +80,7 @@ function makeSub(): Subscription {
   }
   const ctx: SubscriptionContext = {
     selfId: 'me',
+    buffering: 'auto',
     mesh: mesh as unknown as Mesh,
     relay: relay as unknown as RelayNode,
     capKbps: null,

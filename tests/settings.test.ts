@@ -21,7 +21,7 @@ describe('parseSettings', () => {
     const stored = {
       name: 'Ann',
       share: { source: 'tab', systemAudio: false, mic: true, quality: '1080p-ultra', k: 6, m: 0 },
-      view: { quality: 'preview', chatOpen: false },
+      view: { quality: 'preview', buffering: 'extra', chatOpen: false },
     }
     expect(parseSettings(JSON.stringify(stored))).toEqual(stored)
   })
@@ -31,13 +31,13 @@ describe('parseSettings', () => {
       JSON.stringify({
         name: 5,
         share: { source: 'camera', systemAudio: 'yes', mic: true, quality: '8k', k: 0, m: 2.5 },
-        view: { quality: 'ultra', chatOpen: false },
+        view: { quality: 'ultra', buffering: 'huge', chatOpen: false },
       }),
     )
     expect(s).toEqual({
       name: '',
       share: { ...DEFAULT_SETTINGS.share, mic: true },
-      view: { quality: 'auto', chatOpen: false },
+      view: { quality: 'auto', buffering: 'auto', chatOpen: false },
     })
     expect(QUALITY_PRESETS[s.share.quality]).toBeDefined()
   })

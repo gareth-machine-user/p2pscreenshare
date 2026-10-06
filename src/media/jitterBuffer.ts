@@ -9,10 +9,30 @@ export interface PlayoutClockOptions {
   windowMs: number
   minDelayMs: number
   maxDelayMs: number
-  /** Max change of the playout delay per second of wall time (avoids visible jumps). */
+  /** Max change of the playout delay per second of wall time (avoids visible jumps); it rises 4x faster. */
   slewMsPerSec: number
+  /** Max fall of the playout delay per second (defaults to slewMsPerSec). */
+  slewDownMsPerSec?: number
+  /**
+   * How long the largest recent buffer is kept after the spike that needed it (ms). A connection
+   * that hiccups every half minute would otherwise shrink its buffer between hiccups (the transit
+   * window is only a few seconds) and stall on each one.
+   */
+  holdMs: number
+  /** Added on top of the computed buffer (the viewer's "extra smooth" choice). */
+  extraMs: number
 }
 
+/**
+ * The viewer's playback buffering choice: `low` plays as early as the network allows (more
+ * stalls), `auto` adapts to the connection, `extra` adds a fixed cushion on top for flaky ones.
+ */
+export type Buffering = 'low' | 'auto' | 'extra'
+export const BUFFERINGS: readonly Buffering[] = ['low', 'auto', 'extra']
+/** The cushion `extra` adds (ms). */
+export const EXTRA_BUFFER_MS = 1500
+
+const QUALITY = tuning.priority === 'quality'
 const DEFAULT_CLOCK: PlayoutClockOptions = {
   quantile: tuning.playoutQuantile,
   safetyMs: tuning.playoutSafetyMs,
@@ -20,6 +40,18 @@ const DEFAULT_CLOCK: PlayoutClockOptions = {
   minDelayMs: tuning.playoutMinDelayMs,
   maxDelayMs: 4500,
   slewMsPerSec: 250,
+  // Quality: shrink more slowly than the audio playout can speed up (1%, 10 ms/s), so audio
+  // follows smoothly instead of skipping ahead, and keep a spike's buffer for a minute.
+  slewDownMsPerSec: QUALITY ? 8 : 250,
+  holdMs: QUALITY ? 60_000 : 5000,
+  extraMs: 0,
+}
+
+/** What a buffering choice changes from the clock's base options. */
+export function bufferingOptions(b: Buffering): Partial<PlayoutClockOptions> {
+  if (b === 'low') return { quantile: 0.95, safetyMs: 40, minDelayMs: 30, holdMs: 0, slewDownMsPerSec: 250 }
+  if (b === 'extra') return { extraMs: EXTRA_BUFFER_MS }
+  return {}
 }
 
 /**
@@ -33,9 +65,25 @@ export class PlayoutClock {
   private target = 0
   private lastUpdate = 0
   private opts: PlayoutClockOptions
+  private readonly base: PlayoutClockOptions
+  /** The largest buffer needed lately (beyond the fastest path) and when it was last needed. */
+  private peak: { extra: number; at: number } | null = null
 
   constructor(opts: Partial<PlayoutClockOptions> = {}) {
-    this.opts = { ...DEFAULT_CLOCK, ...opts }
+    this.base = { ...DEFAULT_CLOCK, ...opts }
+    this.opts = this.base
+  }
+
+  /**
+   * Switches buffering. Going lower jumps straight to the new target: the viewer asked for less
+   * delay, so a skip is better than minutes of gliding down.
+   */
+  setBuffering(b: Buffering): void {
+    this.opts = { ...this.base, ...bufferingOptions(b) }
+    this.peak = null
+    const now = this.lastUpdate
+    this.recompute(now)
+    if (this.delay !== null && this.target < this.delay) this.delay = this.target
   }
 
   addSample(captureTime: number, completedAt: number): void {
@@ -51,18 +99,19 @@ export class PlayoutClock {
     const minT = sorted[0]
     const q = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * this.opts.quantile))]
     // Express bounds relative to the fastest observed transit (absolute offset is unknown).
-    const extra = Math.min(
-      Math.max(q - minT + this.opts.safetyMs, this.opts.minDelayMs),
-      this.opts.maxDelayMs,
-    )
+    let extra = Math.min(Math.max(q - minT + this.opts.safetyMs, this.opts.minDelayMs), this.opts.maxDelayMs)
+    // Keep the largest recent need for holdMs after it was last needed.
+    if (!this.peak || extra >= this.peak.extra || now - this.peak.at > this.opts.holdMs) this.peak = { extra, at: now }
+    extra = Math.max(extra, this.peak.extra) + this.opts.extraMs
     this.target = minT + extra
     if (this.delay === null) {
       this.delay = this.target
     } else {
       const dt = Math.max(0, now - this.lastUpdate) / 1000
-      const maxStep = this.opts.slewMsPerSec * dt
+      const up = this.opts.slewMsPerSec * 4 * dt
+      const down = (this.opts.slewDownMsPerSec ?? this.opts.slewMsPerSec) * dt
       // Increase quickly (avoid stalls), decrease slowly.
-      const step = this.target > this.delay ? Math.min(this.target - this.delay, maxStep * 4) : -Math.min(this.delay - this.target, maxStep)
+      const step = this.target > this.delay ? Math.min(this.target - this.delay, up) : -Math.min(this.delay - this.target, down)
       this.delay += step
     }
     this.lastUpdate = now

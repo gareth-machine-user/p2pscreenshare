@@ -1,9 +1,10 @@
 // User settings, persisted in localStorage. Reads and writes are wrapped so the app still works
 // when storage is unavailable (private windows, blocked site data).
 import type { ViewQuality } from '../session/peerSession'
+import { BUFFERINGS, type Buffering } from '../media/jitterBuffer'
 import { storageGet, storageSet } from '../util/storage'
 
-export type { ViewQuality }
+export type { Buffering, ViewQuality }
 export type SourceKind = 'screen' | 'window' | 'tab' | 'test'
 export type QualityPreset = 'auto' | '4k' | '2k' | '1080p-ultra' | '1080p-hi' | '1080p' | '720p' | 'low'
 
@@ -22,7 +23,7 @@ export interface ShareSettings {
 export interface Settings {
   name: string
   share: ShareSettings
-  view: { quality: ViewQuality; chatOpen: boolean }
+  view: { quality: ViewQuality; buffering: Buffering; chatOpen: boolean }
 }
 
 const KEY = 'p2pss:settings'
@@ -30,7 +31,7 @@ const KEY = 'p2pss:settings'
 export const DEFAULT_SETTINGS: Settings = {
   name: '',
   share: { source: 'screen', systemAudio: true, mic: false, quality: 'auto', k: 4, m: 1 },
-  view: { quality: 'auto', chatOpen: true },
+  view: { quality: 'auto', buffering: 'auto', chatOpen: true },
 }
 
 /** Bitrate and capture size for each quality preset. */
@@ -99,6 +100,7 @@ export function parseSettings(raw: string | null): Settings {
     },
     view: {
       quality: oneOf(view.quality, VIEW_QUALITIES, d.view.quality),
+      buffering: oneOf(view.buffering, BUFFERINGS, d.view.buffering),
       chatOpen: bool(view.chatOpen, d.view.chatOpen),
     },
   }
