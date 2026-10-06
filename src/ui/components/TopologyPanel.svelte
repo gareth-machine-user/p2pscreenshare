@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { TopologyReport } from '../../proto/messages'
   import { fmtKbps, fmtMs } from '../route'
+  import { fmtMbps } from '../liveRates'
   import TreeView from './TreeView.svelte'
   import FrameStats from './FrameStats.svelte'
 
@@ -47,7 +48,7 @@
     <table>
       <thead>
         <tr>
-          <th>Peer</th><th>Upload</th><th>Home</th><th>Slots</th><th>Children</th><th>Depth</th><th>Latency</th><th>FPS</th><th>Late</th>
+          <th>Peer</th><th title="Live: what this peer's uplink sends (relaying, probes), from its last stats report (2 s average)">Sending</th><th title="Measured upload capacity from the last probe; not current use">Est. upload</th><th>Home</th><th>Slots</th><th>Children</th><th>Depth</th><th>Latency</th><th>FPS</th><th>Late</th>
           <th title="Frames in per second, and frames lost per second (incomplete, late, undecodable or skipped)">In / lost /s</th>
           <th title="Uplink fragments dropped per second for missing their deadline, by temporal layer">Drops T0/T1/T2</th>
           <th title="Average time fragments wait in this peer's uplink queue">Queue</th>
@@ -58,7 +59,8 @@
         {#each rows as r (r.id)}
           <tr>
             <td title={r.id}>{nameOf(r.id)}</td>
-            <td>{fmtKbps(r.stats?.capacityKbps)}{r.stats && r.stats.uplinkDropRate > 0.01 ? ` ⚠ ${(r.stats.uplinkDropRate * 100).toFixed(0)}%` : ''}</td>
+            <td data-testid="topo-live-send">{fmtMbps(r.stats?.uplinkRates?.kbps)}</td>
+            <td class="secondary">{fmtKbps(r.stats?.capacityKbps)}{r.stats && r.stats.uplinkDropRate > 0.01 ? ` ⚠ ${(r.stats.uplinkDropRate * 100).toFixed(0)}%` : ''}</td>
             <td>{r.home ?? '—'}</td>
             <td>{r.slots}</td>
             <td>{r.stats?.children ?? 0}</td>

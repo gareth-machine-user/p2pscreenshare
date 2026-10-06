@@ -1002,6 +1002,22 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     })
   }
 
+  /**
+   * This peer's live totals over the last poll (2 s): sent and received on the wire across all its
+   * connections (getStats), falling back to the uplink's own media counter for sending.
+   */
+  liveRates(): { sendKbps: number | null; recvKbps: number | null } {
+    const now = performance.now()
+    let send: number | null = null
+    let recv: number | null = null
+    for (const t of this.linkTrackers.values()) {
+      const s = t.tracker.current(now)
+      if (s?.sendKbps != null) send = (send ?? 0) + s.sendKbps
+      if (s?.recvKbps != null) recv = (recv ?? 0) + s.recvKbps
+    }
+    return { sendKbps: send ?? this.uplinkStatsNow?.kbps ?? null, recvKbps: recv }
+  }
+
   /** The link from this peer to `peer`, over the last window. */
   linkRate(peer: string): { drops: number; queueMs: number; congested: boolean } | null {
     return this.linkRates.get(peer) ?? null

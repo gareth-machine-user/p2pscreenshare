@@ -590,6 +590,19 @@ summary {
   border-radius: 10px;
   background: var(--panel);
 }
+/* Estimates next to live figures (e.g. the probed upload capacity). */
+td.secondary,
+th.secondary {
+  color: var(--muted);
+}
+.badge.live-upload {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.badge.live-upload.warn {
+  color: var(--warn);
+  border-color: var(--warn-border);
+}
 .live-dot {
   color: var(--danger);
   font-weight: 600;

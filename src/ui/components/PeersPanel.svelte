@@ -1,22 +1,38 @@
 <script lang="ts">
-  import type { Mesh } from '../../mesh/mesh'
+  import type { PeerSession } from '../../session/peerSession'
   import { fmtKbps, fmtMs } from '../route'
+  import { fmtMbps, peerLive } from '../liveRates'
 
   let {
-    mesh,
+    session,
     badges,
     tick,
     onkick = null,
-  }: { mesh: Mesh; badges: (id: string) => string[]; tick: number; onkick?: ((id: string) => void) | null } = $props()
+  }: { session: PeerSession; badges: (id: string) => string[]; tick: number; onkick?: ((id: string) => void) | null } = $props()
 
-  // Everything here comes from gossip records, so the panel costs no extra traffic.
+  const fmtBytes = (b: number) => (b >= 1024 ? `${Math.round(b / 1024)} KB` : `${b} B`)
+  /** Peers whose per-connection rows are shown. */
+  let expanded = $state(new Set<string>())
+  function toggle(id: string): void {
+    const next = new Set(expanded)
+    if (!next.delete(id)) next.add(id)
+    expanded = next
+  }
+
+  // Membership comes from gossip records; the live columns from this peer's own per-connection
+  // stats (getStats every 2 s, uplink counters), re-read every tick.
   const rows = $derived.by(() => {
     void tick
+    const mesh = session.mesh
     const all = [mesh.record, ...mesh.members()].sort((a, b) => a.joinedAt - b.joinedAt)
     const n = all.length
+    const totals = session.liveRates()
     return all.map((r) => {
       const self = r.id === mesh.selfId
       const unreachable = new Set([...r.unreachable, ...all.filter((o) => o.unreachable.includes(r.id)).map((o) => o.id)])
+      const links = self ? [] : session.linkStatsFor(r.id)
+      const live = peerLive(links)
+      const path = self ? undefined : session.pathQueue.get(r.id)
       return {
         id: r.id,
         name: r.name || r.id.slice(0, 6),
@@ -25,30 +41,59 @@
         // Media lanes: open connections to this peer (mesh/lanes.ts); TURN-relayed pairs use one.
         lanes: self ? 0 : mesh.laneCount(r.id),
         turn: !self && mesh.lanes.relayed(r.id),
-        rtt: self ? null : (mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
+        // Path RTT from getStats; before the first poll, the gossiped one.
+        rtt: self ? null : (live.rttMs ?? mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
+        baseline: live.baselineMs,
         capacity: r.capacityKbps,
+        // Live, on the wire: you → that peer and back; for "you", your totals.
+        send: self ? totals.sendKbps : live.sendKbps,
+        recv: self ? totals.recvKbps : live.recvKbps,
+        breakdown: self ? 'Your totals across all connections' : live.breakdown,
+        links,
+        inflationMs: path?.inflationMs ?? null,
+        pathQueued: path?.queued ?? null,
         unreachable: unreachable.size,
         // Can't reach a good part of the lobby: it only gets the stripes it can reach.
         limited: n > 2 && unreachable.size >= Math.max(1, Math.floor((n - 1) / 3)),
       }
     })
   })
+  const cols = $derived(onkick ? 8 : 7)
 </script>
 
 <div class="table-wrap" data-testid="peers-panel">
   <table>
-    <thead><tr><th>Peer</th><th>Link</th><th>RTT</th><th>Upload</th><th>Unreachable</th>{#if onkick}<th></th>{/if}</tr></thead>
+    <thead>
+      <tr>
+        <th>Peer</th>
+        <th title="Live: what you send to this peer right now (all connections, on the wire, last 2 s)">Sending</th>
+        <th title="Live: what you receive from this peer right now (on the wire, last 2 s)">Receiving</th>
+        <th title="Path round-trip time now / its 2-minute minimum (ICE candidate pair)">RTT now / base</th>
+        <th>Link</th>
+        <th class="secondary" title="Measured upload capacity from the last probe; not current use">Est. upload</th>
+        <th>Unreachable</th>
+        {#if onkick}<th></th>{/if}
+      </tr>
+    </thead>
     <tbody>
       {#each rows as r (r.id)}
         <tr data-testid="peer-row" data-peer={r.id}>
           <td title={r.id}>
+            {#if r.links.length}
+              <button class="expand" data-testid="expand-lanes" aria-expanded={expanded.has(r.id)} title="Per-connection stats" onclick={() => toggle(r.id)}>{expanded.has(r.id) ? '▾' : '▸'}</button>
+            {/if}
             {r.name}
             {#each badges(r.id) as b}<span class="badge">{b}</span>{/each}
             {#if r.limited}<span class="badge warn" data-testid="limited">limited connectivity</span>{/if}
           </td>
+          <td class="live" data-testid="live-send" title={r.breakdown}>{fmtMbps(r.send)}</td>
+          <td class="live" data-testid="live-recv" title={r.breakdown}>{fmtMbps(r.recv)}</td>
+          <td>
+            {#if !r.self}{fmtMs(r.rtt)} / {fmtMs(r.baseline)}{/if}
+            {#if r.pathQueued}<span class="badge warn" title="Path RTT {r.inflationMs} ms above its baseline: queueing in the network">+{r.inflationMs} ms</span>{/if}
+          </td>
           <td data-testid="link-status">{r.status}{#if r.lanes > 1}<span class="badge" data-testid="lanes" title="Connections carrying media to this peer">{r.lanes} lanes</span>{:else if r.turn}<span class="badge" title="Relayed through TURN: a single connection">TURN</span>{/if}</td>
-          <td>{fmtMs(r.rtt)}</td>
-          <td>{fmtKbps(r.capacity)}</td>
+          <td class="secondary" title="Measured upload capacity from the last probe; not current use">{fmtKbps(r.capacity)}</td>
           <td data-testid="unreachable-count">{r.unreachable || ''}</td>
           {#if onkick}
             <td>
@@ -56,7 +101,60 @@
             </td>
           {/if}
         </tr>
+        {#if expanded.has(r.id)}
+          {#each r.links as l (l.lane)}
+            <tr class="lane-row" data-testid="lane-row" data-peer={r.id} data-lane={l.lane}>
+              <td colspan={cols}>
+                <span class="lane-name">{l.lane === 0 ? 'mesh link' : `lane ${l.lane}`}</span>
+                <span title="Send / receive rate on the wire (getStats)">↑ {fmtMbps(l.sendKbps)} ↓ {fmtMbps(l.recvKbps)}</span>
+                <span title="Path RTT now / its 2-minute minimum (ICE candidate pair)" class:stale={!l.fresh}>RTT {fmtMs(l.rttMs)} / {fmtMs(l.baselineMs)}{l.fresh ? '' : ' (stale)'}</span>
+                {#if l.queueMs !== null}
+                  <span title="Live media: time queued (uplink + send buffer) and fragments dropped per second" class:warn={l.congested}>queue {fmtMs(l.queueMs)} · {l.drops} drops/s</span>
+                {/if}
+                {#if l.relayed}<span class="badge">relayed</span>{/if}
+                {#if l.cwnd !== null}<span title="SCTP congestion window">cwnd {fmtBytes(l.cwnd)}</span>{/if}
+              </td>
+            </tr>
+          {/each}
+        {/if}
       {/each}
     </tbody>
   </table>
 </div>
+
+<style>
+  .live {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .secondary {
+    color: var(--muted);
+  }
+  .expand {
+    border: none;
+    background: none;
+    padding: 0 4px 0 0;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .lane-row td {
+    font-size: 12px;
+    color: var(--muted);
+    padding-top: 0;
+    padding-left: 18px;
+    white-space: normal;
+  }
+  .lane-row span {
+    display: inline-block;
+    margin-right: 10px;
+  }
+  .lane-name {
+    min-width: 64px;
+  }
+  .stale {
+    opacity: 0.6;
+  }
+  .warn {
+    color: var(--warn);
+  }
+</style>

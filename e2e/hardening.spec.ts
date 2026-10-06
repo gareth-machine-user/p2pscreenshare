@@ -75,6 +75,15 @@ test('one slow viewer does not throttle the stream; a full uplink does', async (
       const conn = (window.__p2p as Any).mesh.conns.get(id)
       Object.defineProperty(conn, 'bufferedAmount', { get: () => 64 * 1024 * 1024 })
     }, peer)
+  /**
+   * Makes the link look backed up but still flowing (a connection at its congestion window): a
+   * send buffer under the high mark, so fragments keep going (no drops) but each waits behind it.
+   */
+  const queuedLink = (peer: string) =>
+    owner.evaluate((id) => {
+      const conn = (window.__p2p as Any).mesh.conns.get(id)
+      Object.defineProperty(conn, 'bufferedAmount', { get: () => 200 * 1024 })
+    }, peer)
   const state = () =>
     owner.evaluate(() => {
       const s = window.__p2p as Any
@@ -90,8 +99,39 @@ test('one slow viewer does not throttle the stream; a full uplink does', async (
   expect(one.kbps).toBe(2000) // not throttled
   expect((await viewerSnapshot(b)).fps).toBeGreaterThan(20) // the other viewer is unaffected
 
-  // Both links back up together: that is what a full uplink looks like, so the bitrate drops.
-  await slowLink(ids[1])
-  await waitFor(state, (s) => s.kbps < 2000, 20_000, 'throttled on a full uplink')
-  console.log('both slow:', JSON.stringify(await state()))
+  // Both links back up together (the second one queueing, not dropping), but the path RTTs stay
+  // flat: that is the connections' own ceilings, not queueing in the network, so the bitrate holds.
+  await queuedLink(ids[1])
+  await new Promise((r) => setTimeout(r, 10_000))
+  const flat = await state()
+  console.log('both backed up, flat RTT:',JSON.stringify(flat), JSON.stringify(await owner.evaluate(() => Object.fromEntries((window.__p2p as Any).pathQueue))))
+  expect(flat.links[ids[0]]?.congested && flat.links[ids[1]]?.congested).toBe(true)
+  expect(flat.full).toBeNull()
+  expect(flat.kbps).toBe(2000)
+
+  // Now the path RTTs inflate as well (+200 ms on every connection, as a full router queue would):
+  // that is what a full uplink looks like, so the bitrate drops.
+  for (const id of ids) {
+    await owner.evaluate((peer) => {
+      for (const { conn } of (window.__p2p as Any).mesh.connectionsOf(peer)) {
+        const pc = conn.pc as RTCPeerConnection
+        const orig = pc.getStats.bind(pc)
+        const base = new Map<string, number>()
+        ;(pc as Any).getStats = async () => {
+          const out = new Map<string, Any>()
+          ;(await orig()).forEach((r: Any) => {
+            if (r.type === 'candidate-pair' && typeof r.responsesReceived === 'number') {
+              if (!base.has(r.id)) base.set(r.id, r.responsesReceived)
+              const n = r.responsesReceived - base.get(r.id)!
+              r = { ...r, currentRoundTripTime: r.currentRoundTripTime + 0.2, totalRoundTripTime: r.totalRoundTripTime + 0.2 * n }
+            }
+            out.set(r.id, r)
+          })
+          return out
+        }
+      }
+    }, id)
+  }
+  await waitFor(state, (s) => s.kbps < 2000, 25_000, 'throttled on a full uplink')
+  console.log('both backed up, RTT inflated:', JSON.stringify(await state()))
 })
