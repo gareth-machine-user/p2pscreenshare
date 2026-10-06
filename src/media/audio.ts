@@ -70,6 +70,9 @@ export class AudioPipeline {
 /** Decodes Opus frames and schedules them on the shared playout timeline. */
 export class AudioPlayer {
   private ctx: AudioContext | null = null
+  private gain: GainNode | null = null
+  /** Every stream starts muted; unmuting needs a user gesture (autoplay policy). */
+  muted = true
   private decoder: AudioDecoder | null = null
   private configured = ''
   private renderAtByTs = new Map<number, number>()
@@ -77,8 +80,19 @@ export class AudioPlayer {
 
   /** Must be called from a user gesture (autoplay policy). */
   enable(): void {
-    if (!this.ctx) this.ctx = new AudioContext({ latencyHint: 'interactive' })
+    if (!this.ctx) {
+      this.ctx = new AudioContext({ latencyHint: 'interactive' })
+      this.gain = this.ctx.createGain()
+      this.gain.connect(this.ctx.destination)
+    }
     void this.ctx.resume()
+  }
+
+  /** Unmuting must happen in a user gesture. Muting keeps decoding, so unmuting is instant. */
+  setMuted(muted: boolean): void {
+    if (!muted) this.enable()
+    this.muted = muted
+    if (this.gain) this.gain.gain.value = muted ? 0 : 1
   }
 
   get enabled(): boolean {
@@ -129,7 +143,7 @@ export class AudioPlayer {
     data.close()
     const src = ctx.createBufferSource()
     src.buffer = buf
-    src.connect(ctx.destination)
+    src.connect(this.gain ?? ctx.destination)
     src.start(when)
   }
 

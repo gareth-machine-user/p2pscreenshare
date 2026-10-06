@@ -1,9 +1,22 @@
 import { wallClock } from '../net/bootstrap'
 
-export async function captureScreen(withAudio: boolean): Promise<MediaStream> {
+export interface CaptureOptions {
+  /** Which picker tab the browser should preselect. */
+  surface?: 'monitor' | 'window' | 'browser'
+  audio: boolean
+  maxWidth?: number
+  maxHeight?: number
+}
+
+export async function captureScreen(o: CaptureOptions): Promise<MediaStream> {
   const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: { frameRate: { ideal: 30, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
-    audio: withAudio,
+    video: {
+      frameRate: { ideal: 30, max: 30 },
+      width: { max: o.maxWidth ?? 1920 },
+      height: { max: o.maxHeight ?? 1080 },
+      ...(o.surface ? { displaySurface: o.surface } : {}),
+    },
+    audio: o.audio,
   })
   for (const t of stream.getVideoTracks()) t.contentHint = 'detail'
   return stream
@@ -13,7 +26,7 @@ export async function captureScreen(withAudio: boolean): Promise<MediaStream> {
  * Synthetic source for testing: an animated canvas that prints the host wall clock, so latency is
  * visible by eye when the host and a viewer are side by side.
  */
-export function testPattern(width = 1280, height = 720, fps = 30): { stream: MediaStream; stop: () => void } {
+export function testPattern(width = 1280, height = 720, fps = 30, withAudio = false): { stream: MediaStream; stop: () => void } {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
@@ -41,11 +54,24 @@ export function testPattern(width = 1280, height = 720, fps = 30): { stream: Med
   draw()
   const timer = setInterval(draw, 1000 / fps)
   const stream = canvas.captureStream(fps)
+  // A quiet tone, so audio paths can be tested without a real capture.
+  let audioCtx: AudioContext | null = null
+  if (withAudio && typeof AudioContext !== 'undefined') {
+    audioCtx = new AudioContext()
+    const osc = audioCtx.createOscillator()
+    const gain = audioCtx.createGain()
+    gain.gain.value = 0.05
+    const dest = audioCtx.createMediaStreamDestination()
+    osc.connect(gain).connect(dest)
+    osc.start()
+    for (const t of dest.stream.getAudioTracks()) stream.addTrack(t)
+  }
   return {
     stream,
     stop: () => {
       clearInterval(timer)
       stream.getTracks().forEach((t) => t.stop())
+      void audioCtx?.close()
     },
   }
 }

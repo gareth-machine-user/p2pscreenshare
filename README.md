@@ -31,8 +31,10 @@ npm install
 npm run dev                 # http://localhost:5173
 ```
 
-Open the app, click **Start sharing**, and send the viewer link. Public WebTorrent trackers are
-used by default.
+Open the app, enter your name and click **Create lobby**. Copy the lobby link and send it to
+others, then click **Share screen**. Your name and sharing choices are remembered in
+`localStorage`, and so is each lobby's owner seed, so reloading a lobby you created keeps you its
+owner. Public WebTorrent trackers are used by default.
 
 For local development, run your own tracker:
 
@@ -45,11 +47,16 @@ Useful URL parameters (put them in the page query or the hash query):
 
 | Param | Where | Meaning |
 |---|---|---|
-| `tracker=ws://a,wss://b` | both | Tracker URLs to use instead of the public defaults |
-| `ice=none` / `ice=stun:…,turn:…` | both | ICE servers (`none` for LAN or tests) |
-| `k`, `m`, `bitrate`, `up` | host | Data and parity stripes, video kbps, host upload budget in kbps |
-| `source=test&res=640x360` | host | Animated test pattern (prints the host clock) instead of screen capture |
+| `tracker=ws://a,wss://b` | any | Tracker URLs to use instead of the public defaults |
+| `ice=none` / `ice=stun:…,turn:…` | any | ICE servers (`none` for LAN or tests) |
+| `name=…` | any | Display name for this page only |
+| `share=1` | owner | Start sharing right away, applying the overrides below (used by the e2e tests) |
+| `k`, `m`, `bitrate`, `up` | owner | With `share=1`: data and parity stripes, video kbps, upload budget in kbps |
+| `source=test&res=640x360&audio=1` | owner | With `share=1`: animated test pattern (prints the clock) and a test tone |
 | `up=800` | viewer | Debug upload cap in kbps (token-bucket shaper), to emulate a weak peer |
+
+`#/host?stream=<seed>` (the old owner link) still works: it stores the seed and redirects to the
+lobby page.
 
 ## How it works
 

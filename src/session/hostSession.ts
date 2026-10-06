@@ -22,6 +22,9 @@ export interface HostOptions {
   bitrateKbps: number
   hostUploadKbps: number
   source: 'screen' | 'test'
+  /** Picker hint for screen capture. */
+  surface?: 'monitor' | 'window' | 'browser'
+  maxSize?: [number, number]
   audio: boolean
   /** Test pattern size, e.g. [1280, 720]. */
   testSize?: [number, number]
@@ -163,11 +166,17 @@ export class HostSession {
   async start(): Promise<void> {
     let stream: MediaStream
     if (this.opts.source === 'test') {
-      const tp = testPattern(...(this.opts.testSize ?? [1280, 720]))
+      const [w, h] = this.opts.testSize ?? [1280, 720]
+      const tp = testPattern(w, h, 30, this.opts.audio)
       stream = tp.stream
       this.stopSource = tp.stop
     } else {
-      stream = await captureScreen(this.opts.audio)
+      stream = await captureScreen({
+        surface: this.opts.surface,
+        audio: this.opts.audio,
+        maxWidth: this.opts.maxSize?.[0],
+        maxHeight: this.opts.maxSize?.[1],
+      })
       this.stopSource = () => stream.getTracks().forEach((t) => t.stop())
     }
     this.localStream = stream

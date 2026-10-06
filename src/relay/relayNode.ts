@@ -71,6 +71,11 @@ export class RelayNode {
     this.children.get(stripe)?.delete(child)
   }
 
+  /** Drops every child (e.g. when the tree is rebuilt from scratch). */
+  clear(): void {
+    this.children.clear()
+  }
+
   removePeer(peer: string): void {
     for (const set of this.children.values()) set.delete(peer)
   }

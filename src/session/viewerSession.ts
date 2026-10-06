@@ -136,6 +136,11 @@ export class ViewerSession {
   private handle(msg: HostToViewer, from: string): void {
     if (msg.t === 'welcome') {
       if (this.hostId && this.hostId !== from && this.state === 'connected') return
+      // A restarted host plans from scratch: forget the old tree.
+      if (this.hostId !== from) {
+        this.relay.clear()
+        this.pendingOk.clear()
+      }
       this.hostId = from
       this.state = 'connected'
       this.config = msg.config

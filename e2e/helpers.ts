@@ -8,6 +8,8 @@ export interface HostOpts {
   bitrate?: number
   up?: number
   res?: string
+  /** Test-pattern tone. */
+  audio?: boolean
 }
 
 /** `streamId` is the host's seed (its `stream` param); viewers join with the derived join code. */
@@ -26,8 +28,8 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
     m: String(o.m),
     bitrate: String(o.bitrate ?? 1500),
     up: String(o.up ?? 4000),
-    audio: '0',
-    autostart: '1',
+    audio: o.audio ? '1' : '0',
+    share: '1',
     res: o.res ?? '640x360',
     stream: streamId,
     tracker: TRACKER_URL,
@@ -49,7 +51,7 @@ export async function openViewer(browser: Browser, streamId: string, name: strin
   const q = new URLSearchParams({ tracker: TRACKER_URL, name, ice: 'none' })
   if (capKbps) q.set('up', String(capKbps))
   const { joinCode } = await hostIdentity(streamId)
-  await page.goto(`/#/watch/${joinCode}?${q}`)
+  await page.goto(`/#/lobby/${joinCode}?${q}`)
   return page
 }
 

@@ -1,15 +1,35 @@
 export type Route =
   | { page: 'home' }
+  /** Legacy owner link carrying the private seed (`stream`); redirected to the lobby page. */
   | { page: 'host'; params: URLSearchParams }
-  | { page: 'watch'; streamId: string; params: URLSearchParams }
+  | { page: 'lobby'; joinCode: string; params: URLSearchParams }
 
 export function parseRoute(hash: string): Route {
   const [path, query = ''] = hash.replace(/^#/, '').split('?')
   const params = new URLSearchParams(query)
   const parts = path.split('/').filter(Boolean)
   if (parts[0] === 'host') return { page: 'host', params }
-  if (parts[0] === 'watch' && parts[1]) return { page: 'watch', streamId: decodeURIComponent(parts[1]), params }
+  // `watch` is the pre-lobby viewer link.
+  if ((parts[0] === 'lobby' || parts[0] === 'watch') && parts[1]) {
+    return { page: 'lobby', joinCode: decodeURIComponent(parts[1]), params }
+  }
   return { page: 'home' }
+}
+
+/** Extracts a join code from a pasted lobby link (or a bare code). */
+export function joinCodeFrom(text: string): string | null {
+  const t = text.trim()
+  const m = /#\/(?:lobby|watch)\/([^?/\s]+)/.exec(t)
+  const code = m ? decodeURIComponent(m[1]) : t
+  return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(code) ? code : null
+}
+
+/** The shareable lobby link, carrying tracker/ICE overrides so test setups keep working. */
+export function lobbyUrl(joinCode: string, params: URLSearchParams): string {
+  const shared = new URLSearchParams()
+  for (const key of ['tracker', 'ice']) if (params.get(key)) shared.set(key, params.get(key)!)
+  const base = `${location.origin}${location.pathname}${location.search}`
+  return `${base}#/lobby/${joinCode}${shared.size ? `?${shared}` : ''}`
 }
 
 /** Tracker URLs: ?tracker=ws://a,wss://b (page query or hash query) or VITE_TRACKERS; else Trystero defaults. */
