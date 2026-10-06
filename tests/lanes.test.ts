@@ -271,13 +271,13 @@ describe('lane congestion accounting', () => {
   })
 
   it('does not call the uplink full when one lane of a single peer backs up', () => {
-    const rates = (xs: LaneSample[]) => [...peerLinkRates(xs).values()]
-    // One of two lanes at its connection's ceiling: not the uplink.
-    expect(uplinkIsFull(rates([sample('a', true), sample('a', false)]), 9000, 10_000)).toBeNull()
-    // Both lanes backed up, but sending well under the (aggregate) probe: that receiver is slow.
-    expect(uplinkIsFull(rates([sample('a', true), sample('a', true)]), 3000, 10_000)).toBeNull()
-    // Both backed up near the measured upload: the uplink is full.
-    expect(uplinkIsFull(rates([sample('a', true), sample('a', true)]), 8000, 10_000)).toEqual({ congested: 1, active: 1 })
+    const rates = (xs: LaneSample[], pathQueued: boolean | null) => [...peerLinkRates(xs).values()].map((r) => ({ ...r, drops: 3, pathQueued }))
+    // One of two lanes at its connection's ceiling: not the uplink, even with a queueing path.
+    expect(uplinkIsFull(rates([sample('a', true), sample('a', false)], true))).toBeNull()
+    // Both lanes backed up with a flat path RTT: the connections' own ceilings.
+    expect(uplinkIsFull(rates([sample('a', true), sample('a', true)], false))).toBeNull()
+    // Both backed up and the path RTT inflated: the path is full.
+    expect(uplinkIsFull(rates([sample('a', true), sample('a', true)], true))).toEqual({ congested: 1, active: 1, signal: 'rtt' })
   })
 })
 

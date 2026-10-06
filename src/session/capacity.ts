@@ -179,22 +179,54 @@ export function feasibleBitrate(currentKbps: number, ratio: number, floorKbps = 
   return Math.max(floorKbps, Math.round((currentKbps * ratio * 0.9) / 50) * 50)
 }
 
+/** Per peer this uplink sends media to: its link congestion and what its path shows. */
+export interface PeerLinkState {
+  /** Most of the peer's connections backed up (queueing or drops past the thresholds). */
+  congested: boolean
+  /** Live fragments dropped per second on the way to this peer. */
+  drops: number
+  /**
+   * Queueing in the network on the path to this peer: its RTT (the connections' ICE candidate
+   * pairs) inflated above the baseline. Null when unknown (no fresh RTT history).
+   */
+  pathQueued: boolean | null
+}
+
+export interface UplinkFull {
+  /** Peers that counted towards "full". */
+  congested: number
+  active: number
+  /** What showed it: inflated path RTTs, heavy drops, or (RTT unknown) congestion alone. */
+  signal: 'rtt' | 'loss' | 'fallback'
+}
+
+/** Drops per second to a peer that count as heavy loss whatever its RTT does. */
+export const HEAVY_DROPS_PER_S = 10
+
 /**
  * Is a peer's uplink itself full? A full uplink congests most of its links at once, while one slow
- * receiver (its downlink or path) congests only its own. With a single link the two look alike, so
- * that link must also be carrying close to the measured upload.
+ * receiver (its downlink or path) congests only its own: more than `share` of the active peers
+ * must count.
+ *
+ * A congested peer counts only if its path shows queueing in the network (RTT inflated above its
+ * baseline). Congested with a flat RTT is the connections' own ceiling (each SCTP association's
+ * congestion window, or a slow receiver): media lanes absorb that, and a lower bitrate wouldn't
+ * help the uplink. Routers with fq_codel/SQM keep queues short, so a full link there shows drops
+ * rather than RTT growth: heavy drops to most peers count whatever the RTT. A congested peer
+ * without an RTT signal (stale or too little history) counts, as the plain majority rule.
+ *
+ * With a single peer, a bottleneck anywhere on the path (this uplink or that peer's downlink)
+ * counts: nobody else is being sent to, so cutting is right either way.
  */
-export function uplinkIsFull(
-  links: { congested: boolean }[],
-  sendingKbps: number,
-  probeKbps: number | null,
-  share = 0.5,
-  singleShare = 0.7,
-): { congested: number; active: number } | null {
-  const active = links.length
-  const congested = links.filter((l) => l.congested).length
-  // More than half: with two links, one slow receiver is not a full uplink.
-  if (!active || congested / active <= share) return null
-  if (active === 1 && probeKbps !== null && sendingKbps < probeKbps * singleShare) return null
-  return { congested, active }
+export function uplinkIsFull(peers: PeerLinkState[], share = 0.5, heavyDropsPerS = HEAVY_DROPS_PER_S): UplinkFull | null {
+  const active = peers.length
+  if (!active) return null
+  // More than half: with two peers, one slow receiver is not a full uplink.
+  const counted = peers.filter((p) => p.congested && p.pathQueued !== false)
+  if (counted.length / active > share) {
+    return { congested: counted.length, active, signal: counted.some((p) => p.pathQueued === null) ? 'fallback' : 'rtt' }
+  }
+  const lossy = peers.filter((p) => p.drops >= heavyDropsPerS).length
+  if (lossy / active > share) return { congested: lossy, active, signal: 'loss' }
+  return null
 }

@@ -22,7 +22,7 @@ import { emptyAuth, isBanned, type AuthDoc } from './auth'
 import { open, seal, type Envelope, type Typed } from './envelope'
 import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn, type ConnFactory, type PeerConn } from './meshConn'
-import { Lane, type LaneFactory } from './lane'
+import { Lane, type LaneConn, type LaneFactory } from './lane'
 import { clampLanes, isLaneMsg, Lanes, type LaneMsg } from './lanes'
 import type { MediaLink, ProbeLink } from '../net/link'
 import { doorPeers, FailureDetector, GONE_MS, isMemberRecord, linkSuspected, RecordStore, retryDelayMs, SUSPECT_MS, type Digest, type MemberRecord } from './records'
@@ -350,6 +350,13 @@ export class Mesh<C extends PeerConn = MeshConn> {
   /** Open connections to `id` (the mesh link plus open lanes; 0 without a mesh link). */
   laneCount(id: string): number {
     return this.linkFor(id) ? 1 + this.lanes.openLanes(id).length : 0
+  }
+
+  /** Open connections to `id`: the mesh link (lane 0) and each open media lane, by lane index. */
+  connectionsOf(id: string): { lane: number; conn: C | LaneConn }[] {
+    const c = this.linkFor(id)
+    if (!c) return []
+    return [{ lane: 0, conn: c }, ...this.lanes.openLanes(id).map((l) => ({ lane: l.index, conn: l }))]
   }
 
   /** Whose link this is (a mesh link or a lane), if any. */

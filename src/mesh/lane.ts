@@ -5,7 +5,8 @@
 // and used). A lane has no `ctl` channel: its signaling runs over the pair's mesh connection.
 import { LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from '../net/link'
 import { tuning } from '../tuning'
-import { binProbeLink, CONNECT_TIMEOUT_MS, gatherComplete } from './meshConn'
+import type { StatsLike } from '../net/linkStats'
+import { binProbeLink, connStats, CONNECT_TIMEOUT_MS, gatherComplete } from './meshConn'
 
 const BIN_BUFFER_LOW = 256 * 1024
 
@@ -23,6 +24,8 @@ export interface LaneConn extends MediaLink {
   createOffer(): Promise<string>
   acceptOffer(sdp: string): Promise<string>
   acceptAnswer(sdp: string): Promise<void>
+  /** The connection's getStats() report (absent in tests' fakes; null when closed). */
+  stats?(): Promise<StatsLike | null>
   close(): void
 }
 
@@ -119,6 +122,10 @@ export class Lane implements LaneConn {
   async acceptAnswer(sdp: string): Promise<void> {
     await this.pc.setRemoteDescription({ type: 'answer', sdp })
     this.armTimeout()
+  }
+
+  stats(): Promise<StatsLike | null> {
+    return connStats(this.pc)
   }
 
   close(): void {
