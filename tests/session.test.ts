@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { liveStreamsOf, planStage, type StageChannel, type ViewQuality } from '../src/session/stage'
-import { PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeDiscardReason, shuffle, UploadProbe, type UploadProbeContext } from '../src/session/uploadProbe'
+import { PROBE_BUFFER, PROBE_CHUNK, PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeDiscardReason, shuffle, UploadProbe, type UploadProbeContext } from '../src/session/uploadProbe'
 import type { PeerMsg } from '../src/proto/messages'
 import type { LinkState, ProbeLink } from '../src/net/link'
 import { Uplink } from '../src/net/uplink'
@@ -239,12 +239,14 @@ describe('upload probe (sending side)', () => {
     for (const l of s.links) expect(s.uplink.queued(l)).toBe(0)
   })
 
-  it('grows the buffer allowance with the measured rate', async () => {
+  it('keeps at most PROBE_BUFFER in a channel, however fast it drains', async () => {
+    // The bin channel shares its SCTP association with ctl: a big probe backlog there stalled the
+    // mesh link in Chromium until the failure detector dropped it.
     const s = setup(1)
-    let maxThreshold = 0
-    await run(s, 12_500, () => (maxThreshold = Math.max(maxThreshold, s.links[0].bufferLowThreshold)))
-    // About 40 ms of 12.5 KB/ms, halved for the low mark.
-    expect(maxThreshold).toBeGreaterThan(200 * 1024)
+    let maxBuffered = 0
+    await run(s, 12_500, () => (maxBuffered = Math.max(maxBuffered, s.links[0].bufferedAmount)))
+    expect(maxBuffered).toBeLessThanOrEqual(PROBE_BUFFER + PROBE_CHUNK)
+    expect(s.links[0].sent).toBeGreaterThan(12_500 * PROBE_DURATION_MS * 0.9)
   })
 
   it('probes every lane of a neighbour in parallel and reports their sum', async () => {

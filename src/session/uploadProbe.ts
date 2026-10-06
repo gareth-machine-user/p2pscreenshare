@@ -16,13 +16,13 @@ export const PROBE_CHUNK = 16 * 1024
 const PROBE_PEERS = 3
 const PROBE_REPLY_TIMEOUT_MS = 3000
 /**
- * Each probe channel may buffer about this much of its measured send rate (within the bounds
- * below): enough to stay busy between refills on a 100+ Mbps link, while media sharing the
- * connection waits behind it at most about this long. Refills happen when the buffer falls to half.
+ * Each probe channel's send-buffer allowance (refills happen when it falls to half). Fixed and
+ * small on purpose: the `bin` channel shares its SCTP association with the mesh link's `ctl`
+ * channel (and lane 0's media), and in Chromium a probe that kept ~0.25-1 MB buffered there could
+ * stall the whole association for seconds, long enough for the failure detector to drop the link.
+ * Buffer-low events refill it quickly enough: 64 KB still sustains hundreds of Mbps per channel.
  */
-const PROBE_BUFFER_MS = 40
-const PROBE_BUFFER_MIN = REPLAY_BUFFER_MAX
-const PROBE_BUFFER_MAX = 1024 * 1024
+export const PROBE_BUFFER = REPLAY_BUFFER_MAX
 /** Backstop refill period (worker ticker), should a buffer-low event not come. */
 const PROBE_TICK_MS = 50
 /** Longest normal gap between refills (the backstop ticks every 50 ms); longer means starved. */
@@ -156,7 +156,6 @@ export class UploadProbe {
         .map((link) => ({
           link,
           enqueued: 0,
-          bufferMax: PROBE_BUFFER_MIN,
           threshold: link.bufferLowThreshold,
         }))
       const probeId = crypto.getRandomValues(new Uint32Array(1))[0]
@@ -175,29 +174,24 @@ export class UploadProbe {
         const now = performance.now()
         maxGapMs = Math.max(maxGapMs, now - lastRefill)
         lastRefill = now
-        for (const lane of lanes) {
-          const l = lane.link
-          // Grow the buffer allowance with the rate the channel has sent at so far.
-          const drained = (lane.enqueued - uplink.queued(l)) * PROBE_CHUNK - l.bufferedAmount
-          const rate = Math.max(0, drained) / Math.max(1, now - start)
-          lane.bufferMax = Math.min(PROBE_BUFFER_MAX, Math.max(lane.bufferMax, rate * PROBE_BUFFER_MS))
-          uplink.setBackground(l, true, lane.bufferMax)
-          l.bufferLowThreshold = Math.floor(lane.bufferMax / 2)
-        }
         // Buffers have room again: what already waits goes first.
         uplink.kick()
         for (const lane of lanes) {
           const l = lane.link
           // The queue holds a buffer's worth on top, so the buffer crosses its low mark again and
           // the next event comes. A send may go straight out (the uplink drains on every send).
-          const depth = Math.ceil(lane.bufferMax / PROBE_CHUNK) + 1
+          const depth = Math.ceil(PROBE_BUFFER / PROBE_CHUNK) + 1
           for (let i = 0; i < 2 * depth + 2 && l.isOpen && uplink.queued(l) < depth; i++) {
             uplink.send(l, chunk(), 0, PROBE_DURATION_MS)
             lane.enqueued++
           }
         }
       }
-      for (const lane of lanes) lane.link.onBufferLow = refill
+      for (const lane of lanes) {
+        uplink.setBackground(lane.link, true, PROBE_BUFFER)
+        lane.link.bufferLowThreshold = PROBE_BUFFER / 2
+        lane.link.onBufferLow = refill
+      }
       cancels.push(every(PROBE_TICK_MS, refill))
       refill()
       // The deadline is on the worker ticker too, so the probe lasts 1.5 s even when hidden.
