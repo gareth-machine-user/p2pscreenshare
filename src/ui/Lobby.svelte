@@ -1,16 +1,20 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte'
   import { loadIdentity, ownerIdentity, ownerIdFromCode } from '../mesh/identity'
+  import type { PublishPolicy } from '../mesh/auth'
   import { DEFAULT_ICE } from '../net/bootstrap'
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publisher'
   import { fmtKbps, fmtMs, iceFrom, lobbyUrl, numParam, randomId, trackersFrom } from './route'
-  import { ownerSeed, QUALITY_PRESETS, saveSettings, settings } from './settings.svelte'
+  import { ownerSeed, QUALITY_PRESETS, saveSettings, settings, type QualityPreset } from './settings.svelte'
   import Stage from './components/Stage.svelte'
   import ShareDialog from './components/ShareDialog.svelte'
   import ChatPanel from './components/ChatPanel.svelte'
   import PeersPanel from './components/PeersPanel.svelte'
   import TopologyPanel from './components/TopologyPanel.svelte'
+  import TileRail, { type Tile } from './components/TileRail.svelte'
+  import RequestToasts from './components/RequestToasts.svelte'
+  import PresenterBar from './components/PresenterBar.svelte'
   import Icon from './components/Icon.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
@@ -62,14 +66,34 @@
       block: params.get('block')?.split(',').filter(Boolean),
     })
     s.onChange = onChange
+    s.quality = settings.view.quality
+    // The owner granted our request: go straight to the share dialog (or share, in tests).
+    s.onGranted = () => {
+      if (urlOverrides) void startSharing()
+      else dialogOpen = true
+    }
     window.__p2p = s
     window.__mesh = s.mesh
     session = s
     await s.start()
     if (destroyed) return void s.leave()
-    if (urlOverrides && s.canShare) void startSharing()
+    if (urlOverrides) {
+      if (s.canShare) void startSharing()
+      else waitForLobbyThenRequest(s)
+    }
   }
   void init()
+
+  /** Tests: ask to share once linked to the owner. */
+  function waitForLobbyThenRequest(s: PeerSession) {
+    const t = setInterval(() => {
+      if (destroyed) return clearInterval(t)
+      if (s.mesh.linkFor(s.ownerId) && s.mesh.member(s.ownerId)) {
+        clearInterval(t)
+        s.requestPublish()
+      }
+    }, 200)
+  }
 
   onDestroy(() => {
     destroyed = true
@@ -81,6 +105,7 @@
 
   let shareError = $state<string | null>(null)
   let dialogOpen = $state(false)
+  let switching = $state(false)
 
   function shareOptions(): ShareOptions {
     const sh = settings.share
@@ -93,12 +118,13 @@
       source: test ? 'test' : 'screen',
       surface: sh.source === 'window' ? 'window' : sh.source === 'tab' ? 'browser' : 'monitor',
       maxSize: [preset.maxWidth, preset.maxHeight],
-      audio: sh.systemAudio && params.get('audio') !== '0',
+      audio: urlOverrides ? params.get('audio') === '1' : sh.systemAudio,
+      mic: urlOverrides ? params.get('mic') === '1' : sh.mic,
       testSize: (params.get('res')?.split('x').map(Number) as [number, number] | undefined) ?? undefined,
     }
   }
 
-  /** Starts (or restarts, with the current settings) this peer's stream. */
+  /** Starts (or restarts, with the current settings: a brief blip) this peer's stream. */
   async function startSharing(): Promise<void> {
     if (!session) return
     shareError = null
@@ -115,14 +141,28 @@
     onChange()
   }
 
+  function onShareClick() {
+    if (!session) return
+    if (session.canShare) dialogOpen = true
+    else session.requestPublish()
+  }
+
+  function changeQuality(q: QualityPreset) {
+    settings.share.quality = q
+    saveSettings()
+    void startSharing()
+  }
+
   // --- view state --------------------------------------------------------------------------------
 
   let muted = $state(true)
   let copied = $state(false)
   let gearTab = $state<'stats' | 'peers' | 'topology'>('stats')
+  let settingsOpen = $state(false)
 
   $effect(() => {
     void settings.view.chatOpen
+    void settings.view.quality
     saveSettings()
   })
 
@@ -157,6 +197,11 @@
       chat: mesh.chat,
       canShare: session.canShare,
       sharing: !!session.publishing,
+      request: session.requestState,
+      requests: [...session.requests.values()],
+      policy: session.policy,
+      revoked: session.revokedNotice,
+      presenterAudio: session.publishing?.audio ?? null,
     }
   })
 
@@ -164,10 +209,12 @@
     void tick
     const s = session
     if (!s) return null
-    const presenting = !!s.publishing && s.selected === s.selfId
+    const stageView = s.stageView()
+    const presenting = stageView.source === 'local'
     const sub = s.stageSub
-    const p = sub?.player.stats ?? null
-    const stage = s.liveStreams().find((x) => x.publisher === s.selected) ?? null
+    const p = stageView.player?.stats ?? null
+    const streams = s.liveStreams()
+    const stage = streams.find((x) => x.publisher === s.selected) ?? null
     const message = !lobby?.joined
       ? `Looking for the lobby… (${lobby?.trackers ?? 0} trackers connected)`
       : presenting
@@ -184,16 +231,33 @@
             ? `Connecting to ${nameOf(stage.publisher)}'s stream…`
             : null
     const pub = s.publishing?.full ?? null
+    const tiles: Tile[] =
+      streams.length >= 2
+        ? streams.map((x) => ({
+            publisher: x.publisher,
+            name: x.publisher === s.selfId ? `${nameOf(x.publisher)} (you)` : nameOf(x.publisher),
+            player: s.subFor(x.publisher, 'preview')?.player ?? null,
+            localStream: x.publisher === s.selfId && s.publishing?.opts.source === 'test' ? s.publishing.localStream : null,
+            hasAudio: !!x.ann.stream?.audio,
+            selected: x.publisher === s.selected,
+            canStop: s.isOwner && x.publisher !== s.selfId,
+          }))
+        : []
     return {
       presenting,
-      localStream: presenting ? (s.publishing?.localStream ?? null) : null,
-      message,
+      source: stageView.source,
+      player: stageView.player,
+      // Mirroring a real screen capture on the screen being captured makes a flickering feedback
+      // loop, so the presenter sees a placeholder (the test pattern is safe to show).
+      localStream: presenting && s.publishing?.opts.source === 'test' ? s.publishing.localStream : null,
+      message: presenting && s.publishing?.opts.source !== 'test' ? 'You are presenting to the lobby.' : message,
       sub,
-      player: p,
       stats: sub?.lastStats ?? null,
+      playerStats: p,
       hasAudio: !!sub?.ann.stream?.audio,
       capacity: s.capacity.estimateKbps,
       channel: presenting ? (pub?.id ?? null) : (sub?.channel ?? null),
+      tiles,
       pub: pub
         ? {
             codec: s.codec,
@@ -217,6 +281,13 @@
     untrack(() => s.watchTopology(ch, true))
     return () => s.watchTopology(ch, false)
   })
+
+  // The main player's quality choice.
+  $effect(() => {
+    const q = settings.view.quality
+    const s = session
+    if (s && s.quality !== q) untrack(() => s.setQuality(q))
+  })
 </script>
 
 <div class="lobby">
@@ -228,78 +299,146 @@
     <code class="lobby-link" data-testid="lobby-link">{link}</code>
     <span class="spacer"></span>
     {#if lobby}<span class="members" data-testid="member-count" title="Members"><Icon name="users" /> {lobby.members}</span>{/if}
-    {#if lobby?.canShare}
-      {#if lobby.sharing}
-        <button data-testid="stop-share" onclick={stopSharing}><Icon name="stop" />Stop sharing</button>
-      {:else}
-        <button class="primary" data-testid="share-screen" onclick={() => (dialogOpen = true)}><Icon name="screen" />Share screen</button>
-      {/if}
+    {#if lobby?.sharing}
+      <button data-testid="stop-share" onclick={stopSharing}><Icon name="stop" />Stop sharing</button>
+    {:else if lobby?.request === 'waiting'}
+      <span class="badge" data-testid="request-waiting">Waiting for the owner…</span>
+      <button onclick={() => session?.cancelRequest()}>Cancel</button>
+    {:else if lobby?.request === 'owner-away'}
+      <span class="badge warn" data-testid="request-owner-away">Owner is away</span>
+      <button onclick={() => session?.cancelRequest()}>Cancel</button>
+    {:else if lobby}
+      {#if lobby.request === 'denied'}<span class="badge warn" data-testid="request-denied">The owner declined</span>{/if}
+      <button class="primary" data-testid="share-screen" onclick={onShareClick}>
+        <Icon name="screen" />{lobby.canShare ? 'Share screen' : 'Ask to share'}
+      </button>
+    {/if}
+    {#if isOwner && lobby}
+      <div class="popover-anchor">
+        <button data-testid="lobby-settings" aria-expanded={settingsOpen} onclick={() => (settingsOpen = !settingsOpen)} title="Lobby settings">
+          <Icon name="gear" />
+        </button>
+        {#if settingsOpen}
+          <div class="popover" data-testid="lobby-settings-panel">
+            <label>
+              Who may share
+              <select
+                data-testid="policy"
+                value={lobby.policy}
+                onchange={(e) => void session?.setPolicy((e.currentTarget as HTMLSelectElement).value as PublishPolicy)}
+              >
+                <option value="ask">Ask me each time</option>
+                <option value="open">Anyone (Allow all)</option>
+                <option value="closed">Only me (Deny all)</option>
+              </select>
+            </label>
+          </div>
+        {/if}
+      </div>
     {/if}
   </header>
+
+  {#if lobby?.revoked}
+    <div class="banner" data-testid="revoked">The owner stopped your stream.</div>
+  {/if}
 
   <div class="lobby-body">
     <div class="stage-col">
       {#if invalid}
         <Stage message="This link is incomplete. Ask for the full lobby link." />
       {:else if view}
-        <Stage
-          player={view.presenting ? null : (view.sub?.player ?? null)}
-          localStream={view.localStream}
-          message={view.message}
-          hasAudio={view.hasAudio}
-          bind:muted
-        >
-          {#snippet panel()}
-            <div class="tabs">
-              <button class:active={gearTab === 'stats'} onclick={() => (gearTab = 'stats')}>Stats</button>
-              <button class:active={gearTab === 'peers'} data-testid="tab-peers" onclick={() => (gearTab = 'peers')}>Peers</button>
-              <button class:active={gearTab === 'topology'} data-testid="tab-topology" onclick={() => (gearTab = 'topology')}>Topology</button>
-            </div>
-            {#if gearTab === 'peers' && session}
-              <PeersPanel mesh={session.mesh} {badges} {tick} />
-            {:else if gearTab === 'topology'}
-              <TopologyPanel report={view.report} {nameOf} />
-            {:else if view.presenting && view.pub}
-              <div class="stats-grid" data-testid="publisher-stats">
-                <div><span>Viewers</span><b data-testid="viewer-count">{view.pub.subscribers}</b></div>
-                <div><span>Codec</span><b>{view.pub.codec ?? '—'}</b></div>
-                <div><span>Stripes</span><b>{view.pub.k} + {view.pub.m}</b></div>
-                <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
-                <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
-                <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
+        <div class="main-row">
+          <Stage
+            player={view.player}
+            localStream={view.localStream}
+            message={view.message}
+            hasAudio={view.hasAudio}
+            qualityOptions={view.presenting || !view.sub ? null : ['auto', 'full', 'preview']}
+            bind:quality={settings.view.quality}
+            bind:muted
+          >
+            {#snippet panel()}
+              <div class="tabs">
+                <button class:active={gearTab === 'stats'} onclick={() => (gearTab = 'stats')}>Stats</button>
+                <button class:active={gearTab === 'peers'} data-testid="tab-peers" onclick={() => (gearTab = 'peers')}>Peers</button>
+                <button class:active={gearTab === 'topology'} data-testid="tab-topology" onclick={() => (gearTab = 'topology')}>Topology</button>
               </div>
-            {:else}
-              <div class="stats-grid" data-testid="viewer-stats">
-                <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
-                <div><span>Glass-to-glass</span><b data-testid="latency">{fmtMs(view.player?.latencyMs)}</b></div>
-                <div><span>Jitter buffer</span><b>{fmtMs(view.player?.bufferMs)}</b></div>
-                <div><span>FPS</span><b>{view.player?.fps ?? '—'}</b></div>
-                <div><span>Resolution</span><b>{view.player?.width ?? 0}×{view.player?.height ?? 0}</b></div>
-                <div><span>Decoded / dropped</span><b>{view.player?.decodedFrames ?? 0} / {view.player?.droppedFrames ?? 0}</b></div>
-                <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
-                <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
-                <div><span>Uplink</span><b>{fmtKbps(view.stats?.uplinkKbps)}</b></div>
-              </div>
-              {#if view.stats}
-                <table class="stripes">
-                  <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th><th>Late</th></tr></thead>
-                  <tbody>
-                    {#each view.stats.stripes as st, i}
-                      <tr class:stale={st.lastRecvAgoMs === null || st.lastRecvAgoMs > 1000}>
-                        <td>{i}</td>
-                        <td>{st.parent === view.sub?.publisher ? 'publisher' : st.parent ? nameOf(st.parent) : '—'}</td>
-                        <td>{view.sub?.depth[i] ?? '—'}</td>
-                        <td>{st.lastRecvAgoMs === null ? 'never' : fmtMs(st.lastRecvAgoMs) + ' ago'}</td>
-                        <td>{fmtMs(st.rttMs)}</td>
-                        <td>{fmtMs(st.lateMs)}</td>
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
+              {#if gearTab === 'peers' && session}
+                <PeersPanel mesh={session.mesh} {badges} {tick} />
+              {:else if gearTab === 'topology'}
+                <TopologyPanel report={view.report} {nameOf} />
+              {:else if view.presenting && view.pub}
+                <div class="stats-grid" data-testid="publisher-stats">
+                  <div><span>Viewers</span><b data-testid="viewer-count">{view.pub.subscribers}</b></div>
+                  <div><span>Codec</span><b>{view.pub.codec ?? '—'}</b></div>
+                  <div><span>Stripes</span><b>{view.pub.k} + {view.pub.m}</b></div>
+                  <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
+                  <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
+                  <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
+                </div>
+              {:else}
+                <div class="stats-grid" data-testid="viewer-stats">
+                  <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
+                  <div><span>Showing</span><b data-testid="stage-source">{view.source}</b></div>
+                  <div><span>Glass-to-glass</span><b data-testid="latency">{fmtMs(view.playerStats?.latencyMs)}</b></div>
+                  <div><span>Jitter buffer</span><b>{fmtMs(view.playerStats?.bufferMs)}</b></div>
+                  <div><span>FPS</span><b>{view.playerStats?.fps ?? '—'}</b></div>
+                  <div><span>Resolution</span><b>{view.playerStats?.width ?? 0}×{view.playerStats?.height ?? 0}</b></div>
+                  <div><span>Decoded / dropped</span><b>{view.playerStats?.decodedFrames ?? 0} / {view.playerStats?.droppedFrames ?? 0}</b></div>
+                  <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
+                  <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
+                </div>
+                {#if view.stats}
+                  <table class="stripes">
+                    <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th><th>Late</th></tr></thead>
+                    <tbody>
+                      {#each view.stats.stripes as st, i}
+                        <tr class:stale={st.lastRecvAgoMs === null || st.lastRecvAgoMs > 1000}>
+                          <td>{i}</td>
+                          <td>{st.parent === view.sub?.publisher ? 'publisher' : st.parent ? nameOf(st.parent) : '—'}</td>
+                          <td>{view.sub?.depth[i] ?? '—'}</td>
+                          <td>{st.lastRecvAgoMs === null ? 'never' : fmtMs(st.lastRecvAgoMs) + ' ago'}</td>
+                          <td>{fmtMs(st.rttMs)}</td>
+                          <td>{fmtMs(st.lateMs)}</td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {/if}
               {/if}
-            {/if}
-          {/snippet}
-        </Stage>
+            {/snippet}
+          </Stage>
+          {#if view.tiles.length}
+            <TileRail
+              tiles={view.tiles}
+              onselect={(p) => {
+                session?.select(p)
+                onChange()
+              }}
+              onstop={(p) => void session?.revokePublisher(p)}
+            />
+          {/if}
+        </div>
+        {#if lobby?.sharing && lobby.presenterAudio}
+          <PresenterBar
+            audio={lobby.presenterAudio}
+            quality={settings.share.quality}
+            onmic={(m) => {
+              session?.publishing?.setMicMuted(m)
+              onChange()
+            }}
+            onsystem={(m) => {
+              session?.publishing?.setSystemMuted(m)
+              onChange()
+            }}
+            onswitch={() => {
+              switching = true
+              dialogOpen = true
+            }}
+            onquality={changeQuality}
+            onstop={stopSharing}
+          />
+        {/if}
       {:else}
         <Stage message="Starting…" />
       {/if}
@@ -317,13 +456,25 @@
   </div>
 </div>
 
+{#if lobby?.requests.length}
+  <RequestToasts requests={lobby.requests} {nameOf} onrespond={(id, a) => void session?.respond(id, a)} />
+{/if}
+
 {#if dialogOpen}
   <ShareDialog
+    micSupported
+    title={switching ? 'Switch source' : 'Share your screen'}
+    action={switching ? 'Switch' : 'Share'}
     onstart={() => {
       dialogOpen = false
+      switching = false
       void startSharing()
     }}
-    oncancel={() => (dialogOpen = false)}
+    oncancel={() => {
+      dialogOpen = false
+      switching = false
+      session?.cancelRequest()
+    }}
   />
 {/if}
 

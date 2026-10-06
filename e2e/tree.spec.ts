@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
-import { hostSnapshot, median, openHost, openViewer, viewerSnapshot, waitFor, type ViewerSnapshot } from './helpers'
+import { hostSnapshot, median, openHost, openViewer, viewerSnapshot, waitFor, type ViewerSnapshot, closeContexts } from './helpers'
+
+test.afterEach(closeContexts)
 
 // Heterogeneous audience: a few strong uplinks, several weak ones. Upload caps are enforced by
 // each viewer's token-bucket shaper, so the probe and relaying behave like constrained peers.

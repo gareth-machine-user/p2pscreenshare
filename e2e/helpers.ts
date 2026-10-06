@@ -1,6 +1,25 @@
-import type { Browser, Page } from '@playwright/test'
+import type { Browser, BrowserContext, Page } from '@playwright/test'
 import { TRACKER_URL } from '../playwright.config'
 import { hostIdentity } from '../src/net/lobby'
+
+/**
+ * Contexts opened by these helpers. Playwright doesn't close contexts made with
+ * browser.newContext() when a test ends, and a lobby left running keeps streaming: call
+ * closeContexts() after each test (test.afterEach) so tests don't load each other.
+ */
+const contexts = new Set<BrowserContext>()
+
+async function newContext(browser: Browser): Promise<BrowserContext> {
+  const ctx = await browser.newContext()
+  contexts.add(ctx)
+  ctx.on('close', () => contexts.delete(ctx))
+  return ctx
+}
+
+export async function closeContexts(): Promise<void> {
+  await Promise.all([...contexts].map((c) => c.close().catch(() => {})))
+  contexts.clear()
+}
 
 export interface HostOpts {
   k: number
@@ -10,11 +29,13 @@ export interface HostOpts {
   res?: string
   /** Test-pattern tone. */
   audio?: boolean
+  /** Mix in the (fake) microphone. */
+  mic?: boolean
 }
 
 /** `streamId` is the host's seed (its `stream` param); viewers join with the derived join code. */
 export async function openHost(browser: Browser, streamId: string, o: HostOpts): Promise<Page> {
-  const ctx = await browser.newContext()
+  const ctx = await newContext(browser)
   const page = await ctx.newPage()
   page.on('pageerror', (e) => console.log('[host pageerror]', e.message))
   if (process.env.E2E_CONSOLE) {
@@ -29,6 +50,7 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
     bitrate: String(o.bitrate ?? 1500),
     up: String(o.up ?? 4000),
     audio: o.audio ? '1' : '0',
+    mic: o.mic ? '1' : '0',
     share: '1',
     res: o.res ?? '640x360',
     stream: streamId,
@@ -45,7 +67,7 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
 }
 
 export async function openViewer(browser: Browser, streamId: string, name: string, capKbps?: number): Promise<Page> {
-  const ctx = await browser.newContext()
+  const ctx = await newContext(browser)
   const page = await ctx.newPage()
   page.on('pageerror', (e) => console.log(`[${name} pageerror]`, e.message))
   if (process.env.E2E_CONSOLE) page.on('console', (m) => console.log(`[${name}]`, m.text()))
@@ -115,7 +137,7 @@ export function median(xs: number[]): number {
 
 /** Opens the owner's lobby page without sharing. */
 export async function openOwner(browser: Browser, seed: string, name = 'owner'): Promise<Page> {
-  const ctx = await browser.newContext()
+  const ctx = await newContext(browser)
   const page = await ctx.newPage()
   page.on('pageerror', (e) => console.log(`[${name} pageerror]`, e.message))
   if (process.env.E2E_CONSOLE) page.on('console', (m) => console.log(`[${name}]`, m.text()))
@@ -126,7 +148,7 @@ export async function openOwner(browser: Browser, seed: string, name = 'owner'):
 
 /** Opens a lobby member's page; `extra` adds URL params (e.g. `block`). */
 export async function openMember(browser: Browser, seed: string, name: string, extra: Record<string, string> = {}): Promise<Page> {
-  const ctx = await browser.newContext()
+  const ctx = await newContext(browser)
   const page = await ctx.newPage()
   page.on('pageerror', (e) => console.log(`[${name} pageerror]`, e.message))
   if (process.env.E2E_CONSOLE) page.on('console', (m) => console.log(`[${name}]`, m.text()))

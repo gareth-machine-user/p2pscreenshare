@@ -76,6 +76,10 @@ export type PublisherMsg =
 export type PeerMsg =
   | SubscriberMsg
   | PublisherMsg
+  /** A member asks the owner for the right to publish. */
+  | { t: 'publish-req' }
+  /** The owner said no (or the policy is closed). */
+  | { t: 'publish-deny' }
   /** End of an upload probe (sent on the reliable channel, outside the uplink queue). */
   | { t: 'probe-end'; id: number }
   /** A neighbour's report of a probe it received from us: bytes, over its arrival window. */

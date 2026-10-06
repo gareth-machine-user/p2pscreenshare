@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test'
-import { openHost, openViewer, viewerSnapshot, waitFor } from './helpers'
+import { openHost, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
+
+test.afterEach(closeContexts)
 
 test('star: host streams to two viewers (k=1, m=0)', async ({ browser }) => {
   const streamId = `e2e-star-${Date.now()}`

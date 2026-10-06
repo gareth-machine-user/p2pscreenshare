@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
-import { meshSnapshot, openHost, openMember, openOwner, viewerSnapshot, waitFor } from './helpers'
+import { meshSnapshot, openHost, openMember, openOwner, viewerSnapshot, waitFor, closeContexts } from './helpers'
+
+test.afterEach(closeContexts)
 
 const all = (pages: Page[]) => Promise.all(pages.map(meshSnapshot))
 

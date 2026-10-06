@@ -3,6 +3,7 @@
 // so the planner fails together with the tree's source: no leader election, no handover.
 import { AudioPipeline } from '../media/audio'
 import { captureScreen, testPattern } from '../media/capture'
+import { AudioMixer, captureMic } from '../media/mixer'
 import { VideoPipeline } from '../media/encoder'
 import { packetize, type EncodedFrame } from '../media/packetizer'
 import type { Mesh } from '../mesh/mesh'
@@ -26,6 +27,8 @@ export interface ShareOptions {
   maxSize?: [number, number]
   /** Capture system/tab audio (or the test tone). */
   audio: boolean
+  /** Mix in the microphone. */
+  mic?: boolean
   /** Test pattern size, e.g. [1280, 720]. */
   testSize?: [number, number]
 }
@@ -283,7 +286,8 @@ export class ChannelPublisher {
   private deactivate(sub: ChannelSubscriber): void {
     sub.active = false
     const id = sub.id
-    this.ctx.relay.removePeer(id)
+    // Only this channel's trees: the peer may still watch this publisher's other channel.
+    this.ctx.relay.removePeer(id, this.id)
     // Stop the departed peer's parents from pushing stripes into a dead link (WebRTC may take
     // tens of seconds to notice), including parents that were still being phased out.
     const parents = this.topology.parents[id] ?? []
@@ -564,16 +568,27 @@ export function newChannelId(): number {
   return crypto.getRandomValues(new Uint32Array(1))[0]
 }
 
+/** The low-resolution preview channel every stream also publishes (tiles, weak downlinks). */
+export const PREVIEW = { width: 320, height: 180, fps: 5, kbps: 120 }
+
 /**
- * A shared screen: one capture, encoded once per channel. Phase 3 publishes the full-resolution
- * channel; the low-resolution preview channel joins it in phase 4.
+ * A shared screen: one capture, encoded once per channel. The full-resolution channel carries the
+ * audio; the preview channel gets a downscaled copy of every 5th-of-a-second frame.
  */
 export class PublishedStream {
   localStream: MediaStream | null = null
   readonly channels: ChannelPublisher[] = []
+  /** What audio the stream carries (the browser may give no system audio, e.g. for windows). */
+  audio = { system: false, mic: false, systemMuted: false, micMuted: false }
   private video: VideoPipeline | null = null
-  private audio: AudioPipeline | null = null
+  private preview: VideoPipeline | null = null
+  private audioPipe: AudioPipeline | null = null
+  private mixer: AudioMixer | null = null
+  private micTrack: MediaStreamTrack | null = null
   private stopSource: (() => void) | null = null
+  private lastPreviewAt = -Infinity
+  private previewCanvas: OffscreenCanvas | null = null
+  private previewBusy = false
 
   constructor(
     readonly opts: ShareOptions,
@@ -582,6 +597,10 @@ export class PublishedStream {
 
   get full(): ChannelPublisher | undefined {
     return this.channels.find((c) => c.kind === 'full')
+  }
+
+  get previewChannel(): ChannelPublisher | undefined {
+    return this.channels.find((c) => c.kind === 'preview')
   }
 
   get codec(): string | null {
@@ -602,36 +621,77 @@ export class PublishedStream {
     }
     this.localStream = stream
 
-    const at = stream.getAudioTracks()[0]
-    const withAudio = !!at && o.audio && AudioPipeline.supported()
+    // System/tab audio and the microphone are mixed into one track.
+    const systemTrack = o.audio ? (stream.getAudioTracks()[0] ?? null) : null
+    this.micTrack = o.mic ? await captureMic() : null
+    const canEncodeAudio = AudioPipeline.supported()
+    if (canEncodeAudio && (systemTrack || this.micTrack)) this.mixer = new AudioMixer(systemTrack, this.micTrack)
+    this.audio = { system: !!systemTrack, mic: !!this.micTrack, systemMuted: false, micMuted: false }
+    const withAudio = !!this.mixer
+
     const full = new ChannelPublisher(newChannelId(), 'full', o.k, o.m, o.bitrateKbps, withAudio, this.ctx, () => this.video?.requestKeyframe())
-    this.channels.push(full)
+    const preview = new ChannelPublisher(newChannelId(), 'preview', 1, 0, PREVIEW.kbps, false, this.ctx, () => this.preview?.requestKeyframe())
+    this.channels.push(full, preview)
 
     const vt = stream.getVideoTracks()[0]
     this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: 30, keyframeIntervalMs: 2000 })
     this.video.onFrame = (f) => full.emit(f)
-    this.video.onStreamInfo = (info) => full.setStream({ ...info, audio: this.audio?.info ?? undefined })
+    this.video.onStreamInfo = (info) => full.setStream({ ...info, audio: this.audioPipe?.info ?? undefined })
+    this.video.onRawFrame = (frame) => this.feedPreview(frame)
     void this.video.start()
 
-    if (withAudio) {
-      this.audio = new AudioPipeline(at)
-      this.audio.onFrame = (f) => {
+    this.preview = new VideoPipeline(null, { bitrateKbps: PREVIEW.kbps, fps: PREVIEW.fps, keyframeIntervalMs: 2000 })
+    this.preview.onFrame = (f) => preview.emit(f)
+    this.preview.onStreamInfo = (info) => preview.setStream(info)
+
+    if (this.mixer) {
+      this.audioPipe = new AudioPipeline(this.mixer.track)
+      this.audioPipe.onFrame = (f) => {
         // The decoder config learns about audio once the encoder is configured.
-        if (full.stream && !full.stream.audio && this.audio?.info) full.setStream({ ...full.stream, audio: this.audio.info })
+        if (full.stream && !full.stream.audio && this.audioPipe?.info) full.setStream({ ...full.stream, audio: this.audioPipe.info })
         full.emit(f)
       }
-      this.audio.start().catch((e) => console.warn('audio disabled', e))
+      this.audioPipe.start().catch((e) => console.warn('audio disabled', e))
     }
     // Ending the capture from the browser's own "Stop sharing" bar ends the stream too.
     vt.addEventListener('ended', () => this.onEnded())
     this.ctx.announce()
   }
 
+  /** Downscales a captured frame for the preview channel, at most PREVIEW.fps times a second. */
+  private feedPreview(frame: VideoFrame): void {
+    const now = performance.now()
+    if (!this.preview || this.previewBusy || now - this.lastPreviewAt < 1000 / PREVIEW.fps) return
+    this.lastPreviewAt = now
+    const scale = Math.min(PREVIEW.width / frame.displayWidth, PREVIEW.height / frame.displayHeight, 1)
+    const w = Math.max(2, Math.round((frame.displayWidth * scale) / 2) * 2)
+    const h = Math.max(2, Math.round((frame.displayHeight * scale) / 2) * 2)
+    if (!this.previewCanvas || this.previewCanvas.width !== w || this.previewCanvas.height !== h) this.previewCanvas = new OffscreenCanvas(w, h)
+    const g = this.previewCanvas.getContext('2d')!
+    g.drawImage(frame, 0, 0, w, h)
+    const small = new VideoFrame(this.previewCanvas, { timestamp: frame.timestamp })
+    this.previewBusy = true
+    void this.preview.encodeExternal(small).finally(() => (this.previewBusy = false))
+  }
+
+  setSystemMuted(muted: boolean): void {
+    this.mixer?.setSystemMuted(muted)
+    this.audio = { ...this.audio, systemMuted: muted }
+  }
+
+  setMicMuted(muted: boolean): void {
+    this.mixer?.setMicMuted(muted)
+    this.audio = { ...this.audio, micMuted: muted }
+  }
+
   onEnded: () => void = () => {}
 
   stop(): void {
     this.video?.stop()
-    this.audio?.stop()
+    this.preview?.stop()
+    this.audioPipe?.stop()
+    this.mixer?.close()
+    this.micTrack?.stop()
     this.stopSource?.()
     for (const c of this.channels) c.stop()
     this.channels.length = 0

@@ -17,6 +17,7 @@ export default defineConfig({
       env: process.env.CHROMIUM_LD_PRELOAD ? { ...process.env, LD_PRELOAD: process.env.CHROMIUM_LD_PRELOAD } : undefined,
       args: [
         '--use-fake-ui-for-media-stream',
+        '--use-fake-device-for-media-stream',
         '--autoplay-policy=no-user-gesture-required',
         '--disable-background-timer-throttling',
         '--disable-renderer-backgrounding',

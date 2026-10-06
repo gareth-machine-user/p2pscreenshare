@@ -86,8 +86,10 @@ export class RelayNode {
     this.children.get(treeKey(channel, stripe))?.delete(child)
   }
 
-  removePeer(peer: string): void {
-    for (const set of this.children.values()) set.delete(peer)
+  /** Stops forwarding to a peer, in every channel or in one. */
+  removePeer(peer: string, channel?: number): void {
+    const prefix = channel === undefined ? null : `${channel >>> 0}:`
+    for (const [key, set] of this.children) if (prefix === null || key.startsWith(prefix)) set.delete(peer)
   }
 
   /** Forgets everything about a channel (it ended, or this peer unsubscribed or was revoked). */

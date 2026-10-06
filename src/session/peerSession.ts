@@ -6,6 +6,7 @@
 // - Subscriber: one Subscription per watched channel (session/subscription.ts).
 // - Relay: one RelayNode for every channel, forwarding over the mesh links' media channels.
 // - Capacity: an upload probe to 3 neighbours, split into relay slots per watched channel.
+import { grant, mayPublish as mayPublishDoc, revoke, setPolicy, type PublishPolicy } from '../mesh/auth'
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
 import { Mesh } from '../mesh/mesh'
@@ -37,6 +38,22 @@ export interface LiveChannel {
   publisher: string
 }
 
+export type ViewQuality = 'auto' | 'full' | 'preview'
+/** Where the stage picture comes from. */
+export type StageSource = 'local' | 'full' | 'preview' | 'none'
+/** A member's request to publish, as the requester sees it. */
+export type RequestState = 'idle' | 'waiting' | 'owner-away' | 'denied' | 'granted'
+
+export interface PublishRequest {
+  id: string
+  at: number
+}
+
+/** Auto quality falls back to the preview when the full stream stalls this long... */
+const AUTO_STALL_MS = 6000
+/** ...and returns once it plays smoothly again for this long. */
+const AUTO_RECOVER_MS = 4000
+
 const PROBE_DURATION_MS = 1500
 const PROBE_CHUNK = 16 * 1024
 const PROBE_PEERS = 3
@@ -60,7 +77,23 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   selected: string | null = null
   /** Latest topology report per channel (Topology panel). */
   readonly topologyReports = new Map<number, TopologyReport>()
+  /** Main player quality: Auto (full, falling back to the preview when it stalls), Full or Preview. */
+  quality: ViewQuality = 'auto'
+  /** Auto quality is showing the preview because the full stream stalled. */
+  autoFallback = false
+  /** This member's request to publish. */
+  requestState: RequestState = 'idle'
+  /** Owner: pending publish requests. */
+  readonly requests = new Map<string, PublishRequest>()
+  /** Set when the owner revoked this peer's stream. */
+  revokedNotice = false
+  /** Debug/e2e: keep publishing after a revocation (relays must still drop the stream). */
+  debugIgnoreRevocation = false
+  /** Debug/e2e: stage source changes, newest last. */
+  readonly stageLog: { at: number; source: StageSource; publisher: string | null }[] = []
   onChange: () => void = () => {}
+  /** The owner granted this peer's request. */
+  onGranted: () => void = () => {}
 
   private channels = new Map<number, LiveChannel>()
   private rootSlotsByChannel: Record<number, number> = {}
@@ -73,6 +106,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null
   private timers: ReturnType<typeof setInterval>[] = []
   private topoWatching = new Set<number>()
+  private stallSince: number | null = null
+  private smoothSince: number | null = null
+  private lastStageDecoded = 0
 
   constructor(opts: PeerSessionOptions) {
     this.selfId = opts.identity.id
@@ -101,11 +137,15 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     m.onRecord = () => this.scheduleReconcile()
     m.onMemberJoin = () => this.scheduleReconcile()
     m.onMemberLeave = (id) => {
+      this.requests.delete(id)
+      if (id === this.ownerId && this.requestState === 'waiting') this.requestState = 'owner-away'
       for (const c of this.ownChannels()) c.removeSubscriber(id)
       this.relay.removePeer(id)
       this.scheduleReconcile(0)
     }
+    m.onAuth = () => this.onAuthChange()
     m.onLinkOpen = (id) => {
+      if (id === this.ownerId && this.requestState === 'owner-away') this.requestPublish()
       // A publisher we watch is reachable again: make sure it still has us.
       for (const sub of this.subs.values()) if (sub.publisher === id) sub.subscribe()
       for (const ch of this.topoWatching) if (this.channels.get(ch)?.publisher === id) this.sendTo(id, { t: 'topo-req', ch, on: true })
@@ -117,13 +157,23 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     await this.mesh.start()
     this.timers.push(setInterval(() => this.sampleUplink(), 2000))
     this.timers.push(setInterval(() => this.maybeProbe(), 1000))
+    this.timers.push(setInterval(() => this.checkAutoQuality(), 500))
+    this.timers.push(setInterval(() => this.logStage(), 100))
   }
 
   // --- channels ----------------------------------------------------------------------------------
 
-  /** Whether a peer may publish. Phase 3: only the owner (a self-grant). */
+  /** Whether a peer may publish: the owner, a granted key, or anyone under an open policy. */
   mayPublish(id: string): boolean {
-    return id === this.ownerId
+    return mayPublishDoc(this.mesh.auth, this.mesh.pubKeyOf(id), id === this.ownerId)
+  }
+
+  get isOwner(): boolean {
+    return this.selfId === this.ownerId
+  }
+
+  get policy(): PublishPolicy {
+    return this.mesh.auth.policy
   }
 
   get canShare(): boolean {
@@ -169,17 +219,31 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     }, delay)
   }
 
-  /** Picks the stage stream, and subscribes to exactly the channels this peer should watch. */
+  /** The preview channel of a publisher's stream, if announced. */
+  previewOf(publisher: string): LiveChannel | undefined {
+    return this.liveChannels().find((c) => c.publisher === publisher && c.ann.kind === 'preview')
+  }
+
+  /**
+   * Picks the stage stream, and subscribes to exactly the channels this peer should watch: the
+   * stage stream (full, or its preview), and every other stream's preview while two or more are
+   * live (the tile rail). A presenter sees its own capture locally.
+   */
   private reconcile(): void {
     this.rebuildChannels()
     const streams = this.liveStreams()
     if (!this.selected || !streams.some((s) => s.publisher === this.selected)) {
-      // Prefer someone else's stream; a presenter sees its own capture locally.
       this.selected = streams.find((s) => s.publisher !== this.selfId)?.publisher ?? streams[0]?.publisher ?? null
+      this.autoFallback = false
     }
     const want = new Map<number, LiveChannel>()
+    const add = (c: LiveChannel | undefined) => c && want.set(c.ann.id >>> 0, c)
     const stage = streams.find((s) => s.publisher === this.selected)
-    if (stage && stage.publisher !== this.selfId) want.set(stage.ann.id >>> 0, stage)
+    if (stage && stage.publisher !== this.selfId) {
+      if (this.quality !== 'preview') add(stage)
+      if (this.quality === 'preview' || this.autoFallback) add(this.previewOf(stage.publisher))
+    }
+    if (streams.length >= 2) for (const s of streams) if (s.publisher !== this.selfId) add(this.previewOf(s.publisher))
 
     for (const [ch, sub] of this.subs) {
       if (!want.has(ch)) {
@@ -196,16 +260,154 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.onChange()
   }
 
-  /** Puts a publisher's stream on the stage. */
+  setQuality(q: ViewQuality): void {
+    this.quality = q
+    this.autoFallback = false
+    this.scheduleReconcile(0)
+  }
+
+  /**
+   * Auto quality: show the preview while the full stream stalls, and go back once it recovers. A
+   * stall means frames stopped arriving: a static screen legitimately runs at a few fps (only
+   * the idle refresh), and treating that as a stall would flip the stage back and forth.
+   */
+  private checkAutoQuality(): void {
+    if (this.quality !== 'auto') return
+    const full = this.stageSub
+    const now = performance.now()
+    if (!full) {
+      this.stallSince = this.smoothSince = null
+      return
+    }
+    const decoded = full.player.stats.decodedFrames
+    const progressing = decoded > this.lastStageDecoded
+    this.lastStageDecoded = decoded
+    if (!this.autoFallback) {
+      this.stallSince = progressing ? null : (this.stallSince ?? now)
+      if (this.stallSince !== null && now - this.stallSince > AUTO_STALL_MS && decoded > 0) {
+        this.autoFallback = true
+        this.smoothSince = null
+        this.scheduleReconcile(0)
+      }
+    } else {
+      this.smoothSince = progressing ? (this.smoothSince ?? now) : null
+      if (this.smoothSince !== null && now - this.smoothSince > AUTO_RECOVER_MS) {
+        this.autoFallback = false
+        this.stallSince = null
+        this.scheduleReconcile(0)
+      }
+    }
+  }
+
+  /** Where the stage picture comes from right now, and the player to draw (if remote). */
+  stageView(): { source: StageSource; player: Subscription['player'] | null } {
+    if (!this.selected) return { source: 'none', player: null }
+    if (this.selected === this.selfId) return { source: this.publishing ? 'local' : 'none', player: null }
+    const full = this.stageSub
+    const prev = this.subFor(this.selected, 'preview')
+    const prevReady = !!prev && prev.player.stats.decodedFrames > 0
+    if (this.quality === 'preview' || (this.quality === 'auto' && this.autoFallback && prevReady)) {
+      return prev ? { source: 'preview', player: prev.player } : { source: 'none', player: null }
+    }
+    // While switching, the preview fills in until the first full-resolution frame.
+    if (full && full.player.stats.decodedFrames === 0 && prevReady) return { source: 'preview', player: prev!.player }
+    return full ? { source: 'full', player: full.player } : { source: 'none', player: null }
+  }
+
+  private logStage(): void {
+    const { source } = this.stageView()
+    const last = this.stageLog.at(-1)
+    if (last?.source === source && last.publisher === this.selected) return
+    this.stageLog.push({ at: Date.now(), source, publisher: this.selected })
+    if (this.stageLog.length > 100) this.stageLog.shift()
+  }
+
+  subFor(publisher: string, kind: 'full' | 'preview'): Subscription | null {
+    for (const sub of this.subs.values()) if (sub.publisher === publisher && sub.ann.kind === kind) return sub
+    return null
+  }
+
+  // --- publish rights ----------------------------------------------------------------------------
+
+  /** Asks the owner for the right to publish (or notes that it's already there). */
+  requestPublish(): void {
+    if (this.canShare) {
+      this.requestState = 'granted'
+      this.onGranted()
+    } else if (!this.mesh.linkFor(this.ownerId)) {
+      this.requestState = 'owner-away'
+    } else {
+      this.requestState = 'waiting'
+      this.sendTo(this.ownerId, { t: 'publish-req' })
+    }
+    this.onChange()
+  }
+
+  cancelRequest(): void {
+    this.requestState = 'idle'
+    this.onChange()
+  }
+
+  /** Owner: answers a request (or all of them). */
+  async respond(id: string, answer: 'allow' | 'allow-all' | 'deny' | 'deny-all'): Promise<void> {
+    if (!this.isOwner) return
+    const pending = answer.endsWith('-all') ? [...this.requests.keys()] : [id]
+    for (const p of pending) this.requests.delete(p)
+    if (answer === 'allow' || answer === 'allow-all') {
+      await this.mesh.updateAuth((doc) => {
+        let d = answer === 'allow-all' ? setPolicy(doc, 'open') : doc
+        for (const p of pending) {
+          const key = this.mesh.pubKeyOf(p)
+          if (key) d = grant(d, key)
+        }
+        return d
+      })
+    } else {
+      if (answer === 'deny-all') await this.mesh.updateAuth((doc) => setPolicy(doc, 'closed'))
+      for (const p of pending) this.sendTo(p, { t: 'publish-deny' })
+    }
+    this.onChange()
+  }
+
+  /** Owner: stops a member's stream and takes away its right to publish. */
+  async revokePublisher(id: string): Promise<void> {
+    const key = this.mesh.pubKeyOf(id)
+    if (!this.isOwner || !key || id === this.ownerId) return
+    await this.mesh.updateAuth((doc) => revoke(doc, key))
+  }
+
+  async setPolicy(policy: PublishPolicy): Promise<void> {
+    if (!this.isOwner) return
+    await this.mesh.updateAuth((doc) => setPolicy(doc, policy))
+    if (policy === 'closed') await this.respond('', 'deny-all')
+    if (policy === 'open') await this.respond('', 'allow-all')
+  }
+
+  private onAuthChange(): void {
+    if (this.publishing && !this.canShare && !this.debugIgnoreRevocation) {
+      this.stopSharing()
+      this.revokedNotice = true
+    }
+    if (this.requestState === 'waiting' && this.canShare) {
+      this.requestState = 'granted'
+      this.onGranted()
+    }
+    this.scheduleReconcile(0)
+  }
+
+  /** Puts a publisher's stream on the stage (its preview fills in until the full stream decodes). */
   select(publisher: string): void {
     this.selected = publisher
-    this.scheduleReconcile(0)
+    this.autoFallback = false
+    this.reconcile()
+    this.logStage()
   }
 
   // --- sharing -----------------------------------------------------------------------------------
 
   async share(opts: ShareOptions): Promise<void> {
-    if (!this.canShare) throw new Error('Only the lobby owner can share for now.')
+    if (!this.canShare) throw new Error('You need the owner’s permission to share.')
+    this.revokedNotice = false
     this.stopSharing()
     const stream = new PublishedStream(opts, this)
     stream.onEnded = () => {
@@ -283,6 +485,19 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   private handle(msg: PeerMsg, from: string): void {
     if (!msg || typeof msg !== 'object') return
+    if (msg.t === 'publish-req') {
+      if (!this.isOwner || this.mayPublish(from)) return
+      if (this.policy === 'closed') this.sendTo(from, { t: 'publish-deny' })
+      else if (this.policy === 'open') void this.respond(from, 'allow')
+      else this.requests.set(from, { id: from, at: Date.now() })
+      this.onChange()
+      return
+    }
+    if (msg.t === 'publish-deny') {
+      if (from === this.ownerId && this.requestState === 'waiting') this.requestState = 'denied'
+      this.onChange()
+      return
+    }
     if (msg.t === 'probe-end') {
       this.onProbeEnd(msg.id, from)
       return
@@ -459,14 +674,13 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   // --- debug / e2e -------------------------------------------------------------------------------
 
-  /** The stage subscription's player (null while presenting or before anything is live). */
+  /** The stage player (null while presenting or before anything is live). */
   get player(): Subscription['player'] | null {
-    return this.stageSub?.player ?? null
+    return this.stageView().player
   }
 
   get stageSub(): Subscription | null {
-    for (const sub of this.subs.values()) if (sub.publisher === this.selected && sub.ann.kind === 'full') return sub
-    return null
+    return this.selected ? this.subFor(this.selected, 'full') : null
   }
 
   debugViewer() {

@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test'
 import { TRACKER_URL } from '../playwright.config'
-import { openHost, openViewer, viewerSnapshot, waitFor } from './helpers'
+import { openHost, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
+
+test.afterEach(closeContexts)
 
 const LOCAL = new URLSearchParams({ tracker: TRACKER_URL, ice: 'none' })
 

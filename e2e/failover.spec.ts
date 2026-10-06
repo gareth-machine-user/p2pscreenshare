@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
-import { hostSnapshot, openHost, openViewer, viewerSnapshot, waitFor } from './helpers'
+import { hostSnapshot, openHost, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
+
+test.afterEach(closeContexts)
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 

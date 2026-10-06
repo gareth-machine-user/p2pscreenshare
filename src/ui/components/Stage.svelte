@@ -37,8 +37,8 @@
   let fullscreen = $state(false)
 
   $effect(() => {
-    player?.setCanvas(canvas ?? null)
-    return () => player?.setCanvas(null)
+    if (!player || !canvas) return
+    return player.attach(canvas)
   })
 
   $effect(() => {

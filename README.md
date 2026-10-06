@@ -102,7 +102,14 @@ lobby page.
    for 4 s, and edges are only made between linked pairs. Encoders overshoot their target, so
    the publisher announces the stripe bitrate it actually sends. It never overloads its own
    uplink for a stripe that parity covers: it is the source of every stripe.
-7. **Applying changes.** The publisher tells the new parent `add-child` and the child `set-parent`
+7. **Several streams.** Anyone the owner allows may share. Each stream is a full-resolution
+   channel plus a 320×180, 5 fps preview channel (~120 kbps, a single tree). While two or more
+   streams are live, every viewer watches all previews in a tile rail and one full stream on the
+   stage; switching tiles shows the preview until the first full-resolution frame. The main
+   player's quality can be Auto (full, falling back to the preview if frames stop arriving), Full
+   or Preview. Presenters mix system audio and the microphone into one Opus track (WebAudio gain
+   nodes, so muting restarts nothing), and every stream starts muted for viewers.
+8. **Applying changes.** The publisher tells the new parent `add-child` and the child `set-parent`
    over their mesh links. Once the child reports `stripe-ok` from the new parent, the old parent
    gets `remove-child`.
 
@@ -124,9 +131,17 @@ relaying peer can't swap the DTLS fingerprints: every mesh link is authenticated
 DTLS encrypts every hop. Gossip records, chat messages and channel announcements are signed
 envelopes (`src/mesh/envelope.ts`) that any peer can verify and forward.
 
+**Publishing rights** (`src/mesh/auth.ts`). The owner signs one gossiped document holding the
+lobby's publish policy (`ask`, `open` = *Allow all*, `closed` = *Deny all*), grants bound to
+grantees' public keys, revocations and bans. Only the key pinned in the join code can change it,
+everyone (including later joiners) holds the latest version, and it keeps working while the owner
+is away. A member who may not publish asks the owner, who answers with **Allow**, **Allow all**,
+**Deny** or **Deny all**; stopping a stream from its tile revokes the grant.
+
 **Tamper-proofing.** Every media fragment is signed by its channel's publisher
 (`src/proto/signing.ts`), and the signature covers the channel id. Relays look up the publisher's
-key from the channel announcement and check that the publisher may publish (for now: the owner)
+key from the channel announcement and check that the publisher may publish (the owner, a granted
+key, or anyone under an open policy, unless revoked)
 before forwarding or playing a fragment, and fail closed. Forged fragments are dropped without
 marking their id as seen, so they can't shadow the genuine fragment, and signed fragments older
 than the 5 s de-dup window are dropped as replays. Tree commands for a channel are only accepted

@@ -59,8 +59,27 @@ export class Player {
     this.interval = setInterval(() => this.tick(), 50)
   }
 
+  /** Extra canvases drawing the same frames (a preview shows in its tile and on the stage). */
+  private extraCanvases = new Set<HTMLCanvasElement>()
+
   setCanvas(canvas: HTMLCanvasElement | null): void {
     this.canvas = canvas
+  }
+
+  /** Draws into another canvas too, starting with the last frame; returns a detach function. */
+  attach(canvas: HTMLCanvasElement): () => void {
+    this.extraCanvases.add(canvas)
+    if (this.lastRendered) this.draw(canvas, this.lastRendered)
+    return () => this.extraCanvases.delete(canvas)
+  }
+
+  private draw(c: HTMLCanvasElement, frame: VideoFrame): void {
+    if (document.hidden) return
+    if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) {
+      c.width = frame.displayWidth
+      c.height = frame.displayHeight
+    }
+    c.getContext('2d')!.drawImage(frame, 0, 0)
   }
 
   setStreamInfo(info: StreamInfo, force = false): void {
@@ -149,14 +168,8 @@ export class Player {
 
     this.width = frame.displayWidth
     this.height = frame.displayHeight
-    const c = this.canvas
-    if (c && !document.hidden) {
-      if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) {
-        c.width = frame.displayWidth
-        c.height = frame.displayHeight
-      }
-      c.getContext('2d')!.drawImage(frame, 0, 0)
-    }
+    if (this.canvas) this.draw(this.canvas, frame)
+    for (const c of this.extraCanvases) this.draw(c, frame)
     this.lastRendered?.close()
     this.lastRendered = frame
   }

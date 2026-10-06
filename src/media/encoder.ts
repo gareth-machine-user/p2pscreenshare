@@ -57,6 +57,8 @@ async function pickConfig(width: number, height: number, o: VideoEncoderOptions)
 export class VideoPipeline {
   onFrame: (f: EncodedFrame) => void = () => {}
   onStreamInfo: (info: StreamInfo) => void = () => {}
+  /** Every captured (or idle-refreshed) frame, before encoding; valid only during the call. */
+  onRawFrame: (frame: VideoFrame) => void = () => {}
 
   private encoder: VideoEncoder | null = null
   private config: VideoEncoderConfig | null = null
@@ -74,9 +76,25 @@ export class VideoPipeline {
   framesDropped = 0
 
   constructor(
-    private track: MediaStreamTrack,
+    /** The capture track, or null for a pipeline fed with encodeExternal (the preview). */
+    private track: MediaStreamTrack | null,
     private opts: VideoEncoderOptions,
   ) {}
+
+  /** Encodes a frame produced elsewhere (closes it). */
+  async encodeExternal(frame: VideoFrame): Promise<void> {
+    if (this.stopped) {
+      frame.close()
+      return
+    }
+    try {
+      await this.encodeFrame(frame)
+    } catch (err) {
+      console.error('encode failed', err)
+    } finally {
+      frame.close()
+    }
+  }
 
   get codec(): string | null {
     return this.config?.codec ?? null
@@ -96,6 +114,7 @@ export class VideoPipeline {
   }
 
   async start(): Promise<void> {
+    if (!this.track) return
     this.reader = frameReader(this.track, this.opts.fps)
     // Screen capture only delivers frames when pixels change. Re-encode the last frame while idle so
     // stripes stay alive (silence means "dead parent" to viewers) and keyframes keep flowing.
@@ -120,6 +139,7 @@ export class VideoPipeline {
       }
       this.framesIn++
       try {
+        this.onRawFrame(frame)
         await this.encodeFrame(frame)
       } catch (err) {
         console.error('encode failed', err)

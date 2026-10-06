@@ -2,7 +2,7 @@
 // when storage is unavailable (private windows, blocked site data).
 
 export type SourceKind = 'screen' | 'window' | 'tab' | 'test'
-export type QualityPreset = 'auto' | '1080p' | '720p' | 'low'
+export type QualityPreset = 'auto' | '4k' | '2k' | '1080p-hi' | '1080p' | '720p' | 'low'
 export type ViewQuality = 'auto' | 'full' | 'preview'
 
 export interface ShareSettings {
@@ -34,11 +34,13 @@ export const DEFAULT_SETTINGS: Settings = {
 /** Bitrate and capture size for each quality preset. */
 export const QUALITY_PRESETS: Record<QualityPreset, { label: string; kbps: number; maxWidth: number; maxHeight: number }> = {
   auto: { label: 'Auto', kbps: 2500, maxWidth: 1920, maxHeight: 1080 },
+  '4k': { label: '4K (2160p)', kbps: 20000, maxWidth: 3840, maxHeight: 2160 },
+  '2k': { label: '2K (1440p)', kbps: 12000, maxWidth: 2560, maxHeight: 1440 },
+  '1080p-hi': { label: '1080p High', kbps: 8000, maxWidth: 1920, maxHeight: 1080 },
   '1080p': { label: '1080p', kbps: 4500, maxWidth: 1920, maxHeight: 1080 },
   '720p': { label: '720p', kbps: 2500, maxWidth: 1280, maxHeight: 720 },
   low: { label: 'Low', kbps: 900, maxWidth: 960, maxHeight: 540 },
-}
-
+};
 export function storageGet(key: string): string | null {
   try {
     return localStorage.getItem(key)

@@ -15,6 +15,7 @@
 // each other as `unreachable` in their records, and retry after 60 s with backoff to 10 min. The
 // pair stays in the lobby; planners just never make it a tree edge.
 import { Rendezvous } from '../net/bootstrap'
+import { emptyAuth, isBanned, type AuthDoc } from './auth'
 import { open, seal, type Envelope, type Typed } from './envelope'
 import type { PeerIdentity } from './identity'
 import { MeshConn } from './meshConn'
@@ -71,9 +72,10 @@ export interface ChatMessage {
 type MeshMsg =
   | { t: 'rec'; env: Envelope }
   | { t: 'recs'; envs: Envelope[] }
-  | { t: 'digest'; d: Digest }
+  | { t: 'digest'; d: Digest; a?: number }
   | { t: 'pull'; ids: string[] }
-  | { t: 'snapshot'; recs: Envelope[]; chat: Envelope[] }
+  | { t: 'snapshot'; recs: Envelope[]; chat: Envelope[]; auth?: Envelope | null }
+  | { t: 'auth'; env: Envelope }
   | { t: 'sig'; to: string; env: Envelope }
   | { t: 'chat'; env: Envelope }
   | { t: 'app'; m: unknown }
@@ -99,6 +101,8 @@ export class Mesh {
   readonly conns = new Map<string, MeshConn>()
   readonly detector = new FailureDetector(GONE_MS)
   chat: ChatMessage[] = []
+  /** The owner's latest signed decisions (publish policy, grants, revocations, bans). */
+  auth: AuthDoc = emptyAuth()
   trackersConnected = 0
   /** Joined: connected to at least one member, or started the lobby. */
   joined = false
@@ -116,10 +120,13 @@ export class Mesh {
   onBinary: (data: Uint8Array, from: string) => void = () => {}
   onBufferLow: () => void = () => {}
   onChat: (m: ChatMessage) => void = () => {}
+  /** The owner's decisions changed. */
+  onAuth: (doc: AuthDoc) => void = () => {}
   onChange: () => void = () => {}
 
   private self: MemberRecord
   private selfEnv: Envelope | null = null
+  private authEnv: Envelope | null = null
   private rendezvous: Rendezvous
   private chatEnvs: Envelope[] = []
   private chatSent: number[] = []
@@ -167,10 +174,19 @@ export class Mesh {
       this.onChange()
     }
     this.rendezvous.shouldAnswer = (id) => this.shouldAnswerDoor(id)
-    this.rendezvous.admit = (id) => !this.isBlocked(id)
+    this.rendezvous.admit = (id) => !this.isBlocked(id) && !this.isBannedPeer(id)
   }
 
   async start(): Promise<void> {
+    // The owner keeps its decisions across reloads.
+    if (this.selfId === this.ownerId) {
+      try {
+        const saved = localStorage.getItem(this.authStoreKey)
+        if (saved) await this.acceptAuth(JSON.parse(saved) as Envelope)
+      } catch {
+        // nothing saved, or storage unavailable
+      }
+    }
     await this.rendezvous.start()
     await this.publish()
     this.rendezvous.setSeeking(true)
@@ -251,6 +267,48 @@ export class Mesh {
 
   sendApp(to: string, m: unknown): boolean {
     return this.conns.get(to)?.sendCtl({ t: 'app', m }) ?? false
+  }
+
+  private get authStoreKey(): string {
+    return `p2pss:auth:${this.opts.joinCode}`
+  }
+
+  /** A peer's public key: from its signed record (or this peer's own). */
+  pubKeyOf(id: string): string | undefined {
+    return id === this.selfId ? this.opts.identity.pubKey : this.store.get(id)?.env.k
+  }
+
+  isBannedPeer(id: string): boolean {
+    return isBanned(this.auth, this.pubKeyOf(id))
+  }
+
+  /** Owner only: applies a change to the lobby's decisions, signs it and gossips it. */
+  async updateAuth(change: (doc: AuthDoc) => AuthDoc): Promise<void> {
+    if (this.selfId !== this.ownerId) throw new Error('only the owner decides')
+    const doc = change(this.auth)
+    if (doc === this.auth) return
+    const env = await seal(this.opts.identity, doc)
+    await this.acceptAuth(env)
+  }
+
+  private async acceptAuth(env: Envelope): Promise<void> {
+    const opened = await open<AuthDoc>(env, 'auth')
+    // Only the key pinned in the join code decides.
+    if (!opened || opened.author !== this.ownerId || opened.body.version <= this.auth.version) return
+    this.auth = opened.body
+    this.authEnv = env
+    if (this.selfId === this.ownerId) {
+      try {
+        localStorage.setItem(this.authStoreKey, JSON.stringify(env))
+      } catch {
+        // storage unavailable
+      }
+    }
+    for (const c of this.conns.values()) c.sendCtl({ t: 'auth', env })
+    // Kicked peers: close our links to them.
+    for (const c of [...this.conns.values()]) if (this.isBannedPeer(c.remoteId)) c.close()
+    this.onAuth(this.auth)
+    this.onChange()
   }
 
   /** Updates this peer's record and gossips it (coalesced). */
@@ -355,13 +413,14 @@ export class Mesh {
     if (this.selfEnv) conn.sendCtl({ t: 'rec', env: this.selfEnv })
     if (viaTracker) {
       // Door link: hand over everything we know, so the joiner can mesh in.
-      conn.sendCtl({ t: 'snapshot', recs: this.store.all().map((s) => s.env), chat: this.chatEnvs })
+      conn.sendCtl({ t: 'snapshot', recs: this.store.all().map((s) => s.env), chat: this.chatEnvs, auth: this.authEnv })
       this.rendezvous.setSeeking(false)
     } else if (this.chatEnvs.length) {
       // Recent chat, so messages sent while this pair was apart still arrive (deduplicated by id).
       conn.sendCtl({ t: 'snapshot', recs: [], chat: this.chatEnvs })
     }
-    conn.sendCtl({ t: 'digest', d: this.digest() })
+    if (this.authEnv) conn.sendCtl({ t: 'auth', env: this.authEnv })
+    conn.sendCtl({ t: 'digest', d: this.digest(), a: this.auth.version })
     this.onLinkOpen(id)
     this.onChange()
   }
@@ -397,6 +456,8 @@ export class Mesh {
 
   private shouldAnswerDoor(id: string): boolean {
     if (this.conns.get(id)?.isOpen || this.isBlocked(id)) return false
+    // A kicked peer is refused (its key is known from gossip once it was a member).
+    if (this.isBannedPeer(id)) return false
     // Joining, or cut off from everyone: answer the first offer.
     if (!this.joined || this.isolatedSince !== null) return this.pendingDoorAnswers === 0
     // Otherwise a door answers doors of a lower id it has no link to: that merges groups that
@@ -455,7 +516,7 @@ export class Mesh {
     for (const rec of this.members()) {
       if (connecting >= CONNECT_BATCH) break
       const id = rec.id
-      if (this.conns.has(id)) continue
+      if (this.conns.has(id) || this.isBannedPeer(id)) continue
       const r = this.retry.get(id)
       if (r && now < r.at) continue
       connecting++
@@ -529,7 +590,7 @@ export class Mesh {
     const key = `${b.from}:${b.kind}:${b.nonce}`
     if (this.seenNonces.has(key)) return
     this.seenNonces.set(key, performance.now())
-    if (this.isBlocked(b.from) || this.left) return
+    if (this.isBlocked(b.from) || this.isBannedPeer(b.from) || this.left) return
 
     if (b.kind === 'knock') {
       if (this.selfId < b.from && !this.conns.get(b.from)?.isOpen) {
@@ -573,7 +634,7 @@ export class Mesh {
   private exchangeDigest(): void {
     const open = [...this.conns.values()].filter((c) => c.isOpen)
     if (!open.length) return
-    open[Math.floor(Math.random() * open.length)].sendCtl({ t: 'digest', d: this.digest() })
+    open[Math.floor(Math.random() * open.length)].sendCtl({ t: 'digest', d: this.digest(), a: this.auth.version })
   }
 
   private async acceptRecord(env: Envelope): Promise<void> {
@@ -673,6 +734,10 @@ export class Mesh {
 
   private handle(msg: MeshMsg, from: string, conn: MeshConn): void {
     if (this.conns.get(from) !== conn) return
+    if (msg.t !== 'auth' && msg.t !== 'snapshot' && this.isBannedPeer(from)) {
+      conn.close()
+      return
+    }
     this.detector.heard(from, performance.now())
     switch (msg.t) {
       case 'rec':
@@ -682,8 +747,12 @@ export class Mesh {
         for (const env of msg.envs ?? []) void this.acceptRecord(env)
         break
       case 'snapshot':
+        if (msg.auth) void this.acceptAuth(msg.auth)
         for (const env of msg.recs ?? []) void this.acceptRecord(env)
         for (const env of msg.chat ?? []) void this.onChatEnv(env, from)
+        break
+      case 'auth':
+        void this.acceptAuth(msg.env)
         break
       case 'digest': {
         const { pull, push } = this.store.compare(msg.d ?? {})
@@ -694,6 +763,7 @@ export class Mesh {
         if (envs.length) conn.sendCtl({ t: 'recs', envs })
         const want = pull.filter((id) => id !== this.selfId)
         if (want.length) conn.sendCtl({ t: 'pull', ids: want })
+        if (this.authEnv && (msg.a ?? 0) < this.auth.version) conn.sendCtl({ t: 'auth', env: this.authEnv })
         break
       }
       case 'pull': {
