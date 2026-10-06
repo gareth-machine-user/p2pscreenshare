@@ -16,7 +16,19 @@ import { RateWindow, round1 } from './rates'
 import type { RelayNode } from '../relay/relayNode'
 import { emptyTopology, subtree, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
-import { defaultPlannerConfig, LATE_PARENT_AVOID_MS, LateParentTracker, REATTACH_BATCH_MS, type LatenessSample } from '../topology/policy'
+import {
+  blameInput,
+  childStripeEvidence,
+  ComplaintLog,
+  defaultPlannerConfig,
+  KeyframeGate,
+  LATE_PARENT_AVOID_MS,
+  LateParentTracker,
+  REATTACH_BATCH_MS,
+  shouldBlameParent,
+  type LatenessSample,
+  type StatsSnapshot,
+} from '../topology/policy'
 import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
 import { after, every } from '../net/ticker'
 import { tuning } from '../tuning'
@@ -68,11 +80,6 @@ const LIVENESS_TIMEOUT_MS = 1200
 /** A peer that failed a liveness ping stays out of the plan this long (or until it answers again). */
 const SUSPECT_HOLD_MS = 3000
 const TOPOLOGY_REPORT_MS = 3000
-/**
- * Keyframe requests from subscribers are honoured at most this often. (Each subscriber also
- * throttles its own requests, to one per 500 ms, in subscription.ts.)
- */
-const KEY_REQUEST_MIN_INTERVAL_MS = 300
 /** Capture and encoding frame rate of the full channel. */
 const CAPTURE_FPS = 30
 /** Congestion control never takes the encoder below this, and moves it in these steps (kbps). */
@@ -93,6 +100,8 @@ export interface ChannelSubscriber {
   /** When it subscribed (newcomers stay leaves for a few seconds). */
   joinedAt: number
   stats: SubscriberStats | null
+  /** When `stats` arrived. */
+  statsAt: number
   /** Recent failures while acting as a parent (lowers rank), decaying. */
   failures: number
   /** Peers this subscriber should not be linked to on this channel, with expiry time. */
@@ -114,7 +123,10 @@ export class ChannelPublisher {
   private pendingRemovals = new Map<string, { oldParent: string; cancel: () => void }>()
   private replanTimer: (() => void) | null = null
   private timers: (() => void)[] = []
-  private lastKeyRequest = 0
+  /** Which subscribers' keyframe requests the encoder honours (one lossy viewer can't force many). */
+  private keyGate = new KeyframeGate()
+  /** Recent "parent forwards nothing" complaints, to corroborate each other. */
+  private complaints = new ComplaintLog()
   private lastPositions = new Map<string, string>()
   /** `${peer}:${stripe}` -> until when that peer's feed is known to be broken upstream. */
   private disruptedUntil = new Map<string, number>()
@@ -208,6 +220,8 @@ export class ChannelPublisher {
 
   emit(frame: EncodedFrame): void {
     if (this.stopped) return
+    // Requested or scheduled, a keyframe serves every subscriber waiting for one.
+    if (frame.key && !frame.audio) this.keyGate.onKeyframe(performance.now())
     const stripes = packetize(frame, this.k, this.m, this.id)
     stripes.forEach((frags, i) => {
       for (const raw of frags) this.stripeBytes[i] = (this.stripeBytes[i] ?? 0) + raw.byteLength
@@ -235,6 +249,7 @@ export class ChannelPublisher {
           id: from,
           joinedAt: performance.now(),
           stats: null,
+          statsAt: 0,
           failures: 0,
           avoid: new Map(),
           active: false,
@@ -260,6 +275,7 @@ export class ChannelPublisher {
     switch (msg.t) {
       case 'stats':
         sub.stats = msg.stats
+        sub.statsAt = performance.now()
         break
       case 'stripe-ok':
         this.completeRemoval(from, msg.stripe, msg.parent)
@@ -267,14 +283,9 @@ export class ChannelPublisher {
       case 'reattach':
         this.queueReattach(from, msg.stripe, msg.linkOpen)
         return
-      case 'need-key': {
-        const now = performance.now()
-        if (now - this.lastKeyRequest > KEY_REQUEST_MIN_INTERVAL_MS) {
-          this.lastKeyRequest = now
-          this.requestKeyframe()
-        }
+      case 'need-key':
+        if (this.keyGate.request(from, performance.now())) this.requestKeyframe()
         return
-      }
       case 'topo-req':
         if (msg.on) {
           this.topoWatchers.add(from)
@@ -293,6 +304,8 @@ export class ChannelPublisher {
     if (!sub) return
     this.deactivate(sub)
     this.subscribers.delete(id)
+    this.keyGate.forget(id)
+    this.complaints.forget(id)
     this.topoWatchers.delete(id)
     this.lastPositions.delete(id)
     this.scheduleReplan(0)
@@ -364,7 +377,8 @@ export class ChannelPublisher {
     batch.sort((a, b) => depth(a) - depth(b))
     const now = performance.now()
     let changed = false
-    const suspects = new Set<string>()
+    /** linkOpen complaints about relays, judged once the whole batch is known. */
+    const accused: { child: string; parent: string; stripe: number; now: number }[] = []
     for (const { child, stripe, linkOpen } of batch) {
       const sub = this.subscribers.get(child)
       if (!sub?.active) continue
@@ -375,20 +389,49 @@ export class ChannelPublisher {
       // This child's feed is broken, and everything below it is going silent as well.
       this.markSubtreeDisrupted(child, stripe, true)
       if (parent && parent !== this.ctx.selfId) {
-        // Link up but nothing forwarded: the parent is unreliable (rank it lower).
+        // Link up but nothing forwarded: the parent may be unreliable (judged below).
         // Link not up: this pair can't connect (avoid it for longer).
         // Either way, pick a different parent for this stripe.
-        const pp = this.subscribers.get(parent)
-        if (linkOpen && pp) {
-          pp.failures++
-          suspects.add(parent)
-        }
+        if (linkOpen && this.subscribers.has(parent)) accused.push({ child, parent, stripe, now })
         sub.avoid.set(parent, now + (linkOpen ? SILENT_PARENT_AVOID_MS : LINK_FAILED_AVOID_MS))
       }
       changed = true
     }
+    const suspects = this.judgeParents(accused)
     if (changed) this.scheduleReplan(0)
     for (const p of suspects) void this.checkAlive(p)
+  }
+
+  /**
+   * One child's complaint lowers a relay's rank for everyone, so it must not come from the child's
+   * own bad downlink: a parent is blamed only on corroboration (shouldBlameParent). Returns the
+   * blamed parents, to be pinged.
+   */
+  private judgeParents(accused: { child: string; parent: string; stripe: number; now: number }[]): Set<string> {
+    const freshMs = tuning.stripeSilenceMs / 2
+    const snapshot = (id: string): StatsSnapshot | null => {
+      const sub = this.subscribers.get(id)
+      return sub?.stats ? { at: sub.statsAt, stripes: sub.stats.stripes } : null
+    }
+    const now = performance.now()
+    // Record the whole batch first: a child complaining about several parents at once is its own
+    // downlink's fault, and siblings in the same batch corroborate each other.
+    const batch = [...this.complaints.recent(now), ...accused.map((c) => ({ ...c, at: c.now, excused: false }))]
+    for (const c of accused) {
+      const input = blameInput(c, snapshot(c.child), snapshot(c.parent), batch, freshMs)
+      const excused = input.parentFeedStale || childStripeEvidence(c, snapshot(c.child), batch, freshMs) === 'stale'
+      this.complaints.add({ ...c, at: c.now, excused })
+    }
+    const recent = this.complaints.recent(now)
+    const blamed = new Set<string>()
+    for (const c of accused) {
+      const pp = this.subscribers.get(c.parent)
+      if (!pp || !shouldBlameParent(blameInput(c, snapshot(c.child), snapshot(c.parent), recent, freshMs))) continue
+      // The parent is unreliable: rank it lower, and check that it's still there.
+      pp.failures++
+      blamed.add(c.parent)
+    }
+    return blamed
   }
 
   /**
