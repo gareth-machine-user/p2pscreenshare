@@ -63,6 +63,11 @@ export interface CongestionConfig {
   sameCeiling: number
   /** The hint expires after this long clean (ms), or three probe gaps if longer. */
   hintTtlMs: number
+  /**
+   * The first climb after a hint expires: gentler than `up`, since the ceiling may well still be
+   * there (a full +25% would overshoot it). Later climbs use `up` again.
+   */
+  upAfterExpiry: number
   /** Smoothing of the other-traffic estimate (weight of the newest clean sample)... */
   otherAlpha: number
   /**
@@ -93,6 +98,7 @@ export const CONGESTION_DEFAULTS: CongestionConfig = {
   probeGapMaxMs: 40_000,
   sameCeiling: 0.15,
   hintTtlMs: 60_000,
+  upAfterExpiry: 1.08,
   otherAlpha: 0.3,
   quietQueueMs: 100,
 }
@@ -158,6 +164,8 @@ export class CongestionController {
   private lastFull: { at: number; queueMs: number; drops: number; sent: number } | null = null
   /** Current gap between probes above the hint (doubles each time the same ceiling is hit). */
   private probeGapMs: number
+  /** A hint just expired: the next climb is gentle (upAfterExpiry). */
+  private gentleNext = false
 
   constructor(readonly cfg: CongestionConfig = CONGESTION_DEFAULTS) {
     this.probeGapMs = cfg.probeGapMs
@@ -229,14 +237,18 @@ export class CongestionController {
     if (this.hint && this.quietSince !== null && s.now - this.quietSince >= Math.max(c.hintTtlMs, 3 * this.probeGapMs)) {
       this.hint = null
       this.probeGapMs = c.probeGapMs
+      this.gentleNext = true
     }
     if (s.currentKbps >= s.maxKbps || s.now - cleanSince < c.upAfterMs || s.now - this.lastUp < c.upAfterMs) return null
     let target: number
     let why: string
     const hint = this.hint
     if (!hint) {
-      target = s.currentKbps * c.up
-      why = 'no congestion for 5 s'
+      // Only while the queue is near-empty: a small overshoot shows up as a growing queue well
+      // before it counts as congestion, and climbing again on top of it would compound it.
+      if (!quiet) return null
+      target = s.currentKbps * (this.gentleNext ? c.upAfterExpiry : c.up)
+      why = this.gentleNext ? 'no congestion for a while, trying a little higher' : 'no congestion for 5 s'
     } else if (s.currentKbps < hint.kbps * c.resumeShare - MIN_CHANGE_KBPS) {
       target = Math.min(hint.kbps * c.resumeShare, s.currentKbps * c.resumeMaxStep)
       why = `back towards ${mbps(hint.kbps)}, where the uplink filled`
@@ -250,6 +262,7 @@ export class CongestionController {
     if (target - s.currentKbps < MIN_CHANGE_KBPS && target < s.maxKbps) return null
     if (target <= s.currentKbps) return null
     this.lastUp = s.now
+    this.gentleNext = false
     return { kbps: target, reason: why }
   }
 }
