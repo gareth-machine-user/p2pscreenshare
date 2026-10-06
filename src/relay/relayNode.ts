@@ -22,6 +22,15 @@ interface StripeCache {
   bytes: number
 }
 
+/**
+ * Whether (epoch, gopId) comes after the cached GOP. Epochs (u16) and gopIds (u32 frame seqs,
+ * continuing across epochs) are compared as serial numbers, so wraparound is handled.
+ */
+function gopNewer(epoch: number, gopId: number, c: StripeCache): boolean {
+  if (epoch !== c.epoch) return ((epoch - c.epoch) & 0xffff) < 0x8000
+  return gopId !== c.gopId && (gopId - c.gopId) >>> 0 < 0x80000000
+}
+
 /** A (channel, stripe) pair: one tree. */
 export const treeKey = (channel: number, stripe: number) => `${channel >>> 0}:${stripe}`
 
@@ -179,7 +188,9 @@ export class RelayNode {
   private cache(key: string, epoch: number, gopId: number, raw: Uint8Array): void {
     let c = this.caches.get(key)
     const startsGop = peekIsKey(raw)
-    if (!c || (startsGop && (gopId !== c.gopId || epoch !== c.epoch))) {
+    // Only a newer GOP replaces the cache: an older keyframe can still arrive late (unordered
+    // channel, async verification) and must not evict the current GOP.
+    if (!c || (startsGop && gopNewer(epoch, gopId, c))) {
       if (!startsGop && !c) return // wait for a keyframe to start caching
       c = { gopId, epoch, frags: [], bytes: 0 }
       this.caches.set(key, c)

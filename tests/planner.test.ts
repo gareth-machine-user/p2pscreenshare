@@ -31,26 +31,35 @@ function makePeers(n: number, seed = 7): PlannerPeer[] {
   }))
 }
 
-function checkInvariants(r: PlanResult, peers: PlannerPeer[], cfg: PlannerConfig) {
+/**
+ * Structural invariants. Every attachment hangs off a relay homed in that stripe and its parent
+ * chain reaches the host (no cycles, no dead branches); every peer receives at least k stripes, or
+ * every stripe with `allStripes` (no parity shedding expected).
+ */
+function checkInvariants(r: PlanResult, peers: PlannerPeer[], cfg: PlannerConfig, allStripes = true) {
   const S = cfg.k + cfg.m
   for (const p of peers) {
     const ps = r.topology.parents[p.id]
     expect(ps).toHaveLength(S)
+    let live = 0
     for (let s = 0; s < S; s++) {
       const parent = ps[s]
-      // every peer receives every stripe
-      expect(parent).not.toBeNull()
+      if (allStripes) expect(parent, `${p.id} stripe ${s}`).not.toBeNull()
+      if (parent === null) continue
       // a non-host parent must be a relay homed in that stripe
-      if (parent !== HOST) expect(r.topology.home[parent!]).toBe(s)
-      // walking up reaches the host (no cycles)
+      if (parent !== HOST) expect(r.topology.home[parent]).toBe(s)
+      // walking up reaches the host (no cycles, no unattached ancestor)
       let cur: string | null = p.id
       const seen = new Set<string>()
       while (cur !== HOST) {
+        expect(cur, `${p.id} stripe ${s}: chain breaks`).not.toBeNull()
         expect(seen.has(cur!)).toBe(false)
         seen.add(cur!)
         cur = r.topology.parents[cur!][s]
       }
+      live++
     }
+    expect(live, `${p.id} live stripes`).toBeGreaterThanOrEqual(cfg.k)
   }
   // fan-out within capacity when there is no overcommit
   if (r.overcommitted === 0) {
@@ -231,5 +240,48 @@ describe('planner', () => {
     expect(rootKids(1)).toBeLessThanOrEqual(1)
     // ...and everyone still gets at least k stripes.
     for (const p of peers) expect(r.topology.parents[p.id].filter((x) => x !== null).length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('never sheds a relay from the stripe it feeds its children', () => {
+    // D relays stripe 2 off an overcommitted root; shedding D's stripe 2 would strand L there.
+    const cfg = config({ k: 2, m: 1, rootSlots: 3, maxFanout: 8 })
+    const P = (id: string, slots: number, joinedAt: number, avoid: string[] = []): PlannerPeer => ({
+      id,
+      slots,
+      joinedAt,
+      failures: 0,
+      avoid,
+    })
+    const peers = [P('A', 8, 0), P('B', 8, 1), P('C', 4, 2), P('D', 3, 3, ['C']), P('L', 0, 4, ['B', 'C'])]
+    const r = plan(peers, emptyTopology(), cfg, 1000)
+    checkInvariants(r, peers, cfg, false)
+    const d = r.topology.home.D!
+    expect(r.topology.parents.D[d]).not.toBeNull()
+  })
+
+  it('keeps its invariants on random inputs', () => {
+    for (let seed = 1; seed <= 300; seed++) {
+      let x = seed
+      const rnd = () => ((x = (x * 1103515245 + 12345) >>> 0) / 2 ** 32)
+      const int = (n: number) => Math.floor(rnd() * n)
+      const k = 1 + int(3)
+      const m = int(3)
+      const cfg = config({ k, m, rootSlots: k + m + int(4), maxFanout: 2 + int(8), switchGain: 1 })
+      const n = 1 + int(25)
+      const ids = Array.from({ length: n }, (_, i) => `p${i}`)
+      const peers: PlannerPeer[] = ids.map((id, i) => ({
+        id,
+        slots: int(3) === 0 ? 0 : int(10),
+        joinedAt: i,
+        failures: int(3),
+        avoid: ids.filter((o) => o !== id && rnd() < 0.15),
+      }))
+      const r1 = plan(peers, emptyTopology(), cfg, 1000)
+      checkInvariants(r1, peers, cfg, false)
+      // Replan after some churn on top of the previous topology.
+      const next = peers.filter(() => rnd() > 0.2)
+      const r2 = plan(next, r1.topology, cfg, 2000)
+      checkInvariants(r2, next, cfg, false)
+    }
   })
 })

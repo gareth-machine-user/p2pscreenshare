@@ -198,10 +198,21 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
 
   // 5. Shed root overcommit where parity allows. The publisher's uplink carries every stripe, so
   // overloading it delays all of them for everyone; a peer that still gets k other stripes just
-  // decodes from those. (Newest attachments go first.)
+  // decodes from those. (Newest attachments go first.) A relay keeps its home stripe: its children
+  // there depend on it. Only stripes whose parent chain reaches the root count as received.
+  const reachesRoot = (id: string, s: number): boolean => {
+    let cur: string | null = id
+    for (let i = 0; i <= peers.length && cur !== null; i++) {
+      if (cur === cfg.hostId) return true
+      cur = parents[cur]?.[s] ?? null
+    }
+    return false
+  }
   for (const { peer, stripe } of rootOver.reverse()) {
-    const attached = parents[peer].filter((x) => x !== null).length
-    if (attached > cfg.k) {
+    if (home[peer] === stripe) continue
+    let live = 0
+    for (let s = 0; s < S; s++) if (reachesRoot(peer, s)) live++
+    if (live > cfg.k) {
       parents[peer][stripe] = null
       depth[peer][stripe] = 0
       overcommitted--
