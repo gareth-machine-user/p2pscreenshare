@@ -236,7 +236,13 @@
       clamp: c ? clampText(c) : null,
       kicked: session.kicked,
       uploading: session.publishing
-        ? uploadBadge({ sendKbps: session.liveRates().sendKbps, full: !!session.uplinkFull, clamp: c ? clampText(c) : null, ccReason: session.ccReason })
+        ? uploadBadge({
+            sendKbps: session.liveRates().sendKbps,
+            full: !!session.uplinkFull,
+            clamp: c ? clampText(c) : null,
+            ccReason: session.ccReason,
+            local: session.localLoad,
+          })
         : null,
     }
   })

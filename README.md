@@ -484,13 +484,27 @@ Rate control, in both profiles:
   Congested over a flat RTT is the connections' own ceiling (each SCTP association's congestion
   window, or a slow receiver): lanes absorb it, and the bitrate isn't cut. Routers with
   fq_codel/SQM keep queues short, so a full link there shows drops instead: heavy drops (≥ 10
-  fragments/s) to most peers count whatever the RTT. A congested peer with no RTT signal (stale
+  fragments/s) to most peers count whatever the RTT, on peers that are congested (on most of their
+  connections: one lane's drops are that connection's). A congested peer with no RTT signal (stale
   for 8 s, or fewer than 3 samples) counts as before, on congestion alone. With a single peer, a
   bottleneck anywhere on its path (your uplink or its downlink) cuts, as nobody else is being
   sent to. Under the debug upload cap (`up=`), the token bucket stands in for the router: sending
   at 85% of the cap or more counts as a queueing path. One slow viewer congests just its own
   link, which sheds enhancement frames for that viewer alone (and its Auto quality can fall back
-  to the preview); viewers' own losses don't move the bitrate either. When full, it settles just below what the uplink actually carried instead of halving
+  to the preview); viewers' own losses don't move the bitrate either. A **stalled connection**
+  isn't congestion either: one whose send buffer stopped draining for 750 ms (`STALL_MS` in
+  `net/uplink.ts`). That is an SCTP association stuck in loss recovery by retransmission timeout
+  (≥ ~400 ms, doubling), typically after a burst overflowed the connection's 64 KB UDP socket
+  buffer in Chromium; the whole association delivers nothing meanwhile, while its path RTT stays
+  flat. Its stripes, and what already waits for it, move to another of the pair's connections until
+  it drains again (`Mesh.mediaLinkFor`), and its drops and queueing (for the window and the
+  backlog's lifetime after) don't count towards congestion (the Peers panel marks it *stalled*).
+  Media channels buffer at most 64 KiB (`LINK_BUFFER_HIGH`) so bursts stay small enough not to
+  cause such stalls (`e2e/diag-sctp.spec.ts` measures it). Nor is **this computer being
+  overloaded**: a window in which the page's main thread stalled for 400 ms or more doesn't count
+  as a full uplink unless path RTTs are inflated, and the presenter's upload badge says the
+  computer can't keep up (the page stalled, or the encoder drops frames) rather than blaming the
+  network. When full, it settles just below what the uplink actually carried instead of halving
   (`session/congestion.ts`): what was sent while congested, minus the uplink's other traffic
   (measured while uncongested: the preview, relayed channels), converted from wire to video
   bitrate with the stripe overhead (one stripe copy per direct child, `stripeKbpsFor`), gives the
@@ -565,7 +579,8 @@ The unit tests (`tests/`) cover:
 - the mesh and security: gossip and failure detection, lobby codes, publish rights, fragment
   signing
 - per-link stats: parsing Chrome and Firefox `getStats()` shapes, RTT baseline and staleness,
-  path inflation; the uplink-full rule (inflated, flat, unknown RTT, heavy drops, single peer)
+  path inflation; the uplink-full rule (inflated, flat, unknown RTT, heavy drops, single peer,
+  stalled lanes); stall detection and rerouting
 - the UI's pure logic: routes and URL parameters, stored settings, share options and stage
   messages, live rate formatting
 
@@ -588,6 +603,17 @@ The e2e suite covers:
 - a single tree: orphans recover within a few seconds, and a late joiner renders in under about 1 s
 - a depth-3 tree, killing the top relay: everyone resumes, the healthy mid-level relays aren't
   blamed by their own children, and a departed leaf is pruned from its parent at once
+
+Opt-in diagnostics (skipped unless `E2E_DIAG=1`): `e2e/diag-congestion.spec.ts` streams from a
+presenter to one viewer on this machine with no upload cap, at a quality preset (`DIAG_PRESET`:
+`ultra`, `hi`, `4k`, `auto`) and a test pattern that keeps the encoder at its full bitrate
+(`pattern=busy`, or `bursty` for a mostly still screen), and prints a per-second timeline of what
+the congestion controller sees and does (bitrate, uplink-full signal, per-lane queueing, drops,
+send buffers, `packetsDiscardedOnSend`, path RTTs, main-thread lag on both pages);
+`DIAG_STALL=lane,ms,every` emulates SCTP association stalls and `DIAG_BLOCK=ms,every` a busy main
+thread. `tools/diag-tabs.ts` runs the same with the presenter's (or viewer's) tab really in the
+background (raw CDP under a display, e.g. `xvfb-run`: Playwright keeps every page visible).
+`e2e/diag-sctp.spec.ts` measures whether a deep send buffer stalls a bare SCTP association.
 
 `up=<kbps>` shapes a page's real uplink (publisher included), so e2e scenarios must be feasible:
 the publisher only plans its own budget, but an overcommitted plan genuinely queues. On a slow

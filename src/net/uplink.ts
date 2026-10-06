@@ -1,4 +1,4 @@
-import { LINK_BUFFER_HIGH, type MediaLink } from './link'
+import { LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type MediaLink } from './link'
 import { tuning } from '../tuning'
 
 // Per-layer queueing deadlines (see tuning.ts): when the uplink can't keep up, enhancement layers
@@ -7,6 +7,15 @@ import { tuning } from '../tuning'
 const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
 /** Replays and probe data are sent only while the channel's send buffer holds less than this (bytes). */
 export const REPLAY_BUFFER_MAX = 64 * 1024
+
+/**
+ * A connection whose send buffer holds more than LINK_BUFFER_LOW and hasn't drained a byte for this
+ * long is stalled (ms). A path at any rate drains something every round trip; what stops a whole
+ * SCTP association instead is loss recovery by retransmission timeout (Chromium's minimum is
+ * ~400 ms, doubling on each repeat), e.g. after a burst overflowed the connection's 64 KB UDP
+ * socket buffer. A stall is that connection's, not a full uplink: it isn't congestion.
+ */
+export const STALL_MS = 750
 
 /** Layers beyond the table (none on the wire: the layer is 2 bits) get the last entry's deadline. */
 function maxAgeForLayer(layer: number): number {
@@ -33,6 +42,10 @@ export interface LinkCounters {
   queueDelaySum: number
   queueDelayN: number
   stalls: number
+  /** When the link was last seen stalled (STALL_MS without draining), or -Infinity. */
+  lastStallAt: number
+  /** Stall episodes (each STALL_MS or longer). */
+  stallEpisodes: number
 }
 
 export interface UplinkStats {
@@ -102,14 +115,48 @@ export class Uplink {
    * receiver (its downlink or path) congests only its own link.
    */
   readonly perLink = new Map<MediaLink, LinkCounters>()
+  /** Per link: its send buffer as last seen (plus what was sent into it since), and when it last drained. */
+  private progress = new Map<MediaLink, { buffered: number; at: number; stalled: boolean }>()
 
   private counters(link: MediaLink): LinkCounters {
     let c = this.perLink.get(link)
     if (!c) {
-      c = { sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0 }
+      c = { sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0, lastStallAt: -Infinity, stallEpisodes: 0 }
       this.perLink.set(link, c)
     }
     return c
+  }
+
+  /**
+   * How long (ms) `link`'s send buffer has held more than LINK_BUFFER_LOW without draining; 0 while
+   * it drains or is nearly empty. Every call is an observation: callers that pick links (the
+   * relay, on every fragment) keep it current. At STALL_MS or more the link is stalled.
+   */
+  stalledMs(link: MediaLink, now = performance.now()): number {
+    const b = link.isOpen ? link.bufferedAmount : 0
+    const p = this.progress.get(link)
+    if (!p) {
+      this.progress.set(link, { buffered: b, at: now, stalled: false })
+      return 0
+    }
+    if (b <= LINK_BUFFER_LOW || b < p.buffered) {
+      p.at = now
+      p.stalled = false
+    }
+    p.buffered = b
+    const ms = now - p.at
+    if (ms >= STALL_MS) {
+      const c = this.counters(link)
+      c.lastStallAt = now
+      if (!p.stalled) c.stallEpisodes++
+      p.stalled = true
+    }
+    return ms
+  }
+
+  /** Whether `link` is stalled (see stalledMs). */
+  isStalled(link: MediaLink, now = performance.now()): boolean {
+    return this.stalledMs(link, now) >= STALL_MS
   }
 
   /**
@@ -146,6 +193,23 @@ export class Uplink {
     this.drain()
   }
 
+  /**
+   * Moves what waits for `from` (live media and replays, not background) to `to`, merged by queueing
+   * time: `from` stalled, and its stripes now go over `to`.
+   */
+  moveQueued(from: MediaLink, to: MediaLink): void {
+    const src = this.queues.get(from)
+    if (!src?.length || from === to || this.background.has(from) || this.background.has(to)) return
+    const dst = this.queues.get(to) ?? []
+    this.queues.set(to, dst)
+    // Live before replays, each in queueing order (as send() keeps them).
+    const merged = [...dst, ...src].sort((a, b) => Number(a.replay) - Number(b.replay) || a.enqueuedAt - b.enqueuedAt)
+    dst.length = 0
+    dst.push(...merged)
+    src.length = 0
+    this.drain()
+  }
+
   /** Items waiting for one link. */
   queued(link: MediaLink): number {
     return this.queues.get(link)?.length ?? 0
@@ -158,6 +222,7 @@ export class Uplink {
     this.background.delete(link)
     this.deadFrames.delete(link)
     this.perLink.delete(link)
+    this.progress.delete(link)
   }
 
   /** Called when a link's send buffer drains. */
@@ -201,7 +266,10 @@ export class Uplink {
         q.length = kept
         if (kept && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) {
           this.stats.bufferStalls++
-          if (!bg) this.counters(link).stalls++
+          if (!bg) {
+            this.counters(link).stalls++
+            this.stalledMs(link, now)
+          }
         }
       }
       let progress = true
@@ -245,6 +313,9 @@ export class Uplink {
           q.shift()
           this.stats.queuedBytes -= it.data.byteLength
           if (link.send(it.data)) {
+            // What went into the buffer isn't drained by the next look at it.
+            const p = this.progress.get(link)
+            if (p) p.buffered += it.data.byteLength
             this.tokens -= it.data.byteLength
             this.stats.sentBytes += it.data.byteLength
             this.stats.sentItems++

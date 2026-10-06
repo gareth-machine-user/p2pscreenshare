@@ -212,7 +212,8 @@ export const HEAVY_DROPS_PER_S = 10
  * baseline). Congested with a flat RTT is the connections' own ceiling (each SCTP association's
  * congestion window, or a slow receiver): media lanes absorb that, and a lower bitrate wouldn't
  * help the uplink. Routers with fq_codel/SQM keep queues short, so a full link there shows drops
- * rather than RTT growth: heavy drops to most peers count whatever the RTT. A congested peer
+ * rather than RTT growth: heavy drops to most peers count whatever the RTT (on peers that are
+ * congested, i.e. on most of their connections, not one stalled lane). A congested peer
  * without an RTT signal (stale or too little history) counts, as the plain majority rule.
  *
  * With a single peer, a bottleneck anywhere on the path (this uplink or that peer's downlink)
@@ -226,7 +227,9 @@ export function uplinkIsFull(peers: PeerLinkState[], share = 0.5, heavyDropsPerS
   if (counted.length / active > share) {
     return { congested: counted.length, active, signal: counted.some((p) => p.pathQueued === null) ? 'fallback' : 'rtt' }
   }
-  const lossy = peers.filter((p) => p.drops >= heavyDropsPerS).length
+  // Heavy drops count only on a peer most of whose connections are congested (peerLinkRates): one
+  // stalled or backed-up lane of several drops a lot without the uplink being full.
+  const lossy = peers.filter((p) => p.congested && p.drops >= heavyDropsPerS).length
   if (lossy / active > share) return { congested: lossy, active, signal: 'loss' }
   return null
 }

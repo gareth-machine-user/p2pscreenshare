@@ -18,10 +18,16 @@ const tasks = new Set<Task>()
 /** Stops the running base timer; null until started. */
 let stopBase: (() => void) | null = null
 
+/** The longest a due task waited for the main thread since the last takeMainThreadLag() (ms). */
+let maxLagMs = 0
+
 function run(): void {
   const now = performance.now()
   for (const t of [...tasks]) {
     if (now < t.due) continue
+    // The worker ticks every 50 ms whatever the tab's state: a task much later than that waited
+    // for the main thread (a long task, GC, an overloaded machine).
+    maxLagMs = Math.max(maxLagMs, now - t.due - BASE_MS)
     if (t.every > 0) t.due = now + t.every
     else tasks.delete(t)
     try {
@@ -80,6 +86,16 @@ export function sleepPrecise(ms: number): Promise<void> {
     const t = setTimeout(done, ms)
     const cancel = after(ms, done)
   })
+}
+
+/**
+ * How long the main thread was unavailable at worst since the last call (ms, beyond the ticker's
+ * own 50 ms resolution): the page stalled. Resets on each call.
+ */
+export function takeMainThreadLag(): number {
+  const lag = Math.max(0, maxLagMs)
+  maxLagMs = 0
+  return lag
 }
 
 /** Whether this page is hidden, so its main-thread timers may be throttled (false outside a browser). */

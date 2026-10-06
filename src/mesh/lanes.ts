@@ -330,6 +330,11 @@ export interface LaneSample {
   queueN: number
   /** This connection backed up (its own threshold test). */
   congested: boolean
+  /**
+   * The connection stalled in (or just before) the window (net/uplink.ts STALL_MS): its queueing
+   * and drops are the stall's, not congestion, so it doesn't vote on the peer's congestion.
+   */
+  stalled?: boolean
 }
 
 /** One link's live-media counter deltas over a stats window (uplink.ts LinkCounters). */
@@ -365,29 +370,45 @@ export function laneSample(
   return { peer, drops, queueSum, queueN, congested: drops > limits.dropsPerS || queueMs > limits.queueMs }
 }
 
+/** One peer's link rates (peerLinkRates). */
+export interface PeerLinkRate {
+  /** Drops/s and average queueing (ms) over the connections that didn't stall. */
+  drops: number
+  queueMs: number
+  congested: boolean
+  /** Some connection to the peer stalled (its numbers are left out of the above). */
+  stalled: boolean
+}
+
 /**
  * Per-peer link rates from per-connection samples: drops add up, queueing averages over the
  * fragments sent, and a peer is congested only when most of its active connections are. One lane
  * backing up is that connection's ceiling (its congestion window), not the peer's, let alone the
- * uplink's: the stripes on its other lanes don't share it.
+ * uplink's: the stripes on its other lanes don't share it. A stalled connection doesn't count at
+ * all: its backlog and drops are the stall's (and its stripes move to another connection).
  */
-export function peerLinkRates(samples: LaneSample[]): Map<string, { drops: number; queueMs: number; congested: boolean }> {
-  const acc = new Map<string, { drops: number; qSum: number; qN: number; lanes: number; congested: number }>()
+export function peerLinkRates(samples: LaneSample[]): Map<string, PeerLinkRate> {
+  const acc = new Map<string, { drops: number; qSum: number; qN: number; lanes: number; congested: number; stalled: boolean }>()
   for (const s of samples) {
-    const p = acc.get(s.peer) ?? { drops: 0, qSum: 0, qN: 0, lanes: 0, congested: 0 }
+    const p = acc.get(s.peer) ?? { drops: 0, qSum: 0, qN: 0, lanes: 0, congested: 0, stalled: false }
+    acc.set(s.peer, p)
+    if (s.stalled) {
+      p.stalled = true
+      continue
+    }
     p.drops += s.drops
     p.qSum += s.queueSum
     p.qN += s.queueN
     p.lanes++
     if (s.congested) p.congested++
-    acc.set(s.peer, p)
   }
-  const out = new Map<string, { drops: number; queueMs: number; congested: boolean }>()
+  const out = new Map<string, PeerLinkRate>()
   for (const [peer, p] of acc) {
     out.set(peer, {
       drops: Math.round(p.drops * 10) / 10,
       queueMs: p.qN > 0 ? Math.round(p.qSum / p.qN) : 0,
-      congested: p.congested / p.lanes > 0.5,
+      congested: p.lanes > 0 && p.congested / p.lanes > 0.5,
+      stalled: p.stalled,
     })
   }
   return out

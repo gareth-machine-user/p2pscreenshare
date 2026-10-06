@@ -13,6 +13,7 @@ const row = (lane: number, o: Partial<LinkRow> = {}): LinkRow => ({
   queueMs: null,
   drops: null,
   congested: false,
+  stalled: false,
   relayed: false,
   cwnd: null,
   availableKbps: null,
@@ -77,5 +78,10 @@ describe('live rates', () => {
     const clamped = uploadBadge({ sendKbps: 900, full: false, clamp: 'Held at 1.0 Mbps: …', ccReason: null })
     expect(clamped).toMatchObject({ warn: true })
     expect(clamped.title).toContain('Held at 1.0 Mbps')
+    // This computer can't keep up: said so, and not blamed on the network.
+    const local = uploadBadge({ sendKbps: 900, full: false, clamp: null, ccReason: null, local: { stallMs: 800, encoderDroppedFps: 6 } })
+    expect(local.warn).toBe(true)
+    expect(local.title).toContain("Your computer can't keep up (the encoder is dropping 6 frames/s, the page stalled for 0.8 s)")
+    expect(local.title).not.toContain('congested')
   })
 })

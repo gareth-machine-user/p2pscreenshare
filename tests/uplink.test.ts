@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { LINK_BUFFER_HIGH, type LinkState, type MediaLink } from '../src/net/link'
-import { Uplink } from '../src/net/uplink'
+import { LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type LinkState, type MediaLink } from '../src/net/link'
+import { STALL_MS, Uplink } from '../src/net/uplink'
 import { tuning } from '../src/tuning'
 
 /** Every message any stub link sent, in order: [link name, first payload byte]. */
@@ -245,6 +245,84 @@ describe('Uplink scheduling', () => {
     u.send(a, msg(1), 0)
     u.kick()
     expect(u.stats.bufferStalls).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('Uplink stall detection', () => {
+  /** A link whose send buffer grows with what it is given, and drains only when told. */
+  class BufferLink extends StubLink {
+    send(data: Uint8Array): boolean {
+      this.bufferedAmount += data.byteLength
+      return super.send(data)
+    }
+  }
+
+  it('calls a link stalled when its buffer holds data and drains nothing for STALL_MS', () => {
+    const u = new Uplink()
+    const a = new BufferLink('a')
+    a.bufferedAmount = LINK_BUFFER_LOW + 1000
+    expect(u.stalledMs(a)).toBe(0)
+    vi.advanceTimersByTime(STALL_MS - 10)
+    expect(u.isStalled(a)).toBe(false)
+    vi.advanceTimersByTime(20)
+    expect(u.isStalled(a)).toBe(true)
+    expect(u.perLink.get(a)).toMatchObject({ stallEpisodes: 1 })
+    // One byte drained: it moves again.
+    a.bufferedAmount--
+    expect(u.isStalled(a)).toBe(false)
+    expect(u.stalledMs(a)).toBe(0)
+    // Stalls again later: a second episode.
+    vi.advanceTimersByTime(STALL_MS + 10)
+    expect(u.isStalled(a)).toBe(true)
+    expect(u.perLink.get(a)).toMatchObject({ stallEpisodes: 2, lastStallAt: performance.now() })
+  })
+
+  it('does not count what was just sent into the buffer as draining', () => {
+    const u = new Uplink()
+    const a = new BufferLink('a')
+    a.bufferedAmount = LINK_BUFFER_LOW + 1000
+    u.stalledMs(a)
+    vi.advanceTimersByTime(STALL_MS / 2)
+    // New fragments go in (the buffer has room below the high mark); none leave.
+    for (let i = 0; i < 3; i++) u.send(a, msg(i, 1000), 0)
+    expect(sentBy('a')).toHaveLength(3)
+    vi.advanceTimersByTime(STALL_MS / 2 + 10)
+    expect(u.isStalled(a)).toBe(true)
+  })
+
+  it('moves what waits for a stalled link to another, in queueing order, live before replays', () => {
+    const u = new Uplink()
+    const a = new StubLink('a')
+    const b = new StubLink('b')
+    a.block()
+    b.block()
+    u.send(a, msg(1), 0)
+    u.send(a, msg(2), 0, undefined, true)
+    vi.advanceTimersByTime(5)
+    u.send(b, msg(3), 0)
+    vi.advanceTimersByTime(5)
+    u.send(a, msg(4), 1)
+    u.moveQueued(a, b)
+    expect(u.queued(a)).toBe(0)
+    expect(u.queued(b)).toBe(4)
+    b.unblock()
+    u.kick()
+    expect(sentBy('b')).toEqual([1, 3, 4, 2])
+    expect(sentBy('a')).toEqual([])
+  })
+
+  it('never calls a nearly empty or closed link stalled', () => {
+    const u = new Uplink()
+    const a = new BufferLink('a')
+    a.bufferedAmount = LINK_BUFFER_LOW
+    u.stalledMs(a)
+    vi.advanceTimersByTime(10 * STALL_MS)
+    expect(u.isStalled(a)).toBe(false)
+    a.bufferedAmount = LINK_BUFFER_HIGH
+    u.stalledMs(a)
+    a.isOpen = false
+    vi.advanceTimersByTime(10 * STALL_MS)
+    expect(u.isStalled(a)).toBe(false)
   })
 })
 

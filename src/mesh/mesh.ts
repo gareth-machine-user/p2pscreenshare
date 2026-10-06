@@ -334,12 +334,30 @@ export class Mesh<C extends PeerConn = MeshConn> {
 
   /**
    * The link that carries `stripe` to `id`: one of the pair's media lanes when open, else the mesh
-   * link itself (see lanes.ts). Undefined without an open mesh link.
+   * link itself (see lanes.ts), unless that one is stalled. Undefined without an open mesh link.
    */
   mediaLinkFor(id: string, stripe: number): MediaLink | undefined {
     const c = this.linkFor(id)
-    return c ? this.lanes.linkFor(c, stripe) : undefined
+    if (!c) return undefined
+    const link = this.lanes.linkFor(c, stripe)
+    if (!this.isStalled(link)) return link
+    // Its connection is stuck: another of the pair's that isn't (until it drains again).
+    for (const { conn } of this.connectionsOf(id)) {
+      if (conn === link || !conn.isOpen || this.isStalled(conn)) continue
+      this.onReroute(link, conn)
+      return conn
+    }
+    return link
   }
+
+  /** A stripe's fragments moved from a stalled connection to `to` (the session moves what waits too). */
+  onReroute: (from: MediaLink, to: MediaLink) => void = () => {}
+
+  /**
+   * Whether a connection is stalled: its send buffer stopped draining (set by the session, from
+   * the uplink: net/uplink.ts stalledMs). A stalled connection's stripes go over another of the pair's.
+   */
+  isStalled: (link: MediaLink) => boolean = () => false
 
   /** Probe links to `id`: the mesh link's and each open lane's (parallel flows). */
   probeLinksFor(id: string): ProbeLink[] {

@@ -187,6 +187,34 @@ describe('stripe to lane mapping', () => {
     await until(() => b.laneCount(a.selfId) === 3, 1000, 'answerer lanes')
   })
 
+  it('moves a stalled connection’s stripes to another of the pair’s until it drains', async () => {
+    const lobby = await makeLobby([3, 3])
+    await startAll(lobby)
+    const [a, b] = lobby.meshes
+    await until(() => a.laneCount(b.selfId) === 3, 5000, 'lanes open')
+    const primary = a.linkFor(b.selfId)!
+    const [l1, l2] = lobby.net.openLanes(a.selfId, b.selfId).sort((x, y) => x.index - y.index)
+    const stalled = new Set<unknown>()
+    a.isStalled = (l) => stalled.has(l)
+    const moves: unknown[][] = []
+    a.onReroute = (from, to) => moves.push([from, to])
+    const map = () => [0, 1, 2].map((s) => a.mediaLinkFor(b.selfId, s))
+    // Lane 1 stalls: its stripe goes over the first connection that isn't (the mesh link).
+    stalled.add(l1)
+    expect(map()).toEqual([primary, primary, l2])
+    // What already waited for lane 1 follows its stripe.
+    expect(moves).toEqual([[l1, primary]])
+    // The mesh link stalls too: the next one that drains.
+    stalled.add(primary)
+    expect(map()).toEqual([l2, l2, l2])
+    // All of them stalled: each keeps its own (nowhere better to go).
+    stalled.add(l2)
+    expect(map()).toEqual([primary, l1, l2])
+    // Drained again: back to the usual mapping.
+    stalled.clear()
+    expect(map()).toEqual([primary, l1, l2])
+  })
+
   it('gives up on a pair whose lanes keep failing, after a few attempts with backoff', async () => {
     const lobby = await makeLobby([2, 2])
     lobby.net.blockLanes(lobby.ids[0].id, lobby.ids[1].id)
@@ -247,7 +275,7 @@ describe('lane congestion accounting', () => {
 
   it('counts a peer congested only when most of its lanes are', () => {
     const one = peerLinkRates([sample('a', true), sample('a', false)])
-    expect(one.get('a')).toEqual({ drops: 10, queueMs: 105, congested: false })
+    expect(one.get('a')).toEqual({ drops: 10, queueMs: 105, congested: false, stalled: false })
     expect(peerLinkRates([sample('a', true), sample('a', true)]).get('a')?.congested).toBe(true)
     expect(peerLinkRates([sample('a', true)]).get('a')?.congested).toBe(true)
     expect(peerLinkRates([sample('a', true), sample('a', true), sample('a', false), sample('a', false)]).get('a')?.congested).toBe(false)
@@ -268,6 +296,31 @@ describe('lane congestion accounting', () => {
     expect(laneSample('a', { sentItems: 0, sentBytes: 0, drops: 0, queueSum: 0, queueN: 0 }, 0, 2, limits)).toBeNull()
     // Per lane, then per peer: one backed-up lane of two is not the peer.
     expect(peerLinkRates([backed, empty]).get('a')?.congested).toBe(false)
+  })
+
+  it('leaves stalled connections out of the peer’s congestion, drops and queueing', () => {
+    const stalled = { ...sample('a', true), drops: 40, stalled: true }
+    // A stalled lane and a healthy one: the peer is fine (it was the stall, not congestion).
+    expect(peerLinkRates([stalled, sample('a', false)]).get('a')).toEqual({ drops: 0, queueMs: 10, congested: false, stalled: true })
+    // Only stalled lanes: nothing says the peer is congested.
+    expect(peerLinkRates([stalled]).get('a')).toEqual({ drops: 0, queueMs: 0, congested: false, stalled: true })
+    // A stalled lane with a congested one: the congested one decides.
+    expect(peerLinkRates([stalled, sample('a', true)]).get('a')?.congested).toBe(true)
+    const full = (xs: LaneSample[]) => uplinkIsFull([...peerLinkRates(xs).values()].map((r) => ({ ...r, pathQueued: false })))
+    expect(full([stalled, sample('a', false)])).toBeNull()
+  })
+
+  it('heavy drops on one lane of two are that connection’s, not a full uplink', () => {
+    // A lane dropping 40 fragments/s (its association stuck in loss recovery), the other clean,
+    // over a flat path RTT: the peer's drops add up past the heavy-loss mark, but most of its
+    // connections are fine.
+    const lossyLane = { ...sample('a', true), drops: 40 }
+    const rates = [...peerLinkRates([lossyLane, sample('a', false)]).values()].map((r) => ({ ...r, pathQueued: false }))
+    expect(rates[0].drops).toBe(40)
+    expect(uplinkIsFull(rates)).toBeNull()
+    // Both lanes dropping heavily: the path is losing packets.
+    const both = [...peerLinkRates([lossyLane, lossyLane]).values()].map((r) => ({ ...r, pathQueued: false }))
+    expect(uplinkIsFull(both)).toEqual({ congested: 1, active: 1, signal: 'loss' })
   })
 
   it('does not call the uplink full when one lane of a single peer backs up', () => {

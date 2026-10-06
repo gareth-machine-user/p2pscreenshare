@@ -105,12 +105,23 @@ export function uploadBadge(o: {
   clamp: string | null
   /** The congestion controller's last move. */
   ccReason: string | null
+  /** This computer can't keep up (PeerSession.localLoad), if so. */
+  local?: { stallMs: number; encoderDroppedFps: number } | null
 }): { text: string; warn: boolean; title: string } {
-  const warn = o.full || o.clamp !== null
-  const why = o.clamp ?? (o.full ? (o.ccReason ?? 'Your uplink is congested') : null)
+  const local = o.local ? localLoadText(o.local) : null
+  const warn = o.full || o.clamp !== null || local !== null
+  const why = [local, o.clamp ?? (o.full ? (o.ccReason ?? 'Your uplink is congested') : null)].filter(Boolean).join(' ') || null
   return {
     text: `Uploading ${fmtMbps(o.sendKbps)}`,
     warn,
     title: why ? `Live upload (all connections, last 2 s). ${why}` : 'Live upload (all connections, last 2 s)',
   }
+}
+
+/** Why this computer can't keep up, in words (not the network: a lower bitrate wouldn't help it). */
+export function localLoadText(l: { stallMs: number; encoderDroppedFps: number }): string {
+  const parts: string[] = []
+  if (l.encoderDroppedFps > 0) parts.push(`the encoder is dropping ${l.encoderDroppedFps} frames/s`)
+  if (l.stallMs > 0) parts.push(`the page stalled for ${(l.stallMs / 1000).toFixed(1)} s`)
+  return `Your computer can't keep up (${parts.join(', ')}): this is not network congestion.`
 }

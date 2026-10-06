@@ -10,10 +10,10 @@ import { ban, grant, isBanned, mayPublish as mayPublishDoc, revoke, setPolicy, t
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
 import { Mesh } from '../mesh/mesh'
-import { laneSample, peerLinkRates, type LaneSample } from '../mesh/lanes'
+import { laneSample, peerLinkRates, type LaneSample, type PeerLinkRate } from '../mesh/lanes'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { fromBase64Url } from '../net/lobby'
-import { Uplink } from '../net/uplink'
+import { STALL_MS, Uplink } from '../net/uplink'
 import { LinkStatsTracker, parseLinkStats, pathInflation, type LinkStats } from '../net/linkStats'
 import { isTopologyReport, parsePeerMsg, type EncoderRates, type PeerMsg, type TopologyReport, type UplinkRates } from '../proto/messages'
 import { RateWindow, round1 } from './rates'
@@ -27,7 +27,7 @@ import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { UploadProbe } from './uploadProbe'
-import { after, every, tabHidden } from '../net/ticker'
+import { after, every, tabHidden, takeMainThreadLag } from '../net/ticker'
 import { tuning } from '../tuning'
 
 export interface PeerSessionOptions {
@@ -64,6 +64,8 @@ export interface LinkRow {
   queueMs: number | null
   drops: number | null
   congested: boolean
+  /** The connection stalled recently (its send buffer stopped draining; net/uplink.ts STALL_MS). */
+  stalled: boolean
   relayed: boolean | null
   /** SCTP congestion window (bytes), if the browser exposes sctp-transport stats (Chrome doesn't). */
   cwnd: number | null
@@ -112,6 +114,19 @@ const CC_RTT_INFLATION_MS = tuning.ccRttInflationMs
  * queue is the bottleneck's, which on a real link would sit in the router and inflate path RTTs.
  */
 const SHAPER_FULL_SHARE = 0.85
+/**
+ * A connection's numbers stay "the stall's" for this long after it was last seen stalled: its
+ * backlog then goes out late, or expires (at most the base layer's queueing deadline).
+ */
+const STALL_GRACE_MS = STALL_MS + tuning.maxAgeByLayer[0]
+/**
+ * The page stalled at least this long in a window (ms; the main thread was busy: a long task, GC,
+ * an overloaded machine): queueing and drops without an inflated path RTT are then this computer's,
+ * not the network's.
+ */
+const LOCAL_STALL_MS = 400
+/** The encoder dropping this many frames per second means it can't keep up. */
+const ENCODER_BEHIND_FPS = 3
 /** Each connection's getStats() (path RTT, wire rates) is polled this often. */
 const LINK_STATS_MS = 2000
 
@@ -192,16 +207,21 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   /** What last made the controller lower the bitrate, and the uplink rate it saw then. */
   private ccCause: { kind: 'uplink'; sendingKbps: number } | null = null
   /** Per peer: live-media drops/s and queueing on the link from this peer (Topology panel). */
-  readonly linkRates = new Map<string, { drops: number; queueMs: number; congested: boolean }>()
+  readonly linkRates = new Map<string, PeerLinkRate>()
   /** Per peer: path RTT inflation over its baseline (ms; null: no RTT signal) and whether it counts as queueing. */
   readonly pathQueue = new Map<string, { inflationMs: number | null; queued: boolean | null }>()
   /** Whether this peer's uplink itself is full (most peers congested together, over queueing paths). */
   uplinkFull: UplinkFull | null = null
+  /**
+   * This computer can't keep up (last window): the page stalled for `stallMs` (main thread busy)
+   * or the encoder dropped `encoderDroppedFps` frames per second. Null when it keeps up.
+   */
+  localLoad: { stallMs: number; encoderDroppedFps: number; uplinkSignal: boolean } | null = null
   /** Per connection (mesh link or lane): its getStats() history (see net/linkStats.ts). */
   private linkTrackers = new Map<object, { peer: string; lane: number; tracker: LinkStatsTracker }>()
   private pollingStats = false
   /** Per connection: live-media numbers over the last window. */
-  private laneRates = new Map<object, { sentKbps: number; drops: number; queueMs: number; congested: boolean }>()
+  private laneRates = new Map<object, { sentKbps: number; drops: number; queueMs: number; congested: boolean; stalled: boolean }>()
   private linkLast = new Map<object, { sent: number; bytes: number; drops: number; qSum: number; qN: number }>()
   private lastAutoRestart = -Infinity
   private stallSince: number | null = null
@@ -248,6 +268,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const m = this.mesh
     m.onMedia = (data, from) => this.relay.receive(data, from)
     m.onBufferLow = () => this.uplink.kick()
+    // A connection whose send buffer stopped draining hands its stripes to another of the pair's.
+    m.isStalled = (link) => this.uplink.isStalled(link)
+    m.onReroute = (from, to) => this.uplink.moveQueued(from, to)
     m.onBinary = (data, from) => this.uploadProbe.onChunk(data, from)
     m.onApp = (raw, from) => {
       const msg = parsePeerMsg(raw)
@@ -872,7 +895,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       queueMs: dN > 0 ? Math.round(dSum / dN) : 0,
     }
     this.encoderStatsNow = this.publishing?.sampleEncoder() ?? null
-    this.sampleLinks(dt)
+    const stallMs = Math.round(takeMainThreadLag())
+    this.sampleLinks(dt, stallMs)
     this.adaptBitrate(now)
     // Drops on one slow link say nothing about this peer's upload: only a full uplink caps it.
     this.capacity.observe(this.uplinkNow.kbps, this.uplinkFull ? this.uplinkNow.dropRate : 0)
@@ -891,10 +915,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
    * counts as congested only when most of its active lanes are: one lane backing up is that
    * connection's ceiling, which the stripes on the other lanes don't share.
    */
-  private sampleLinks(dt: number): void {
+  private sampleLinks(dt: number, stallMs = 0): void {
     this.linkRates.clear()
     this.laneRates.clear()
     const samples: LaneSample[] = []
+    const at = performance.now()
     for (const [link, c] of this.uplink.perLink) {
       const peer = this.mesh.peerOfLink(link)
       if (!peer) continue
@@ -915,12 +940,16 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
         { dropsPerS: LINK_DROPS_PER_S, queueMs: CC_QUEUE_MS },
       )
       if (!sample) continue
+      // Stalled in the window, or its backlog from a stall still going out (STALL_GRACE_MS).
+      this.uplink.stalledMs(link, at)
+      sample.stalled = at - c.lastStallAt <= dt * 1000 + STALL_GRACE_MS
       samples.push(sample)
       this.laneRates.set(link, {
         sentKbps: Math.round((sentBytes * 8) / 1000 / dt),
         drops: Math.round(sample.drops * 10) / 10,
         queueMs: sample.queueN > 0 ? Math.round(sample.queueSum / sample.queueN) : 0,
-        congested: sample.congested,
+        congested: sample.congested && !sample.stalled,
+        stalled: sample.stalled,
       })
     }
     for (const [peer, r] of peerLinkRates(samples)) this.linkRates.set(peer, r)
@@ -936,7 +965,14 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       this.pathQueue.set(peer, { inflationMs: path ? Math.round(path.inflationMs) : null, queued })
       peers.push({ congested: r.congested, drops: r.drops, pathQueued: queued })
     }
-    this.uplinkFull = uplinkIsFull(peers, UPLINK_FULL_SHARE)
+    const full = uplinkIsFull(peers, UPLINK_FULL_SHARE)
+    // The page stalled: what queued meanwhile is this computer's doing. Only an inflated path RTT
+    // still says the network is full too.
+    const pageStalled = stallMs >= LOCAL_STALL_MS
+    this.uplinkFull = full && (full.signal === 'rtt' || !pageStalled) ? full : null
+    const encoderDroppedFps = this.encoderStatsNow?.droppedFps ?? 0
+    this.localLoad =
+      pageStalled || encoderDroppedFps >= ENCODER_BEHIND_FPS ? { stallMs, encoderDroppedFps, uplinkSignal: !!full && !this.uplinkFull } : null
   }
 
   /** Polls getStats() on every open connection (mesh links and lanes) into its tracker. */
@@ -996,6 +1032,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
         queueMs: r?.queueMs ?? null,
         drops: r?.drops ?? null,
         congested: r?.congested ?? false,
+        stalled: r?.stalled ?? false,
         relayed: s?.relayed ?? null,
         cwnd: s?.sctp?.congestionWindow ?? null,
         availableKbps: kbps(s?.availableOutgoingKbps),
@@ -1020,7 +1057,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   /** The link from this peer to `peer`, over the last window. */
-  linkRate(peer: string): { drops: number; queueMs: number; congested: boolean } | null {
+  linkRate(peer: string): PeerLinkRate | null {
     return this.linkRates.get(peer) ?? null
   }
 

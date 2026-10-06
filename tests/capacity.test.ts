@@ -179,6 +179,10 @@ describe('is the uplink full?', () => {
     expect(uplinkIsFull([p(true, false, 4), p(true, false, 4)])).toBeNull()
     // One lossy peer of two is that receiver.
     expect(uplinkIsFull([p(true, false, 30), p(false, false, 0)])).toBeNull()
+    // Drops on a peer that isn't congested (on most of its connections) don't count: one stalled
+    // or backed-up lane of several.
+    expect(uplinkIsFull([p(false, false, 30)])).toBeNull()
+    expect(uplinkIsFull([p(false, false, 30), p(false, false, 30)])).toBeNull()
   })
   it('one slow receiver among several is not a full uplink, whatever its path shows', () => {
     expect(uplinkIsFull([p(true, true), p(false, false), p(false, false)])).toBeNull()

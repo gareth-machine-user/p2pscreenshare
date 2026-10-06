@@ -110,6 +110,7 @@
                 {#if l.queueMs !== null}
                   <span title="Live media: time queued (uplink + send buffer) and fragments dropped per second" class:warn={l.congested}>queue {fmtMs(l.queueMs)} · {l.drops} drops/s</span>
                 {/if}
+                {#if l.stalled}<span class="badge warn" title="This connection's send buffer stopped draining for a while (an SCTP stall, not congestion): its stripes moved to another connection meanwhile" data-testid="lane-stalled">stalled</span>{/if}
                 {#if l.relayed}<span class="badge">relayed</span>{/if}
                 {#if l.cwnd !== null}<span title="SCTP congestion window">cwnd {fmtBytes(l.cwnd)}</span>{/if}
               </td>
