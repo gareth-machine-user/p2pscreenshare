@@ -211,9 +211,9 @@ function toldParent(id: string, s: number): string | null | undefined {
   return last?.t === 'set-parent' ? last.parent : undefined
 }
 
-/** Lets promise callbacks (gzip, pings) finish without moving fake time. */
-async function flush(): Promise<void> {
-  for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r))
+/** Lets promise callbacks (gzip) run without moving fake time, until `cond` holds or for a while. */
+async function flush(cond = () => false): Promise<void> {
+  for (let i = 0; i < 2000 && !cond(); i++) await new Promise((r) => setImmediate(r))
 }
 
 /** Long enough for a reattach batch to be handled (the ticker runs every 50 ms). */
@@ -653,8 +653,9 @@ describe('ChannelPublisher: feasibility', () => {
 })
 
 describe('ChannelPublisher: topology reports', () => {
-  async function topo(id: string): Promise<TopologyReport[]> {
-    await flush()
+  /** The reports sent to `id`, once there are `n` (or after a while, if `n` is omitted). */
+  async function topo(id: string, n?: number): Promise<TopologyReport[]> {
+    await flush(() => n !== undefined && sentTo(id, 'topo').length >= n)
     const out: TopologyReport[] = []
     for (const m of sentTo(id, 'topo')) if (m.t === 'topo') out.push(JSON.parse(await gunzip(fromBase64Url(m.z))))
     return out
@@ -663,11 +664,11 @@ describe('ChannelPublisher: topology reports', () => {
   it('answers topo-req at once, then every 3 s until turned off', async () => {
     await striped()
     send('c1', { t: 'topo-req', ch: CH, on: true })
-    const [first] = await topo('c1')
+    const [first] = await topo('c1', 1)
     expect(first).toMatchObject({ channel: CH, publisher: HOST, k: 2, m: 1, rootSlots: 3, topology: h.cp.topology })
     expect(first.peers.map((p) => p.id).sort()).toEqual([...TREE].sort())
     await advance(3000)
-    expect((await topo('c1')).length).toBe(2)
+    expect((await topo('c1', 2)).length).toBe(2)
     expect(await topo('c2')).toEqual([])
     send('c1', { t: 'topo-req', ch: CH, on: false })
     await advance(6000)
