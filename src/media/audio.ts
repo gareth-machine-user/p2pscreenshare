@@ -2,6 +2,7 @@ import { wallClock } from '../net/clock'
 import { NO_REF } from '../proto/framing'
 import type { StreamInfo } from '../proto/messages'
 import type { EncodedFrame } from './packetizer'
+import { Playout, type PlayoutStats } from './playout'
 
 type AudioInfo = NonNullable<StreamInfo['audio']>
 
@@ -9,6 +10,31 @@ type AudioInfo = NonNullable<StreamInfo['audio']>
 const REBUILD_INTERVAL_MS = 1000
 /** Most encoded audio frames held for decoding (about 5 s of 20 ms frames). */
 const MAX_PENDING = 250
+/** Fallback playback only: drift past which chunks re-sync to their targets, s. */
+const RESYNC_S = 0.12
+
+/** AudioWorklet module: the Playout class (stringified) behind a processor that feeds it. */
+const WORKLET_SRC = `
+const Playout = (${Playout.toString()});
+class P2PPlayout extends AudioWorkletProcessor {
+  constructor() {
+    super()
+    this.p = new Playout(sampleRate)
+    this.blocks = 0
+    this.port.onmessage = (e) => {
+      const m = e.data
+      if (m.reset) this.p.reset()
+      else this.p.push(m.planes, m.rate, m.target)
+    }
+  }
+  process(_inputs, outputs) {
+    this.p.render(outputs[0], currentTime)
+    if (++this.blocks % 200 === 0) this.port.postMessage(this.p.stats)
+    return true
+  }
+}
+registerProcessor('p2p-playout', P2PPlayout)
+`
 
 /** Encodes an audio track to Opus (Chromium: needs MediaStreamTrackProcessor). */
 export class AudioPipeline {
@@ -90,9 +116,9 @@ export class AudioPipeline {
  *
  * Audio frames travel on every stripe over unordered channels and different relay paths, so they
  * arrive out of order. They are kept in a small jitter buffer and decoded in sequence (Opus is
- * stateful); a missing frame is skipped only when the next one is due. Decoded chunks are played
- * back to back, each starting where the previous one ended, so jitter in the target times doesn't
- * leave clicks or gaps; playback re-syncs only if it drifts from the target by more than RESYNC_S.
+ * stateful); a missing frame is skipped only when the next one is due. Decoded chunks go to an
+ * AudioWorklet that plays them as one continuous, resampled stream (see playout.ts). Without
+ * AudioWorklet, chunks are scheduled back to back as separate buffers, which can click.
  */
 export class AudioPlayer {
   private ctx: AudioContext | null = null
@@ -108,7 +134,17 @@ export class AudioPlayer {
   private decoding: number[] = []
   /** Audio-context time where the scheduled audio ends. */
   private nextTime = 0
-  stats = { played: 0, late: 0, skipped: 0, resyncs: 0 }
+  /** The playout worklet, once loaded; null while loading or when unsupported (fallback). */
+  private node: AudioWorkletNode | null = null
+  /** 'loading' drops decoded audio until the worklet is ready. */
+  mode: 'loading' | 'worklet' | 'direct' = 'loading'
+  stats: { played: number; late: number; skipped: number } & Pick<PlayoutStats, 'resyncs' | 'underruns'> & Partial<PlayoutStats> = {
+    played: 0,
+    late: 0,
+    skipped: 0,
+    resyncs: 0,
+    underruns: 0,
+  }
   private info: AudioInfo | null = null
   private lastBuildAt = -Infinity
 
@@ -118,8 +154,31 @@ export class AudioPlayer {
       this.ctx = new AudioContext({ latencyHint: 'interactive' })
       this.gain = this.ctx.createGain()
       this.gain.connect(this.ctx.destination)
+      void this.loadWorklet(this.ctx)
     }
     void this.ctx.resume()
+  }
+
+  private async loadWorklet(ctx: AudioContext): Promise<void> {
+    if (!ctx.audioWorklet) {
+      this.mode = 'direct'
+      return
+    }
+    const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'text/javascript' }))
+    try {
+      await ctx.audioWorklet.addModule(url)
+      if (this.ctx !== ctx) return
+      const node = new AudioWorkletNode(ctx, 'p2p-playout', { numberOfInputs: 0, outputChannelCount: [2] })
+      node.port.onmessage = (e: MessageEvent<PlayoutStats>) => Object.assign(this.stats, e.data)
+      node.connect(this.gain ?? ctx.destination)
+      this.node = node
+      this.mode = 'worklet'
+    } catch (err) {
+      console.warn('audio worklet unavailable; scheduling buffers directly', err)
+      this.mode = 'direct'
+    } finally {
+      URL.revokeObjectURL(url)
+    }
   }
 
   /** Unmuting must happen in a user gesture. Muting keeps decoding, so unmuting is instant. */
@@ -141,6 +200,7 @@ export class AudioPlayer {
     this.lastBuildAt = -Infinity
     this.pending.clear()
     this.nextSeq = null
+    this.node?.port.postMessage({ reset: true })
     this.build()
   }
 
@@ -238,6 +298,10 @@ export class AudioPlayer {
     }
     const now = ctx.currentTime
     const target = now + (renderAt - wallClock()) / 1000
+    if (this.mode !== 'direct') {
+      this.playWorklet(data, target, now)
+      return
+    }
     const duration = data.numberOfFrames / data.sampleRate
     // Back to back with what is already scheduled, unless that drifted far from the target.
     let start = this.nextTime
@@ -265,12 +329,30 @@ export class AudioPlayer {
     this.stats.played++
   }
 
+  private playWorklet(data: AudioData, target: number, now: number): void {
+    const node = this.node
+    if (!node) {
+      data.close()
+      return
+    }
+    const planes: Float32Array[] = []
+    for (let ch = 0; ch < data.numberOfChannels; ch++) {
+      const plane = new Float32Array(data.numberOfFrames)
+      data.copyTo(plane, { planeIndex: ch, format: 'f32-planar' })
+      planes.push(plane)
+    }
+    const rate = data.sampleRate
+    if (target + data.numberOfFrames / rate < now) this.stats.late++
+    data.close()
+    node.port.postMessage({ planes, rate, target }, planes.map((p) => p.buffer))
+    this.stats.played++
+  }
+
   close(): void {
     this.info = null
+    this.node?.disconnect()
+    this.node = null
     this.closeDecoder()
     void this.ctx?.close().catch(() => {})
   }
 }
-
-/** Playback re-syncs to the jitter buffer's target when it drifts further than this (s). */
-const RESYNC_S = 0.12
