@@ -17,6 +17,15 @@ interface Item {
   maxAge: number
 }
 
+/** Live-media counters for one link (cumulative). */
+export interface LinkCounters {
+  sentItems: number
+  drops: number
+  queueDelaySum: number
+  queueDelayN: number
+  stalls: number
+}
+
 export interface UplinkStats {
   sentBytes: number
   droppedItems: number
@@ -75,6 +84,20 @@ export class Uplink {
   private background = new Set<MediaLink>()
   /** Per link: frames that already lost a fragment there (until when to remember them). */
   private deadFrames = new Map<MediaLink, Map<string, number>>()
+  /**
+   * Per-link live-media counters: a full uplink congests most links at once, while one slow
+   * receiver (its downlink or path) congests only its own link.
+   */
+  readonly perLink = new Map<MediaLink, LinkCounters>()
+
+  private counters(link: MediaLink): LinkCounters {
+    let c = this.perLink.get(link)
+    if (!c) {
+      c = { sentItems: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0 }
+      this.perLink.set(link, c)
+    }
+    return c
+  }
 
   setBackground(link: MediaLink, on = true): void {
     if (on) this.background.add(link)
@@ -90,6 +113,7 @@ export class Uplink {
     if (frame && this.deadFrames.get(link)?.has(frame)) {
       this.stats.droppedItems++
       this.stats.droppedByLayer[Math.min(3, layer)]++
+      if (!replay) this.counters(link).drops++
       return
     }
     let q = this.queues.get(link)
@@ -116,6 +140,7 @@ export class Uplink {
     this.queues.delete(link)
     this.background.delete(link)
     this.deadFrames.delete(link)
+    this.perLink.delete(link)
   }
 
   /** Called when a link's send buffer drains. */
@@ -151,11 +176,16 @@ export class Uplink {
         }
         let kept = 0
         for (const it of q) {
-          if (now - it.enqueuedAt > it.maxAge || (it.frame && dead?.has(it.frame))) this.drop(it, bg)
-          else q[kept++] = it
+          if (now - it.enqueuedAt > it.maxAge || (it.frame && dead?.has(it.frame))) {
+            this.drop(it, bg)
+            if (!bg && !it.replay) this.counters(link).drops++
+          } else q[kept++] = it
         }
         q.length = kept
-        if (kept && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) this.stats.bufferStalls++
+        if (kept && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) {
+          this.stats.bufferStalls++
+          if (!bg) this.counters(link).stalls++
+        }
       }
       let progress = true
       let waitingOnTokens = false
@@ -195,6 +225,10 @@ export class Uplink {
             if (!this.background.has(link) && !it.replay) {
               this.stats.queueDelaySum += now - it.enqueuedAt
               this.stats.queueDelayN++
+              const c = this.counters(link)
+              c.sentItems++
+              c.queueDelaySum += now - it.enqueuedAt
+              c.queueDelayN++
             }
           } else {
             this.stats.droppedItems++

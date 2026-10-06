@@ -48,6 +48,8 @@ export interface PublisherContext {
   announce(): void
   /** This peer's encoder and uplink over the last window (Topology panel). */
   publisherStats(): { encoder: EncoderRates | null; uplink: UplinkRates | null }
+  /** This peer's link to another, over the last window. */
+  linkRate(peer: string): { drops: number; queueMs: number; congested: boolean } | null
   onChange(): void
 }
 
@@ -639,7 +641,13 @@ export class ChannelPublisher {
       rootSlots: this.ctx.rootSlots(this.id),
       overcommitted: this.lastPlan?.overcommitted ?? 0,
       changes: this.totalChanges,
-      peers: [...this.subscribers.values()].map((s) => ({ id: s.id, failures: s.failures, avoid: [...s.avoid.keys()], stats: s.stats })),
+      peers: [...this.subscribers.values()].map((s) => ({
+        id: s.id,
+        failures: s.failures,
+        avoid: [...s.avoid.keys()],
+        stats: s.stats,
+        link: this.ctx.linkRate(s.id),
+      })),
       publisherStats: this.ctx.publisherStats(),
     }
   }

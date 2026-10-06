@@ -137,3 +137,23 @@ export function feasibleBitrate(currentKbps: number, ratio: number, floorKbps = 
   if (!Number.isFinite(ratio) || ratio >= 1) return currentKbps
   return Math.max(floorKbps, Math.round((currentKbps * ratio * 0.9) / 50) * 50)
 }
+
+/**
+ * Is a peer's uplink itself full? A full uplink congests most of its links at once, while one slow
+ * receiver (its downlink or path) congests only its own. With a single link the two look alike, so
+ * that link must also be carrying close to the measured upload.
+ */
+export function uplinkIsFull(
+  links: { congested: boolean }[],
+  sendingKbps: number,
+  probeKbps: number | null,
+  share = 0.5,
+  singleShare = 0.7,
+): { congested: number; active: number } | null {
+  const active = links.length
+  const congested = links.filter((l) => l.congested).length
+  // More than half: with two links, one slow receiver is not a full uplink.
+  if (!active || congested / active <= share) return null
+  if (active === 1 && probeKbps !== null && sendingKbps < probeKbps * singleShare) return null
+  return { congested, active }
+}
