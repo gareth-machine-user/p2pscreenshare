@@ -62,19 +62,21 @@ const REBALANCE_MS = 10_000
 const AUTO_RESTART_GAP_MS = 30_000
 /**
  * Congestion control for a presenter's bitrate: back off by 25% (at most every 4 s) while its uplink
- * drops fragments or queues them for long, or the median viewer loses frames; after 10 s clean,
- * creep back up by 15% (at most every 10 s), never above the chosen quality.
+ * drops fragments or queues them for long, or the median viewer loses frames; after 5 s clean,
+ * climb back by 25% every 5 s, never above the chosen quality.
  */
 const CC_DOWN = 0.75
 /** Clearly swamped (dropping a lot, or queueing over twice the limit): halve instead. */
 const CC_DOWN_SEVERE = 0.5
 const CC_SEVERE_DROPS_PER_S = 50
-const CC_UP = 1.15
+const CC_UP = 1.25
 const CC_DOWN_GAP_MS = 4000
-const CC_UP_AFTER_MS = 10_000
+const CC_UP_AFTER_MS = 5000
 const CC_DROPS_PER_S = 5
 const CC_QUEUE_MS = tuning.ccQueueMs
 const CC_VIEWER_LOSS = 0.15
+/** Viewers' loss reports lag (2 s windows, plus delivery): ignore them for this long after a cut. */
+const CC_VIEWER_HOLD_MS = 6000
 
 /** Auto quality falls back to the preview when the full stream stalls this long... */
 const AUTO_STALL_MS = 6000
@@ -150,6 +152,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private ccCleanSince: number | null = null
   /** Why the congestion controller last moved the bitrate (shown in Stats). */
   ccReason: string | null = null
+  /** What last made the controller lower the bitrate, and the uplink rate it saw then. */
+  private ccCause: { kind: 'uplink' | 'viewers'; sendingKbps: number; viewerLoss: number } | null = null
   private lastAutoRestart = -Infinity
   private stallSince: number | null = null
   private smoothSince: number | null = null
@@ -601,11 +605,15 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
         ? `uplink dropping ${Math.round(drops)} fragments/s`
         : up.queueMs > CC_QUEUE_MS
           ? `uplink queueing ${up.queueMs} ms`
-          : viewerLoss > CC_VIEWER_LOSS
+          : viewerLoss > CC_VIEWER_LOSS && now - this.ccLastDown > CC_VIEWER_HOLD_MS
             ? `viewers losing ${Math.round(viewerLoss * 100)}% of frames`
             : null
     if (reason) {
       this.ccCleanSince = null
+      const kind = reason.startsWith('viewers') ? 'viewers' : 'uplink'
+      // While congested, what the uplink manages to send is about what it can carry.
+      const sendingKbps = Math.max(up.kbps, this.ccCause?.kind === kind ? this.ccCause.sendingKbps * 0.8 : 0)
+      this.ccCause = { kind, sendingKbps, viewerLoss }
       if (now - this.ccLastDown >= CC_DOWN_GAP_MS && full.kbps > 300) {
         this.ccLastDown = now
         this.ccReason = `lowered: ${reason}`
@@ -615,10 +623,48 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       return
     }
     this.ccCleanSince ??= now
-    if (full.kbps < s.ceilingKbps && !full.limited && now - this.ccCleanSince >= CC_UP_AFTER_MS && now - this.ccLastUp >= CC_UP_AFTER_MS) {
+    // Climb back, but not past what the audience's relay slots can carry (when that's the limit).
+    const cap = full.limited ? Math.max(full.limited.feasibleKbps, full.kbps) : s.ceilingKbps
+    if (full.kbps < Math.min(cap, s.ceilingKbps) && now - this.ccCleanSince >= CC_UP_AFTER_MS && now - this.ccLastUp >= CC_UP_AFTER_MS) {
       this.ccLastUp = now
-      this.ccReason = 'raised: no congestion for 10 s'
-      s.adaptBitrate(full.kbps * CC_UP)
+      this.ccReason = 'raised: no congestion for 5 s'
+      s.adaptBitrate(Math.min(cap, full.kbps * CC_UP))
+      if (full.kbps >= s.ceilingKbps) this.ccCause = null
+    }
+  }
+
+  /**
+   * Why the presenter's bitrate is below its chosen quality, in numbers: what its uplink manages
+   * to send, and what this stream needs at the chosen quality (one stripe per direct child, for
+   * every stripe). Null when it runs at full quality.
+   */
+  bitrateClamp(): {
+    currentKbps: number
+    ceilingKbps: number
+    cause: 'uplink' | 'viewers' | 'audience'
+    sendingKbps: number
+    neededKbps: number
+    directEdges: number
+    stripes: number
+    viewerLossPct: number
+  } | null {
+    const s = this.publishing
+    const full = s?.full
+    if (!s || !full || full.kbps >= s.ceilingKbps) return null
+    let directEdges = 0
+    for (const ps of Object.values(full.topology.parents)) for (const p of ps) if (p === this.selfId) directEdges++
+    directEdges = Math.max(directEdges, full.subscribers.size ? full.stripes : 0)
+    // Nominal stripe rate at the chosen quality: a lower bound (encoders overshoot).
+    const stripeAtCeiling = stripeKbpsFor(s.ceilingKbps, full.k, full.withAudio)
+    return {
+      currentKbps: full.kbps,
+      ceilingKbps: s.ceilingKbps,
+      cause: this.ccCause?.kind ?? (full.limited ? 'audience' : 'uplink'),
+      sendingKbps: Math.round(this.ccCause?.sendingKbps ?? this.uplinkStatsNow?.kbps ?? 0),
+      neededKbps: Math.round(directEdges * stripeAtCeiling),
+      directEdges,
+      stripes: full.stripes,
+      viewerLossPct: Math.round((this.ccCause?.viewerLoss ?? 0) * 100),
     }
   }
 

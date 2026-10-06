@@ -366,9 +366,15 @@ Rate control, in both profiles:
   that frame's fragments on that link are dropped too, freeing upload for frames that can still
   play.
 - **Congestion control.** Every 2 s the publisher lowers its bitrate by 25% (by half when clearly
-  swamped) while its uplink drops fragments or queues them for long, or the median viewer loses
-  frames, and raises it by 15% after 10 s clean, never above the chosen quality. The presenter's
-  Stats show why it last changed. Changes apply in place, with no new capture.
+  swamped) while its uplink drops live fragments or queues them for long, or the median viewer
+  loses frames (viewer reports are ignored for 6 s after a cut, since they still describe older
+  frames). After 5 s clean it climbs back by 25% every 5 s, never above the chosen quality or what
+  the audience's relay slots can carry. Catch-up replays to newly attached viewers don't count as
+  congestion. Changes apply in place, with no new capture.
+- **Why it's clamped.** While the bitrate is below the chosen quality, the presenter bar (and
+  Stats) say why in numbers: for example "your upload is sending about 3.0 Mbps, but 16 Mbps needs
+  at least 21 Mbps here (you send 5 stripe copies yourself …)", or that viewers are losing frames.
+  A lower quality preset or fewer parity stripes then usually looks sharper than a starved one.
 
 Every place a frame can go missing is counted and shown in **Stats** (and per viewer in
 **Topology**): frames dropped by the encoder, uplink fragments dropped by temporal layer and

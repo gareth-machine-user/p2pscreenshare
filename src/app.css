@@ -650,3 +650,10 @@ button.danger {
 td.warn {
   color: #f2c94c;
 }
+.badge.clamp {
+  white-space: normal;
+  line-height: 1.35;
+  padding: 4px 8px;
+  flex-basis: 100%;
+  order: 10;
+}

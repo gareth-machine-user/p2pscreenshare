@@ -26,6 +26,8 @@ export interface UplinkStats {
   droppedByLayer: number[]
   /** Background (probe) items dropped. */
   droppedBackground: number
+  /** GOP-cache replay items dropped (a new child's catch-up, not live media: not a congestion signal). */
+  droppedReplay: number
   /** Items the data channel refused (link closing). */
   sendFailed: number
   /** Drains that found a link's send buffer full while it had items waiting. */
@@ -55,6 +57,7 @@ export class Uplink {
     queuedBytes: 0,
     droppedByLayer: [0, 0, 0, 0],
     droppedBackground: 0,
+    droppedReplay: 0,
     sendFailed: 0,
     bufferStalls: 0,
     queueDelaySum: 0,
@@ -188,7 +191,8 @@ export class Uplink {
             this.tokens -= it.data.byteLength
             this.stats.sentBytes += it.data.byteLength
             this.stats.sentItems++
-            if (!this.background.has(link)) {
+            // Live media only: replays to a new child are meant to wait behind it.
+            if (!this.background.has(link) && !it.replay) {
               this.stats.queueDelaySum += now - it.enqueuedAt
               this.stats.queueDelayN++
             }
@@ -216,6 +220,7 @@ export class Uplink {
     this.stats.queuedBytes -= it.data.byteLength
     this.stats.droppedItems++
     if (background) this.stats.droppedBackground++
+    else if (it.replay) this.stats.droppedReplay++
     else this.stats.droppedByLayer[Math.min(3, it.layer)]++
   }
 

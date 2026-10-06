@@ -8,6 +8,7 @@
     uplink = null,
     encoder = null,
     adapting = null,
+    clamp = null,
   }: {
     loss?: LossRates | null
     renderedFps?: number | null
@@ -15,6 +16,8 @@
     encoder?: EncoderRates | null
     /** Why the presenter's bitrate last changed. */
     adapting?: string | null
+    /** Why the bitrate is below the chosen quality, if it is. */
+    clamp?: string | null
   } = $props()
 
   const n = (x: number) => (x === 0 ? '0' : x < 10 ? x.toFixed(1) : Math.round(x).toString())
@@ -35,6 +38,7 @@
       <div><span>Keyframes /s</span><b>{n(encoder.keyframes)}</b></div>
       {#if adapting}<div><span>Bitrate control</span><b data-testid="cc-reason">{adapting}</b></div>{/if}
     </div>
+    {#if clamp}<p class="hint warn" data-testid="clamp-explained">{clamp}</p>{/if}
   {/if}
   {#if loss}
     <h4>Playback</h4>
