@@ -72,6 +72,8 @@ export type PublisherMsg =
   | { t: 'position'; ch: number; home: number | null; depth: number[] }
   /** Gzipped TopologyReport (base64url), at most every 3 s while requested. */
   | { t: 'topo'; ch: number; z: string }
+  /** The channel is overcommitted: please re-measure your upload (estimates may be stale). */
+  | { t: 'reprobe'; ch: number }
 
 export type PeerMsg =
   | SubscriberMsg

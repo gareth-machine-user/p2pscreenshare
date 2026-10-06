@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CapacityEstimator, splitBudget } from '../src/session/capacity'
+import { CapacityEstimator, feasibilityRatio, feasibleBitrate, rebalanceWeights, splitBudget } from '../src/session/capacity'
 
 describe('budget split', () => {
   it('a viewer offers floor(B / stripe kbps) slots', () => {
@@ -57,5 +57,38 @@ describe('capacity estimate', () => {
     for (let i = 0; i < 40; i++) e.observe(1500, 0)
     expect(e.estimateKbps).toBe(5000)
     expect(e.observedCapKbps).toBeNull()
+  })
+})
+
+describe('competing publishers', () => {
+  it('moves weight towards channels with a deficit, a step at a time', () => {
+    let w: Record<string, number> = { a: 1, b: 1 }
+    w = rebalanceWeights(w, { a: 3, b: 0 })
+    expect(w.a).toBeCloseTo(1.1)
+    expect(w.b).toBeCloseTo(0.9)
+    for (let i = 0; i < 50; i++) w = rebalanceWeights(w, { a: 3, b: 0 })
+    // b keeps a floor, so it is never starved in turn; the total is preserved.
+    expect(w.b).toBeCloseTo(0.2)
+    expect(w.a + w.b).toBeCloseTo(2)
+  })
+
+  it('does nothing with one channel, or when nobody (or everybody) is short', () => {
+    expect(rebalanceWeights({ a: 1 }, { a: 5 })).toEqual({ a: 1 })
+    expect(rebalanceWeights({ a: 1, b: 1 }, {})).toEqual({ a: 1, b: 1 })
+    expect(rebalanceWeights({ a: 1, b: 1 }, { a: 1, b: 2 })).toEqual({ a: 1, b: 1 })
+  })
+})
+
+describe('feasibility and auto quality', () => {
+  it('compares slot supply with N × S', () => {
+    expect(feasibilityRatio(8, 3, 24)).toBe(1)
+    expect(feasibilityRatio(8, 3, 12)).toBe(0.5)
+    expect(feasibilityRatio(0, 3, 0)).toBe(Infinity)
+  })
+
+  it('suggests a bitrate the audience can carry', () => {
+    expect(feasibleBitrate(2500, 1.2)).toBe(2500)
+    expect(feasibleBitrate(2500, 0.5)).toBe(1150)
+    expect(feasibleBitrate(2500, 0.05)).toBe(300)
   })
 })

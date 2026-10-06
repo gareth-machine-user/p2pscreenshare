@@ -111,10 +111,19 @@
     const sh = settings.share
     const preset = QUALITY_PRESETS[sh.quality]
     const test = sh.source === 'test' || (urlOverrides && params.get('source') === 'test')
+    const auto = urlOverrides ? params.get('quality') === 'auto' : sh.quality === 'auto'
+    const k = Math.max(1, urlOverrides ? numParam(params, 'k', sh.k) : sh.k)
+    const bitrateKbps = urlOverrides ? numParam(params, 'bitrate', preset.kbps) : preset.kbps
+    let m = Math.max(0, urlOverrides ? numParam(params, 'm', sh.m) : sh.m)
+    // Auto quality adapts the bitrate to the audience, and adds parity when relays allow.
+    if (session) {
+      session.autoBitrate = auto
+      if (auto && !urlOverrides) m = session.autoParity(k, m, bitrateKbps)
+    }
     return {
-      k: Math.max(1, urlOverrides ? numParam(params, 'k', sh.k) : sh.k),
-      m: Math.max(0, urlOverrides ? numParam(params, 'm', sh.m) : sh.m),
-      bitrateKbps: urlOverrides ? numParam(params, 'bitrate', preset.kbps) : preset.kbps,
+      k,
+      m,
+      bitrateKbps,
       source: test ? 'test' : 'screen',
       surface: sh.source === 'window' ? 'window' : sh.source === 'tab' ? 'browser' : 'monitor',
       maxSize: [preset.maxWidth, preset.maxHeight],
@@ -202,6 +211,8 @@
       policy: session.policy,
       revoked: session.revokedNotice,
       presenterAudio: session.publishing?.audio ?? null,
+      limited: session.publishing?.full?.limited ?? null,
+      kicked: session.kicked,
     }
   })
 
@@ -341,6 +352,9 @@
   {#if lobby?.revoked}
     <div class="banner" data-testid="revoked">The owner stopped your stream.</div>
   {/if}
+  {#if lobby?.kicked}
+    <div class="banner" data-testid="kicked">The owner removed you from the lobby.</div>
+  {/if}
 
   <div class="lobby-body">
     <div class="stage-col">
@@ -364,7 +378,7 @@
                 <button class:active={gearTab === 'topology'} data-testid="tab-topology" onclick={() => (gearTab = 'topology')}>Topology</button>
               </div>
               {#if gearTab === 'peers' && session}
-                <PeersPanel mesh={session.mesh} {badges} {tick} />
+                <PeersPanel mesh={session.mesh} {badges} {tick} onkick={isOwner ? (id) => void session?.kick(id) : null} />
               {:else if gearTab === 'topology'}
                 <TopologyPanel report={view.report} {nameOf} />
               {:else if view.presenting && view.pub}
@@ -422,6 +436,8 @@
         {#if lobby?.sharing && lobby.presenterAudio}
           <PresenterBar
             audio={lobby.presenterAudio}
+            limited={lobby.limited}
+            auto={session?.autoBitrate ?? false}
             quality={settings.share.quality}
             onmic={(m) => {
               session?.publishing?.setMicMuted(m)

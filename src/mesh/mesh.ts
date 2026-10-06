@@ -17,7 +17,7 @@
 import { Rendezvous } from '../net/bootstrap'
 import { emptyAuth, isBanned, type AuthDoc } from './auth'
 import { open, seal, type Envelope, type Typed } from './envelope'
-import type { PeerIdentity } from './identity'
+import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn } from './meshConn'
 import { doorPeers, FailureDetector, linkSuspected, RecordStore, retryDelayMs, type Digest, type MemberRecord } from './records'
 
@@ -127,6 +127,8 @@ export class Mesh {
   private self: MemberRecord
   private selfEnv: Envelope | null = null
   private authEnv: Envelope | null = null
+  /** Peer ids of banned keys, so a kicked peer is refused even before its record is known. */
+  private bannedIds = new Set<string>()
   private rendezvous: Rendezvous
   private chatEnvs: Envelope[] = []
   private chatSent: number[] = []
@@ -279,7 +281,7 @@ export class Mesh {
   }
 
   isBannedPeer(id: string): boolean {
-    return isBanned(this.auth, this.pubKeyOf(id))
+    return this.bannedIds.has(id) || isBanned(this.auth, this.pubKeyOf(id))
   }
 
   /** Owner only: applies a change to the lobby's decisions, signs it and gossips it. */
@@ -297,6 +299,7 @@ export class Mesh {
     if (!opened || opened.author !== this.ownerId || opened.body.version <= this.auth.version) return
     this.auth = opened.body
     this.authEnv = env
+    this.bannedIds = new Set(await Promise.all(this.auth.banned.map((k) => peerIdOf(k))))
     if (this.selfId === this.ownerId) {
       try {
         localStorage.setItem(this.authStoreKey, JSON.stringify(env))
@@ -305,8 +308,10 @@ export class Mesh {
       }
     }
     for (const c of this.conns.values()) c.sendCtl({ t: 'auth', env })
-    // Kicked peers: close our links to them.
-    for (const c of [...this.conns.values()]) if (this.isBannedPeer(c.remoteId)) c.close()
+    // Kicked peers: close our links to them, once the news had time to reach them.
+    setTimeout(() => {
+      for (const c of [...this.conns.values()]) if (this.isBannedPeer(c.remoteId)) c.close()
+    }, 500)
     this.onAuth(this.auth)
     this.onChange()
   }

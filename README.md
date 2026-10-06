@@ -93,8 +93,10 @@ lobby page.
    watch.
 5. **Capacity** (`src/session/capacity.ts`). At join a peer sends a paced 1.5 s probe to 3 random
    neighbours at background priority, and adds what its uplink sent meanwhile. While relaying,
-   drops above 3% cap the estimate at 90% of the achieved rate. 75% of the estimate is split into
-   relay slots per watched channel (a publisher first reserves its own roots) and gossiped.
+   drops above 3% cap the estimate at 90% of the achieved rate; it re-probes every 5 minutes when
+   lightly loaded. 75% of the estimate is split into relay slots per watched channel (a publisher
+   first reserves its own roots), weighted towards channels whose publisher reports a deficit,
+   and gossiped.
 6. **Planning** (`src/session/publisher.ts`, `src/topology/planner.ts`). The publisher replans
    every 2 s and 50 ms after inputs change. `plan()` is pure and deterministic: home stripes are
    balanced by offered slots, each tree is built top-down keeping valid existing parents
@@ -167,10 +169,14 @@ membership layer handles everything else.
 | Event | Detection | Response | Time |
 |---|---|---|---|
 | A relay's link drops | The publisher's link to it closes or misses pings for 1.5 s | Replan at once; its parents get `remove-child`; its subtree is marked "disrupted upstream" for 6 s | ms |
-| A stripe goes silent | A child hears nothing on it for 2 s and sends `reattach` | Batched for 400 ms and handled shallowest-first; the reported parent is pinged (1.2 s) and avoided | ~2.5 s |
+| A stripe goes silent | A child hears nothing on it for 1 s and sends `reattach` | Batched for 400 ms and handled shallowest-first; the reported parent is pinged (1.2 s) and avoided | ~1.5 s |
 | Resume | The new parent replays its cached GOP over an existing mesh link | | ~1 RTT |
 | A pair can't connect | Mesh ICE fails; both list each other as unreachable | Never a tree edge; retried with backoff | — |
 | A peer leaves | Its goodbye record, or 6 s without anything fresh | Removed from every channel it watched | ≤ 6 s |
+| A relay is consistently late | Every viewer measures how far behind the first piece of each frame each stripe arrives; the publisher attributes the excess to the parent | Lateness counts as a parent-choice penalty; a parent late by more than 150 ms for 10 s loses its children there for 30 s | 10 s |
+| Several publishers compete for relays | Channel announcements carry the latest plan's `deficit` | Every 10 s each peer moves 10% of its budget weight from channels without a deficit to those with one | a few rounds |
+| The audience can't upload enough | Offered slots below 90% of the N × S needed for 10 s | The presenter sees "Audience upload is limited: about X Mbps will play smoothly"; with Auto quality the stream restarts at that bitrate | ~10 s + blip |
+| Upload estimates go stale | Every 5 min while relaying lightly, or when a publisher whose channel is overcommitted asks | Re-probe | — |
 
 Measured in the e2e tests on one machine:
 - **With parity (`m ≥ 1`):** a relay leaving is invisible (minimum 19–24 fps during failover).
@@ -186,8 +192,9 @@ Mechanisms that keep one failure from spreading:
 - **No startup backlog.** A new child's live fragments are queued ahead of its GOP replay, so its jitter buffer isn't inflated.
 
 Not handled yet:
-- A relay that is alive but consistently *late*: children's jitter buffers grow, but nobody moves them.
-- More than `m` relays failing within one detection window: viewers fed by all of them stall until reattach.
+- More than `m` relays failing within one detection window: viewers fed by all of them stall until
+  reattach. Pull repair (fetching missing pieces from relays outside one's own subtree) is designed
+  but deferred until measurements show it's needed.
 
 ## Simulation
 
@@ -197,7 +204,24 @@ stay a mean of 240 s, and the stream is 2.5 Mbps. Peers offer slots from a noisy
 re-measured every 10 s, and the publisher sees offers and joins `--gossip` ms late (default 500).
 When a peer leaves, its subtree loses that stripe for `--repair` ms (default 2500, matching the
 mesh e2e measurement above). A viewer stalls while more than `m` of its stripes are missing. (The
-tables below were measured before the mesh, with 3500 ms repairs.)
+parity tables below were measured before the mesh, with 3500 ms repairs.)
+
+Two scenarios exercise the hardening:
+
+```
+$ npm run sim -- --sweep late --peers 100      # relays that forward 250 ms late, 4+1 stripes
+late share | handled | p50 ms | p95 ms | stall %
+        0% |     yes |    311 |    354 |   0.235
+       10% |      no |    320 |    570 |   0.235
+       10% |     yes |    314 |    505 |   0.247
+       25% |      no |    482 |    595 |   0.235
+       25% |     yes |    343 |    580 |   0.255
+
+$ npm run sim -- --sweep competing --peers 60  # two publishers, everyone watches both
+rebalancing | overcommitted A | overcommitted B | degraded % A | degraded % B
+         no |             0.0 |            98.0 |         0.00 |        85.00
+        yes |             4.6 |            38.5 |         0.00 |         0.00
+```
 
 ```
 k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent changes/min
@@ -295,7 +319,7 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | `MAX_FANOUT` | `session/capacity.ts` | 16 | Children per relay. Higher uses strong peers fully but enlarges each failure's blast radius. |
 | `minUptimeMsForRelay` | `ChannelPublisher.plannerConfig` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |
 | `switchGain`, `rttSwitchMs` | `ChannelPublisher.plannerConfig` | 1, 40 | How many levels shallower (or ms closer) a parent must be before a peer is moved. Higher means less churn. |
-| `STRIPE_SILENCE_MS` | `session/subscription.ts` | 2000 | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
+| `STRIPE_SILENCE_MS` | `session/subscription.ts` | 1000 | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
 | `REATTACH_BATCH_MS`, `LIVENESS_TIMEOUT_MS` | `session/publisher.ts` | 400, 1200 | Collateral-blame window, and the dead-parent confirmation timeout |
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
 | `keyframeIntervalMs` | `PublishedStream.start` | 2000 | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
@@ -311,6 +335,11 @@ npm run e2e                 # Playwright: local tracker + dev server + several b
 ```
 
 The e2e suite covers:
+- hardening: auto quality lowers the bitrate for an audience that can't carry the stream; a kicked
+  member stays out after a reload
+- several publishers: request and approve, tiles, the preview filling in while switching, mixed
+  audio and mutes, revocation (relays reject a revoked publisher that keeps sending), deny and
+  allow all
 - the lobby UI: persisted settings, the player overlay, and the Topology panel
 - the mesh: six peers mesh up, one leaves, a blocked pair is gossiped, chat reaches everyone; the
   lobby carries on without its owner; the mesh link stays up under streaming load
@@ -340,7 +369,10 @@ CHROMIUM_LD_PRELOAD=$PWD/tools/nosme/nosme.so npm run e2e
 - **Trust.** Anyone with the viewer link can watch, and the join code can't be revoked per viewer.
   Relays can't forge or alter the stream (see [Security](#security)), but they can still drop it.
 - **Lobby size.** The full mesh is designed for about 50 peers (each holds a connection to every
-  other one).
+  other one). Phones holding 49 connections may struggle.
+- **Kicks and Sybils.** The join code can't be revoked, so a kicked person can come back with a new
+  key (a reload keeps the old key, which stays refused). Anyone with the link can join under many
+  keys; the owner can kick them.
 - **NAT pairs without TURN.** Some pairs never connect; planners avoid them, and the Peers panel
   shows "limited connectivity", but a peer that can't reach most of the lobby only gets the
   stripes it can reach. Pass TURN servers with `ice=`.

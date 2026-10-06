@@ -15,7 +15,7 @@ import type { PublisherMsg, StreamInfo, SubscriberMsg, SubscriberStats, Topology
 import type { RelayNode } from '../relay/relayNode'
 import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
-import { MAX_FANOUT, stripeKbpsFor } from './capacity'
+import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
 
 export interface ShareOptions {
   k: number
@@ -66,6 +66,14 @@ const LIVENESS_TIMEOUT_MS = 1200
 /** A peer that failed a liveness ping stays out of the plan this long (or until it answers again). */
 const SUSPECT_HOLD_MS = 3000
 const TOPOLOGY_REPORT_MS = 3000
+/** A parent whose children's pieces arrive this much later than its own, for this long, loses them. */
+export const LATE_PARENT_MS = 150
+const LATE_PARENT_FOR_MS = 10_000
+const LATE_PARENT_AVOID_MS = 30_000
+/** Audience upload counts as short when supply is below 90% of demand for this long. */
+const SHORT_SUPPLY_FOR_MS = 10_000
+/** At most this often, an overcommitted channel asks its subscribers to re-measure their upload. */
+const REPROBE_ASK_MS = 60_000
 
 export interface ChannelSubscriber {
   id: string
@@ -108,6 +116,13 @@ export class ChannelPublisher {
   private measuredStripeKbps = 0
   private announcedStripeKbps = 0
   private lastMeasureAt = performance.now()
+  /** Excess lateness (ms) per `${parent}:${stripe}`, from children's reports. */
+  readonly lateness = new Map<string, number>()
+  private lateSince = new Map<string, number>()
+  private shortSince: number | null = null
+  private lastReprobeAsk = 0
+  /** Set while the audience can't carry this channel: a bitrate it could carry. */
+  limited: { feasibleKbps: number; ratio: number } | null = null
 
   constructor(
     readonly id: number,
@@ -434,12 +449,77 @@ export class ChannelPublisher {
       switchGain: 1,
       rttSwitchMs: 40,
       rtt: (a, b) => mesh.member(a)?.rtt[b] ?? mesh.member(b)?.rtt[a] ?? null,
+      lateness: (parent, stripe) => this.lateness.get(`${parent}:${stripe}`) ?? 0,
+    }
+  }
+
+  /**
+   * How much later a parent's children receive a stripe than the parent itself does, averaged over
+   * its children. A parent late by more than LATE_PARENT_MS for 10 s loses its children there.
+   */
+  private updateLateness(now: number): void {
+    const sums = new Map<string, { total: number; n: number }>()
+    for (const sub of this.subscribers.values()) {
+      if (!sub.active || !sub.stats) continue
+      sub.stats.stripes.forEach((st, s) => {
+        const p = st.parent
+        if (!p || p === this.ctx.selfId) return
+        const own = this.subscribers.get(p)?.stats?.stripes[s]?.lateMs ?? 0
+        const key = `${p}:${s}`
+        const acc = sums.get(key) ?? { total: 0, n: 0 }
+        acc.total += Math.max(0, st.lateMs - own)
+        acc.n++
+        sums.set(key, acc)
+      })
+    }
+    this.lateness.clear()
+    for (const [key, { total, n }] of sums) this.lateness.set(key, total / n)
+    for (const [key, late] of this.lateness) {
+      if (late <= LATE_PARENT_MS) {
+        this.lateSince.delete(key)
+        continue
+      }
+      const since = this.lateSince.get(key) ?? now
+      this.lateSince.set(key, since)
+      if (now - since < LATE_PARENT_FOR_MS) continue
+      // Consistently late: its children on this stripe move elsewhere for a while.
+      this.lateSince.delete(key)
+      const [parent, stripe] = [key.slice(0, key.lastIndexOf(':')), Number(key.slice(key.lastIndexOf(':') + 1))]
+      for (const sub of this.subscribers.values()) {
+        if (this.topology.parents[sub.id]?.[stripe] === parent) sub.avoid.set(parent, now + LATE_PARENT_AVOID_MS)
+      }
+    }
+    for (const key of [...this.lateSince.keys()]) if (!this.lateness.has(key)) this.lateSince.delete(key)
+  }
+
+  /** Whether the audience's offered slots can carry this channel (warns the publisher if not). */
+  private updateFeasibility(now: number): void {
+    const active = [...this.subscribers.values()].filter((s) => s.active)
+    const supply = this.ctx.rootSlots(this.id) + active.reduce((a, s) => a + Math.min(MAX_FANOUT, this.offeredSlots(s.id)), 0)
+    const ratio = feasibilityRatio(active.length, this.stripes, supply)
+    if (ratio >= 0.9) {
+      this.shortSince = null
+      if (this.limited) {
+        this.limited = null
+        this.ctx.onChange()
+      }
+      return
+    }
+    this.shortSince ??= now
+    if (now - this.shortSince >= SHORT_SUPPLY_FOR_MS) {
+      const next = { feasibleKbps: feasibleBitrate(this.kbps, ratio), ratio }
+      if (next.feasibleKbps !== this.limited?.feasibleKbps) {
+        this.limited = next
+        this.ctx.onChange()
+      }
     }
   }
 
   replan(): void {
     if (this.stopped) return
     const now = performance.now()
+    this.updateLateness(now)
+    this.updateFeasibility(now)
     for (const [key, until] of this.disruptedUntil) if (now > until) this.disruptedUntil.delete(key)
     const mesh = this.ctx.mesh
     const peers: PlannerPeer[] = []
@@ -471,6 +551,11 @@ export class ChannelPublisher {
     for (const c of result.changes) this.apply(c)
     this.sendPositions(result)
     if (deficitChanged) this.ctx.announce()
+    // Overcommitted: maybe the audience's estimates are stale (a network got better). Ask.
+    if (result.overcommitted > 0 && now - this.lastReprobeAsk > REPROBE_ASK_MS) {
+      this.lastReprobeAsk = now
+      for (const sub of this.subscribers.values()) if (sub.active) this.send(sub.id, { t: 'reprobe', ch: this.id })
+    }
     this.ctx.onChange()
   }
 

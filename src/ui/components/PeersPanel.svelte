@@ -2,7 +2,12 @@
   import type { Mesh } from '../../mesh/mesh'
   import { fmtKbps, fmtMs } from '../route'
 
-  let { mesh, badges, tick }: { mesh: Mesh; badges: (id: string) => string[]; tick: number } = $props()
+  let {
+    mesh,
+    badges,
+    tick,
+    onkick = null,
+  }: { mesh: Mesh; badges: (id: string) => string[]; tick: number; onkick?: ((id: string) => void) | null } = $props()
 
   // Everything here comes from gossip records, so the panel costs no extra traffic.
   const rows = $derived.by(() => {
@@ -29,7 +34,7 @@
 
 <div class="table-wrap" data-testid="peers-panel">
   <table>
-    <thead><tr><th>Peer</th><th>Link</th><th>RTT</th><th>Upload</th><th>Unreachable</th></tr></thead>
+    <thead><tr><th>Peer</th><th>Link</th><th>RTT</th><th>Upload</th><th>Unreachable</th>{#if onkick}<th></th>{/if}</tr></thead>
     <tbody>
       {#each rows as r (r.id)}
         <tr data-testid="peer-row" data-peer={r.id}>
@@ -42,6 +47,11 @@
           <td>{fmtMs(r.rtt)}</td>
           <td>{fmtKbps(r.capacity)}</td>
           <td data-testid="unreachable-count">{r.unreachable || ''}</td>
+          {#if onkick}
+            <td>
+              {#if !r.self}<button class="danger" data-testid="kick" onclick={() => onkick?.(r.id)}>Kick</button>{/if}
+            </td>
+          {/if}
         </tr>
       {/each}
     </tbody>

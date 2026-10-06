@@ -13,7 +13,7 @@
 //   A viewer stalls while it is missing more than m stripes.
 // - Overloaded parents (children * stripe rate > true capacity) degrade their subtree.
 
-import { HEADROOM } from '../src/session/capacity'
+import { HEADROOM, rebalanceWeights, splitBudget } from '../src/session/capacity'
 import type { PlannerConfig, PlannerPeer, Topology } from '../src/topology/model'
 import { emptyTopology } from '../src/topology/model'
 import { plan } from '../src/topology/planner'
@@ -88,8 +88,36 @@ interface Result {
   changesPerMin: number
 }
 
-function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAIR_MS): Result {
+/** Deterministic per-peer coin, independent of the main random stream. */
+function coin(id: string, salt: number): number {
+  let h = salt
+  for (let i = 0; i < id.length; i++) h = Math.imul(h ^ id.charCodeAt(i), 2654435761) >>> 0
+  return (h % 10_000) / 10_000
+}
+
+/** Extra forwarding delay of a "late" relay (alive, but slow to pass data on). */
+const LATE_EXTRA_MS = 250
+/** As in the app: a parent late by more than 150 ms for 10 s loses its children for 30 s. */
+const LATE_LIMIT_MS = 150
+const LATE_FOR_MS = 10_000
+const LATE_AVOID_MS = 30_000
+
+interface RunOptions {
+  /** Share of peers that forward LATE_EXTRA_MS late. */
+  lateFrac?: number
+  /** Whether the planner reacts to measured lateness (penalty + moving children away). */
+  handleLate?: boolean
+}
+
+function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAIR_MS, ro: RunOptions = {}): Result {
   seed = Number(args.get('seed') ?? 42)
+  const lateFrac = ro.lateFrac ?? 0
+  const handleLate = ro.handleLate ?? true
+  const lateExtra = (id: string) => (id !== HOST && coin(id, 7) < lateFrac ? LATE_EXTRA_MS : 0)
+  /** When each relay started relaying (lateness is only measured once it has children). */
+  const relaySince = new Map<string, number>()
+  const avoidUntil = new Map<string, Map<string, number>>()
+  let planNow = 0
   const S = k + m
   const stripeKbps = (BITRATE_KBPS / k) * 1.03
   const access = new Map<string, number>([[HOST, 10]])
@@ -103,6 +131,7 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
     switchGain: 1,
     rttSwitchMs: 40,
     rtt: (a, b) => 2 * ((access.get(a) ?? 10) + (access.get(b) ?? 10) + 10),
+    lateness: handleLate ? (parent) => (planNow - (relaySince.get(parent) ?? Infinity) >= 2000 ? lateExtra(parent) : 0) : undefined,
   }
   const trueCap = new Map<string, number>([[HOST, HOST_UPLOAD_KBPS]])
   /** Offered slots over time per peer: [time it was gossiped, slots], newest last. */
@@ -145,10 +174,34 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
   let viewerTicks = 0
 
   const replan = (now: number) => {
+    planNow = now
+    for (const [id, h] of Object.entries(topo.home)) {
+      if (h === null) relaySince.delete(id)
+      else if (!relaySince.has(id)) relaySince.set(id, now)
+    }
+    if (handleLate) {
+      // A relay late for LATE_FOR_MS loses its children for a while.
+      for (const [id, since] of relaySince) {
+        if (lateExtra(id) <= LATE_LIMIT_MS || now - since < LATE_FOR_MS) continue
+        for (const [child, ps] of Object.entries(topo.parents)) {
+          if (!ps.includes(id)) continue
+          const m = avoidUntil.get(child) ?? new Map<string, number>()
+          m.set(id, now + LATE_AVOID_MS)
+          avoidUntil.set(child, m)
+        }
+        relaySince.set(id, now)
+      }
+    }
     // Departures are seen at once (the publisher's own mesh links); joins and offers through gossip.
     const peers: PlannerPeer[] = [...live.values()]
       .filter((p) => now - p.joinedAt >= GOSSIP_DELAY_MS)
-      .map((p) => ({ id: p.id, slots: offerFor(p.id, now), joinedAt: p.joinedAt, failures: 0, avoid: [] }))
+      .map((p) => ({
+        id: p.id,
+        slots: offerFor(p.id, now),
+        joinedAt: p.joinedAt,
+        failures: 0,
+        avoid: [...(avoidUntil.get(p.id) ?? new Map<string, number>())].filter(([, t]) => t > now).map(([a]) => a),
+      }))
     const r = plan(peers, topo, cfg, now)
     changes += r.changes.length
     topo = r.topology
@@ -233,7 +286,7 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
           const children = load.get(par) ?? 1
           const perChild = Math.min(trueCap.get(par)! / children, trueCap.get(par)!)
           const pieceBits = ((BITRATE_KBPS * 1000) / FPS / k) * 1.03
-          lat += access.get(par)! + access.get(cur)! + 10 + pieceBits / perChild
+          lat += access.get(par)! + access.get(cur)! + 10 + pieceBits / perChild + lateExtra(par)
           quality = Math.min(quality, (trueCap.get(par)! / (children * stripeKbps)))
           cur = par
           depth++
@@ -267,7 +320,99 @@ function fmtRow(r: Result): string {
   return `${String(r.k).padEnd(2)} ${String(r.m).padEnd(1)} | ${r.p50.toFixed(0).padStart(6)} | ${r.p95.toFixed(0).padStart(6)} | ${String(r.maxDepth).padStart(9)} | ${r.stallPct.toFixed(3).padStart(7)} | ${r.stallsPerHour.toFixed(2).padStart(9)} | ${r.degradedPct.toFixed(2).padStart(10)} | ${r.changesPerMin.toFixed(0).padStart(18)}`
 }
 
-if (args.get('sweep') === 'parity') {
+/**
+ * Two publishers competing for the same audience's upload: every peer watches both channels and
+ * splits its budget between them (session/capacity.ts). The budget is split by stripe bitrate,
+ * i.e. into about as many slots for each channel, but B needs more of them (5 stripes against 2),
+ * so B runs short while A has slots to spare.
+ * With rebalancing, peers shift weight towards the channel that reports a deficit every 10 s.
+ */
+function runCompeting(rebalance: boolean): { deficit: [number, number]; degraded: [number, number] } {
+  seed = Number(args.get('seed') ?? 42)
+  const channels = [
+    { host: 'hostA', kbps: 1500, k: 2, m: 0 },
+    { host: 'hostB', kbps: 3000, k: 4, m: 1 },
+  ].map((c) => ({ ...c, stripeKbps: (c.kbps / c.k) * 1.03, topo: emptyTopology() as Topology, deficit: 0 }))
+  const peers = Array.from({ length: PEERS }, (_, i) => samplePeer(i, -10_000, 1e9))
+  const weights = new Map(peers.map((p) => [p.id, { 0: 1, 1: 1 } as Record<string, number>]))
+  const estimate = new Map(peers.map((p) => [p.id, p.trueKbps * (0.8 + rnd() * 0.3)]))
+  const sums = { deficit: [0, 0], degraded: [0, 0], samples: 0 }
+  for (let now = 0; now < SECONDS * 1000; now += REPLAN_EVERY_MS) {
+    if (rebalance && now % 10_000 === 0) {
+      for (const p of peers) weights.set(p.id, rebalanceWeights(weights.get(p.id)!, { 0: channels[0].deficit, 1: channels[1].deficit }))
+    }
+    // Each peer's offer per channel from its weighted budget split.
+    const offers = new Map(
+      peers.map((p) => {
+        const w = weights.get(p.id)!
+        const split = splitBudget(estimate.get(p.id)!, [], channels.map((c, i) => ({ id: i, stripeKbps: c.stripeKbps, weight: w[i] })))
+        return [p.id, split.offers]
+      }),
+    )
+    channels.forEach((c, i) => {
+      const cfg: PlannerConfig = {
+        hostId: c.host,
+        k: c.k,
+        m: c.m,
+        rootSlots: Math.floor((HOST_UPLOAD_KBPS * HEADROOM) / c.stripeKbps),
+        maxFanout: MAX_FANOUT,
+        minUptimeMsForRelay: 4000,
+        switchGain: 1,
+      }
+      const r = plan(
+        peers.map((p) => ({ id: p.id, slots: offers.get(p.id)![i] ?? 0, joinedAt: p.joinedAt, failures: 0, avoid: [] })),
+        c.topo,
+        cfg,
+        now,
+      )
+      c.topo = r.topology
+      c.deficit = r.overcommitted
+      if (now >= 30_000) {
+        sums.deficit[i] += r.overcommitted
+        // Degraded: a parent's children need more than its true upload share for this channel.
+        let degraded = 0
+        const load = new Map<string, number>()
+        for (const ps of Object.values(r.topology.parents)) ps.forEach((par) => par && load.set(par, (load.get(par) ?? 0) + 1))
+        for (const p of peers) {
+          const over = r.topology.parents[p.id].filter((par) => {
+            if (!par || par === c.host) return false
+            const share = (peers.find((x) => x.id === par)!.trueKbps * (weights.get(par)![i] / (weights.get(par)![0] + weights.get(par)![1])))
+            return (load.get(par) ?? 0) * c.stripeKbps > share
+          }).length
+          if (over > c.m) degraded++
+        }
+        sums.degraded[i] += degraded / peers.length
+      }
+    })
+    if (now >= 30_000) sums.samples++
+  }
+  return {
+    deficit: [sums.deficit[0] / sums.samples, sums.deficit[1] / sums.samples],
+    degraded: [(100 * sums.degraded[0]) / sums.samples, (100 * sums.degraded[1]) / sums.samples],
+  }
+}
+
+if (args.get('sweep') === 'late') {
+  // Relays that are alive but consistently late: with and without the planner reacting.
+  console.log(`peers=${PEERS} seconds=${SECONDS} late relays forward ${LATE_EXTRA_MS} ms late\n`)
+  console.log('late share | handled | p50 ms | p95 ms | stall %')
+  console.log('-----------+---------+--------+--------+--------')
+  for (const lateFrac of [0, 0.1, 0.25]) {
+    for (const handleLate of [false, true]) {
+      if (lateFrac === 0 && !handleLate) continue
+      const r = run(4, 1, MEAN_LIFETIME_S, REPAIR_MS, { lateFrac, handleLate })
+      console.log(`${`${lateFrac * 100}%`.padStart(10)} | ${(handleLate ? 'yes' : 'no').padStart(7)} | ${r.p50.toFixed(0).padStart(6)} | ${r.p95.toFixed(0).padStart(6)} | ${r.stallPct.toFixed(3).padStart(7)}`)
+    }
+  }
+} else if (args.get('sweep') === 'competing') {
+  console.log(`peers=${PEERS} seconds=${SECONDS}: two publishers (A 1.5 Mbps in 2+0 stripes, B 3 Mbps in 4+1), everyone watches both\n`)
+  console.log('rebalancing | overcommitted A | overcommitted B | degraded % A | degraded % B')
+  console.log('------------+-----------------+-----------------+--------------+-------------')
+  for (const rebalance of [false, true]) {
+    const r = runCompeting(rebalance)
+    console.log(`${(rebalance ? 'yes' : 'no').padStart(11)} | ${r.deficit[0].toFixed(1).padStart(15)} | ${r.deficit[1].toFixed(1).padStart(15)} | ${r.degraded[0].toFixed(2).padStart(12)} | ${r.degraded[1].toFixed(2).padStart(12)}`)
+  }
+} else if (args.get('sweep') === 'parity') {
   // How much does parity buy? Stall time (% of viewing time) for each (k, m) across churn levels.
   const lifetimes = [60, 240, 900]
   const configs: [number, number][] = [

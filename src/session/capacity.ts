@@ -91,3 +91,49 @@ export function stripeKbpsFor(bitrateKbps: number, k: number, audio: boolean): n
   // ~30 video and ~50 audio fragments per second, each with a 64-byte signature.
   return (bitrateKbps / k) * 1.05 + 15 + (audio ? 70 + 26 : 0)
 }
+
+/**
+ * Deficit-driven budget weights: every round a peer moves `step` of the weight of each channel
+ * without a deficit to the channels that have one (split evenly). With a single publisher this
+ * does nothing; with several, starved channels gain relay slots within a few rounds, without
+ * any negotiation. Weights are kept above a floor so no channel is starved in turn.
+ */
+export function rebalanceWeights(
+  weights: Record<string, number>,
+  deficits: Record<string, number>,
+  step = 0.1,
+  floor = 0.2,
+): Record<string, number> {
+  const ids = Object.keys(weights)
+  const short = ids.filter((id) => (deficits[id] ?? 0) > 0)
+  const fine = ids.filter((id) => (deficits[id] ?? 0) <= 0)
+  if (!short.length || !fine.length) return { ...weights }
+  const out = { ...weights }
+  let pool = 0
+  for (const id of fine) {
+    const give = Math.min(out[id] * step, Math.max(0, out[id] - floor))
+    out[id] -= give
+    pool += give
+  }
+  for (const id of short) out[id] += pool / short.length
+  return out
+}
+
+/**
+ * Can the audience carry a channel? Each of N subscribers needs one parent per stripe, so a
+ * channel needs N × S child slots; supply is the publisher's root slots plus what subscribers
+ * offer. Returns supply / demand (≥ 1: feasible).
+ */
+export function feasibilityRatio(subscribers: number, stripes: number, supplySlots: number): number {
+  const demand = subscribers * stripes
+  return demand === 0 ? Infinity : supplySlots / demand
+}
+
+/**
+ * A bitrate the audience can carry: slots scale with 1 / stripe bitrate, so scaling the bitrate
+ * by the supply ratio (with 10% margin) makes supply meet demand. Never below `floorKbps`.
+ */
+export function feasibleBitrate(currentKbps: number, ratio: number, floorKbps = 300): number {
+  if (!Number.isFinite(ratio) || ratio >= 1) return currentKbps
+  return Math.max(floorKbps, Math.round((currentKbps * ratio * 0.9) / 50) * 50)
+}

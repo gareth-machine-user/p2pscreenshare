@@ -6,7 +6,7 @@
 // - Subscriber: one Subscription per watched channel (session/subscription.ts).
 // - Relay: one RelayNode for every channel, forwarding over the mesh links' media channels.
 // - Capacity: an upload probe to 3 neighbours, split into relay slots per watched channel.
-import { grant, mayPublish as mayPublishDoc, revoke, setPolicy, type PublishPolicy } from '../mesh/auth'
+import { ban, grant, isBanned, mayPublish as mayPublishDoc, revoke, setPolicy, type PublishPolicy } from '../mesh/auth'
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
 import { Mesh } from '../mesh/mesh'
@@ -16,7 +16,7 @@ import { Uplink } from '../net/uplink'
 import type { PeerMsg, PublisherMsg, SubscriberMsg, TopologyReport } from '../proto/messages'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
-import { CapacityEstimator, splitBudget } from './capacity'
+import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor } from './capacity'
 import { PublishedStream, type ChannelPublisher, type PublisherContext, type ShareOptions } from './publisher'
 import { Subscription, type SubscriptionContext } from './subscription'
 
@@ -48,6 +48,15 @@ export interface PublishRequest {
   id: string
   at: number
 }
+
+/** Re-measure upload this often when relaying lightly (a network may have improved)... */
+const REPROBE_EVERY_MS = 5 * 60_000
+/** ...but never more often than this, whoever asks. */
+const REPROBE_MIN_GAP_MS = 30_000
+/** Budget weights shift towards channels with a deficit this often. */
+const REBALANCE_MS = 10_000
+/** Auto quality: wait this long between automatic restarts of a stream. */
+const AUTO_RESTART_GAP_MS = 30_000
 
 /** Auto quality falls back to the preview when the full stream stalls this long... */
 const AUTO_STALL_MS = 6000
@@ -87,6 +96,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   readonly requests = new Map<string, PublishRequest>()
   /** Set when the owner revoked this peer's stream. */
   revokedNotice = false
+  /** Set when the owner removed this peer from the lobby. */
+  kicked = false
+  /** The publisher's stream adapts its bitrate to what the audience can carry (Auto quality). */
+  autoBitrate = false
+  /** Budget weight per watched channel (deficit-driven). */
+  readonly weights = new Map<number, number>()
   /** Debug/e2e: keep publishing after a revocation (relays must still drop the stream). */
   debugIgnoreRevocation = false
   /** Debug/e2e: stage source changes, newest last. */
@@ -106,6 +121,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null
   private timers: ReturnType<typeof setInterval>[] = []
   private topoWatching = new Set<number>()
+  private lastProbeAt = -Infinity
+  private lastAutoRestart = -Infinity
   private stallSince: number | null = null
   private smoothSince: number | null = null
   private lastStageDecoded = 0
@@ -158,6 +175,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.timers.push(setInterval(() => this.sampleUplink(), 2000))
     this.timers.push(setInterval(() => this.maybeProbe(), 1000))
     this.timers.push(setInterval(() => this.checkAutoQuality(), 500))
+    this.timers.push(setInterval(() => this.rebalance(), REBALANCE_MS))
+    this.timers.push(setInterval(() => this.checkAutoBitrate(), 2000))
+    this.timers.push(setInterval(() => this.maybeReprobe(), 30_000))
     this.timers.push(setInterval(() => this.logStage(), 100))
   }
 
@@ -384,6 +404,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   private onAuthChange(): void {
+    if (!this.kicked && isBanned(this.mesh.auth, this.mesh.pubKeyOf(this.selfId))) {
+      this.kicked = true
+      void this.leave()
+      this.onChange()
+      return
+    }
     if (this.publishing && !this.canShare && !this.debugIgnoreRevocation) {
       this.stopSharing()
       this.revokedNotice = true
@@ -461,7 +487,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   /** Recomputes the budget split and gossips the offered slots if they changed. */
   private updateOffers(): void {
     const own = this.ownChannels().map((c) => ({ id: c.id, stripeKbps: c.stripeKbps, stripes: c.stripes }))
-    const watched = [...this.subs.values()].map((s) => ({ id: s.channel, stripeKbps: s.ann.stripeKbps, weight: 1 }))
+    const watched = [...this.subs.values()].map((s) => ({ id: s.channel, stripeKbps: s.ann.stripeKbps, weight: this.weights.get(s.channel) ?? 1 }))
     const split = splitBudget(this.capacity.estimateKbps, own, watched)
     this.rootSlotsByChannel = split.rootSlots
     const offers = Object.fromEntries(Object.entries(split.offers).map(([ch, n]) => [String(ch), n]))
@@ -475,6 +501,63 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     ) {
       this.mesh.updateRecord({ offers, subs, capacityKbps })
     }
+  }
+
+  /**
+   * Shifts this peer's relay budget towards watched channels whose publisher reports a deficit
+   * (it had to overcommit), away from those without. Converges in a few rounds, no negotiation.
+   */
+  private rebalance(): void {
+    const weights: Record<string, number> = {}
+    const deficits: Record<string, number> = {}
+    for (const sub of this.subs.values()) {
+      weights[sub.channel] = this.weights.get(sub.channel) ?? 1
+      deficits[sub.channel] = sub.ann.deficit
+    }
+    const next = rebalanceWeights(weights, deficits)
+    this.weights.clear()
+    for (const [ch, w] of Object.entries(next)) this.weights.set(Number(ch), w)
+    this.updateOffers()
+  }
+
+  /** Re-measures upload every 5 minutes while relay load is light. */
+  private maybeReprobe(): void {
+    const now = performance.now()
+    const est = this.capacity.estimateKbps
+    if (est === null || now - this.lastProbeAt < REPROBE_EVERY_MS) return
+    if (this.uplinkNow.kbps < est * 0.3) void this.probe()
+  }
+
+  /**
+   * Auto quality for a presenter: when the audience's upload can't carry the stream for 10 s, the
+   * publisher's sharing controls warn, and with Auto quality the stream restarts at a bitrate it
+   * can carry (a brief blip).
+   */
+  private checkAutoBitrate(): void {
+    const s = this.publishing
+    const full = s?.full
+    if (!s || !full?.limited || !this.autoBitrate) return
+    const now = performance.now()
+    if (now - this.lastAutoRestart < AUTO_RESTART_GAP_MS || full.limited.feasibleKbps >= s.opts.bitrateKbps) return
+    this.lastAutoRestart = now
+    void this.share({ ...s.opts, bitrateKbps: full.limited.feasibleKbps }).catch((e) => console.warn('auto quality restart failed', e))
+  }
+
+  /**
+   * Auto mode picks a second parity stripe when the lobby has enough relays: at least two capable
+   * relays (two stripes of upload) per stripe.
+   */
+  autoParity(k: number, m: number, bitrateKbps: number): number {
+    const r = stripeKbpsFor(bitrateKbps, k, true)
+    const relays = this.mesh.members().filter((rec) => (rec.capacityKbps ?? 0) * 0.75 >= 2 * r).length
+    return relays >= 2 * (k + 2) ? Math.max(m, 2) : m
+  }
+
+  /** Owner: removes a member (members close their links, doors refuse it). */
+  async kick(id: string): Promise<void> {
+    const key = this.mesh.pubKeyOf(id)
+    if (!this.isOwner || !key || id === this.ownerId) return
+    await this.mesh.updateAuth((doc) => ban(doc, key))
   }
 
   // --- control messages --------------------------------------------------------------------------
@@ -516,6 +599,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       // Tree commands for a channel come only from that channel's publisher.
       const sub = this.subs.get(m.ch >>> 0)
       if (sub && sub.publisher === from) sub.handle(m)
+      return
+    }
+    if (msg.t === 'reprobe') {
+      const sub = this.subs.get(msg.ch >>> 0)
+      if (sub && sub.publisher === from && performance.now() - this.lastProbeAt > REPROBE_MIN_GAP_MS) void this.probe()
       return
     }
     if (msg.t === 'topo') {
@@ -587,6 +675,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   async probe(): Promise<number | null> {
     if (this.probing) return null
     this.probing = true
+    this.lastProbeAt = performance.now()
     try {
       const targets = [...this.mesh.conns.values()]
         .filter((c) => c.isOpen)

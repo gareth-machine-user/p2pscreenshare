@@ -31,6 +31,8 @@ export interface HostOpts {
   audio?: boolean
   /** Mix in the (fake) microphone. */
   mic?: boolean
+  /** Auto quality: restart at a bitrate the audience can carry. */
+  autoQuality?: boolean
 }
 
 /** `streamId` is the host's seed (its `stream` param); viewers join with the derived join code. */
@@ -51,6 +53,7 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
     up: String(o.up ?? 4000),
     audio: o.audio ? '1' : '0',
     mic: o.mic ? '1' : '0',
+    quality: o.autoQuality ? 'auto' : 'fixed',
     share: '1',
     res: o.res ?? '640x360',
     stream: streamId,

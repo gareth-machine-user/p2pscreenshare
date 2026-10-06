@@ -4,6 +4,8 @@
 
   let {
     audio,
+    limited = null,
+    auto = false,
     quality,
     onmic,
     onsystem,
@@ -12,6 +14,10 @@
     onstop,
   }: {
     audio: { system: boolean; mic: boolean; systemMuted: boolean; micMuted: boolean }
+    /** Set while the audience's upload can't carry the stream. */
+    limited?: { feasibleKbps: number } | null
+    /** Auto quality will lower the bitrate by itself. */
+    auto?: boolean
     quality: QualityPreset
     onmic: (muted: boolean) => void
     onsystem: (muted: boolean) => void
@@ -40,5 +46,10 @@
     {#each Object.entries(QUALITY_PRESETS) as [value, p]}<option {value}>{p.label}</option>{/each}
   </select>
   <span class="spacer"></span>
+  {#if limited}
+    <span class="badge warn" data-testid="audience-limited">
+      Audience upload is limited: about {(limited.feasibleKbps / 1000).toFixed(1)} Mbps will play smoothly{auto ? ' (adjusting)' : ''}
+    </span>
+  {/if}
   <button class="danger" data-testid="presenter-stop" onclick={onstop}><Icon name="stop" />Stop</button>
 </div>
