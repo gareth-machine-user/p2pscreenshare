@@ -198,6 +198,8 @@ export class Player {
 
   private tick(): void {
     this.pump()
+    // Lets the audio jitter buffer give up on a missing frame once a later one is due.
+    this.audio.pump()
     const now = wallClock()
     // Show the newest frame that is due; drop older due frames.
     let due: Pending | null = null

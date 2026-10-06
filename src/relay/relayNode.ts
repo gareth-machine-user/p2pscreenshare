@@ -124,7 +124,10 @@ export class RelayNode {
     }
     const cache = this.caches.get(key)
     if (!cache) return
-    for (const raw of cache.frags) this.uplink.send(link, withReplayFlag(raw), 0, REPLAY_MAX_AGE_MS, true)
+    // Only what the decoder needs to catch up: the keyframe and base-layer frames. Enhancement
+    // layers (T1, T2) are referenced by nothing later, and skipping them makes the catch-up about a
+    // quarter of the size, which matters with long GOPs.
+    for (const raw of cache.frags) if (peekLayer(raw) === 0) this.uplink.send(link, withReplayFlag(raw), 0, REPLAY_MAX_AGE_MS, true)
   }
 
   /** Fragment produced locally (publisher). */

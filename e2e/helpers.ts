@@ -145,8 +145,11 @@ export const PERF = {
   minFps: envNumber('E2E_MIN_FPS', 15),
   /** Lowest frame rate allowed while a relay fails over. */
   minFailoverFps: envNumber('E2E_MIN_FAILOVER_FPS', 10),
-  /** Glass-to-glass latency bound (median, for trees). */
-  maxLatencyMs: envNumber('E2E_MAX_LATENCY_MS', 1500),
+  /**
+   * Glass-to-glass latency bound (median, for trees). The default quality profile (tuning.ts)
+   * trades delay for complete frames: longer queue deadlines and a deeper jitter buffer.
+   */
+  maxLatencyMs: envNumber('E2E_MAX_LATENCY_MS', 3000),
 }
 
 export function median(xs: number[]): number {

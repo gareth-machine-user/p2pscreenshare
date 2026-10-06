@@ -7,6 +7,8 @@ type AudioInfo = NonNullable<StreamInfo['audio']>
 
 /** Minimum time between AudioDecoder rebuilds after errors. */
 const REBUILD_INTERVAL_MS = 1000
+/** Most encoded audio frames held for decoding (about 5 s of 20 ms frames). */
+const MAX_PENDING = 250
 
 /** Encodes an audio track to Opus (Chromium: needs MediaStreamTrackProcessor). */
 export class AudioPipeline {
@@ -17,7 +19,18 @@ export class AudioPipeline {
   private stopped = false
   private reader: ReadableStreamDefaultReader<AudioData> | null = null
 
+  private tsOffsetMs: number | null = null
+
   constructor(private track: MediaStreamTrack) {}
+
+  /** Wall-clock capture time of a chunk, from its media timestamp (µs). */
+  private captureTimeOf(timestampUs: number): number {
+    const ms = timestampUs / 1000
+    const now = wallClock()
+    // Re-anchor if the media clock and the wall clock drift apart by more than 200 ms.
+    if (this.tsOffsetMs === null || Math.abs(ms + this.tsOffsetMs - now) > 200) this.tsOffsetMs = now - ms
+    return ms + this.tsOffsetMs
+  }
 
   static supported(): boolean {
     return typeof AudioEncoder !== 'undefined' && typeof MediaStreamTrackProcessor !== 'undefined'
@@ -43,7 +56,9 @@ export class AudioPipeline {
           key: true,
           layer: 0,
           audio: true,
-          captureTime: wallClock(),
+          // From the audio's own timestamps (regular 20 ms spacing), anchored to the wall clock
+          // once: the encoder's output timing is bursty.
+          captureTime: this.captureTimeOf(chunk.timestamp),
           data,
         })
       },
@@ -70,7 +85,15 @@ export class AudioPipeline {
   }
 }
 
-/** Decodes Opus frames and schedules them on the shared playout timeline. */
+/**
+ * Decodes Opus frames and plays them on the shared playout timeline.
+ *
+ * Audio frames travel on every stripe over unordered channels and different relay paths, so they
+ * arrive out of order. They are kept in a small jitter buffer and decoded in sequence (Opus is
+ * stateful); a missing frame is skipped only when the next one is due. Decoded chunks are played
+ * back to back, each starting where the previous one ended, so jitter in the target times doesn't
+ * leave clicks or gaps; playback re-syncs only if it drifts from the target by more than RESYNC_S.
+ */
 export class AudioPlayer {
   private ctx: AudioContext | null = null
   private gain: GainNode | null = null
@@ -78,10 +101,16 @@ export class AudioPlayer {
   muted = true
   private decoder: AudioDecoder | null = null
   private configured = ''
+  /** Encoded frames waiting to be decoded, by sequence number. */
+  private pending = new Map<number, { f: EncodedFrame; renderAt: number }>()
+  private nextSeq: number | null = null
+  /** Target play times of frames handed to the decoder, in decode order. */
+  private decoding: number[] = []
+  /** Audio-context time where the scheduled audio ends. */
+  private nextTime = 0
+  stats = { played: 0, late: 0, skipped: 0, resyncs: 0 }
   private info: AudioInfo | null = null
   private lastBuildAt = -Infinity
-  private renderAtByTs = new Map<number, number>()
-  private lastSeq = -1
 
   /** Must be called from a user gesture (autoplay policy). */
   enable(): void {
@@ -110,6 +139,8 @@ export class AudioPlayer {
     this.configured = key
     this.info = info
     this.lastBuildAt = -Infinity
+    this.pending.clear()
+    this.nextSeq = null
     this.build()
   }
 
@@ -121,7 +152,9 @@ export class AudioPlayer {
     if (now - this.lastBuildAt < REBUILD_INTERVAL_MS) return false
     this.lastBuildAt = now
     this.closeDecoder()
-    this.renderAtByTs.clear()
+    // Frames still inside a failed decoder never come out: their play times must go too, or every
+    // later chunk would be scheduled against the wrong one.
+    this.decoding = []
     const decoder = new AudioDecoder({
       output: (data) => this.play(data),
       error: (e) => {
@@ -152,29 +185,68 @@ export class AudioPlayer {
   /** `renderAt` is the local wall-clock time this frame should be heard. */
   push(f: EncodedFrame, renderAt: number | null): void {
     if (!this.info || !this.enabled || renderAt === null) return
-    if (f.seq <= this.lastSeq) return
-    this.lastSeq = f.seq
-    if ((!this.decoder || this.decoder.state === 'closed') && !this.build()) return
-    const ts = Math.round(f.captureTime * 1000)
-    this.renderAtByTs.set(ts, renderAt)
-    if (this.renderAtByTs.size > 300) this.renderAtByTs.clear()
-    try {
-      this.decoder!.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data: f.data }))
-    } catch (err) {
-      console.warn('audio decode error', err)
+    // Already decoded (or skipped): a duplicate or a straggler.
+    if (this.nextSeq !== null && f.seq < this.nextSeq) return
+    if (this.pending.has(f.seq)) return
+    // Bounded while a failed decoder waits to be rebuilt.
+    if (this.pending.size >= MAX_PENDING) {
+      this.pending.clear()
+      this.nextSeq = null
+    }
+    this.pending.set(f.seq, { f, renderAt })
+    if (!this.decoder || this.decoder.state === 'closed') this.build()
+    this.pump()
+  }
+
+  /** Decodes in sequence order; skips a missing frame once a later one is about due. */
+  pump(): void {
+    const decoder = this.decoder
+    if (!decoder || decoder.state !== 'configured') return
+    for (;;) {
+      if (this.nextSeq === null) {
+        if (!this.pending.size) return
+        this.nextSeq = Math.min(...this.pending.keys())
+      }
+      const item = this.pending.get(this.nextSeq)
+      if (item) {
+        this.pending.delete(this.nextSeq)
+        this.nextSeq++
+        this.decoding.push(item.renderAt)
+        try {
+          decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(item.f.captureTime * 1000), data: item.f.data }))
+        } catch (err) {
+          this.decoding.pop()
+          console.warn('audio decode error', err)
+        }
+        continue
+      }
+      // nextSeq is missing: wait unless a later frame is due within a frame's time.
+      if (!this.pending.size) return
+      const later = Math.min(...this.pending.keys())
+      if (this.pending.get(later)!.renderAt - wallClock() > 20) return
+      this.stats.skipped += later - this.nextSeq
+      this.nextSeq = later
     }
   }
 
   private play(data: AudioData): void {
     const ctx = this.ctx
-    const renderAt = this.renderAtByTs.get(data.timestamp)
-    this.renderAtByTs.delete(data.timestamp)
+    const renderAt = this.decoding.shift()
     if (!ctx || renderAt === undefined) {
       data.close()
       return
     }
-    const when = ctx.currentTime + (renderAt - wallClock()) / 1000
-    if (when < ctx.currentTime) {
+    const now = ctx.currentTime
+    const target = now + (renderAt - wallClock()) / 1000
+    const duration = data.numberOfFrames / data.sampleRate
+    // Back to back with what is already scheduled, unless that drifted far from the target.
+    let start = this.nextTime
+    if (this.nextTime < now || Math.abs(target - this.nextTime) > RESYNC_S) {
+      if (this.nextTime > 0) this.stats.resyncs++
+      start = Math.max(target, now + 0.01)
+    }
+    if (start + duration < now) {
+      this.stats.late++
       data.close()
       return
     }
@@ -188,7 +260,9 @@ export class AudioPlayer {
     const src = ctx.createBufferSource()
     src.buffer = buf
     src.connect(this.gain ?? ctx.destination)
-    src.start(when)
+    src.start(start)
+    this.nextTime = start + duration
+    this.stats.played++
   }
 
   close(): void {
@@ -197,3 +271,6 @@ export class AudioPlayer {
     void this.ctx?.close().catch(() => {})
   }
 }
+
+/** Playback re-syncs to the jitter buffer's target when it drifts further than this (s). */
+const RESYNC_S = 0.12

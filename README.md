@@ -25,6 +25,10 @@ only to find the lobby; no media server is involved.
   arrival times. The default profile favours complete frames over delay (see
   [Quality versus latency](#quality-versus-latency)); the low-latency profile measured about
   **70 ms** glass-to-glass in local e2e tests.
+- **Gapless audio.** Opus frames ride on every stripe of the full channel. A small jitter buffer
+  reorders them and decodes in sequence, and chunks are played back to back, re-syncing to the
+  playout clock only when they drift. Catch-up replays and upload probes are paced so live audio
+  never waits behind them.
 - **Graceful degradation.** Uplink queues drop temporal enhancement layers (T2, then T1) first, so
   an overloaded relay lowers the frame rate instead of stalling. A relay cache of the frames since
   the last keyframe (the GOP) lets new or re-attached children start decoding immediately.
@@ -475,6 +479,6 @@ CHROMIUM_LD_PRELOAD=$PWD/tools/nosme/nosme.so npm run e2e
 - **Encoding and playback.** Each stream has a full encoding and a small preview; viewers on weak
   downlinks can switch to the preview, and overloaded relays drop temporal layers. Capture relies
   on `MediaStreamTrackProcessor` (Chromium); other browsers fall back to sampling a `<video>`
-  element. Audio playback scheduling is basic. Testing so far is mostly headless Chromium.
+  element.  Testing so far is mostly headless Chromium.
 - **Tracker reliability.** Public trackers are flaky. Self-host one with `npm run tracker` (it's
   `bittorrent-tracker`) behind TLS for real use.

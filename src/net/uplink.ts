@@ -5,6 +5,8 @@ import { tuning } from '../tuning'
 // (T2, then T1) expire first, so overloaded relays degrade frame rate instead of stalling the
 // base layer.
 const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
+/** Replays and probe data are sent only while the channel's send buffer holds less than this (bytes). */
+const REPLAY_BUFFER_MAX = 64 * 1024
 
 /** Layers beyond the table (none on the wire: the layer is 2 bits) get the last entry's deadline. */
 function maxAgeForLayer(layer: number): number {
@@ -218,6 +220,10 @@ export class Uplink {
           }
           if (!q.length || link.bufferedAmount > LINK_BUFFER_HIGH) continue
           const it = q[0]
+          // Catch-up replays and probes only go out while the channel's send buffer is nearly
+          // empty: a mesh link's channels share one connection, so a deep backlog of either would
+          // hold up live media (audio especially) inside it.
+          if ((it.replay || this.background.has(link)) && link.bufferedAmount > REPLAY_BUFFER_MAX) continue
           // Tokens may go negative (debt), so messages larger than the burst still get through.
           if (this.capKbps !== null && this.tokens <= 0) {
             waitingOnTokens = true

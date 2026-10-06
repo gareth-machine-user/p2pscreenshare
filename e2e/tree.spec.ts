@@ -44,10 +44,12 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
   }
   const lat = snaps.map((s) => s.latencyMs!).filter((x) => x !== null)
   expect(median(lat)).toBeLessThan(PERF.maxLatencyMs)
-  // Weak peers (< 1 stripe of upload) never relay.
-  snaps.forEach((s, i) => {
-    if (CAPS[i] <= 800) expect(s.home).toBeNull()
-  })
+  // A peer relays only if its upload covers at least one stripe at the current stripe rate
+  // (congestion control may lower the bitrate, which lets weaker peers carry a stripe).
+  for (const [i, v] of viewers.entries()) {
+    const stripeKbps = await v.evaluate(() => (window.__p2p as { stageSub?: { ann: { stripeKbps: number } } }).stageSub?.ann.stripeKbps ?? 0)
+    if (snaps[i].home !== null) expect(CAPS[i] * 0.75).toBeGreaterThanOrEqual(stripeKbps * 0.9)
+  }
   // The host serves only a few children; relays carry the rest.
   expect(h.hostChildren).toBeLessThanOrEqual(4)
   expect(snaps.some((s) => s.children > 0)).toBe(true)
