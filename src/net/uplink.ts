@@ -27,6 +27,8 @@ interface Item {
 /** Live-media counters for one link (cumulative). */
 export interface LinkCounters {
   sentItems: number
+  /** Live-media bytes handed to the channel (with bufferedAmount, how long its buffer takes to drain). */
+  sentBytes: number
   drops: number
   queueDelaySum: number
   queueDelayN: number
@@ -104,7 +106,7 @@ export class Uplink {
   private counters(link: MediaLink): LinkCounters {
     let c = this.perLink.get(link)
     if (!c) {
-      c = { sentItems: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0 }
+      c = { sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0 }
       this.perLink.set(link, c)
     }
     return c
@@ -225,7 +227,9 @@ export class Uplink {
             if (link.state === 'closed' || link.state === 'failed') this.forget(link)
             continue
           }
-          if (!q.length || link.bufferedAmount > LINK_BUFFER_HIGH) continue
+          // Background links (probes) are bounded by their own allowance, which grows past this on
+          // fast links.
+          if (!q.length || (!this.background.has(link) && link.bufferedAmount > LINK_BUFFER_HIGH)) continue
           const it = q[0]
           // Catch-up replays and probes only go out while the channel's send buffer is nearly
           // empty: a mesh link's channels share one connection, so a deep backlog of either would
@@ -250,6 +254,7 @@ export class Uplink {
               this.stats.queueDelayN++
               const c = this.counters(link)
               c.sentItems++
+              c.sentBytes += it.data.byteLength
               c.queueDelaySum += now - it.enqueuedAt
               c.queueDelayN++
             }
