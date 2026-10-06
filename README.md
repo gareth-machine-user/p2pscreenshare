@@ -141,7 +141,7 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    lightly loaded and visible. 75% of the estimate is split into relay slots per watched channel (a publisher
    first reserves its own roots), weighted towards channels whose publisher reports a deficit,
    and gossiped.
-6. **Planning** (`src/session/publisher.ts`, `src/topology/planner.ts`). The publisher replans
+6. **Planning** (`src/session/channelPublisher.ts`, `src/topology/planner.ts`). The publisher replans
    every 2 s and 50 ms after inputs change. `plan()` is pure and deterministic: home stripes are
    balanced by offered slots, each tree is built top-down keeping valid existing parents
    (hysteresis: a move needs a parent a level shallower or 40 ms closer), newcomers stay leaves
@@ -506,7 +506,7 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `stripeSilenceMs` | `tuning.ts` | 1500 (quality), 1000 (latency) | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
 | `REATTACH_BATCH_MS` | `topology/policy.ts` | 400 | Collateral-blame window: reattach requests collected this long are handled shallowest-first |
 | `LATE_PARENT_MS`, `LATE_PARENT_FOR_MS`, `LATE_PARENT_AVOID_MS` | `topology/policy.ts` | 150, 10000, 30000 | How late, for how long, a parent may be before its children avoid it, and for how long |
-| `LIVENESS_TIMEOUT_MS` | `session/publisher.ts` | 1200 | The dead-parent confirmation timeout |
+| `LIVENESS_TIMEOUT_MS` | `session/channelPublisher.ts` | 1200 | The dead-parent confirmation timeout |
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
 | `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*`, `mediaMaxPacketLifeTimeMs`, `ccQueueMs` | `tuning.ts` | see the table above | Uplink layer deadlines, jitter buffer, retransmits and congestion back-off: latency vs complete, smooth frames |

@@ -98,7 +98,7 @@ test('revoking a publisher stops its stream, and relays drop what it still sends
   const forced = await alice.evaluate(async (viewerId: string) => {
     const s = window.__p2p as Any
     s.debugIgnoreRevocation = true
-    const modulePath = '/src/session/publisher.ts'
+    const modulePath = '/src/session/publishedStream.ts'
     const { PublishedStream } = await import(/* @vite-ignore */ modulePath)
     const stream = new PublishedStream({ k: 1, m: 0, bitrateKbps: 600, source: 'test', audio: false, testSize: [320, 180] }, s)
     s.publishing = stream

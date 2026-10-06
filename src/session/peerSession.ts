@@ -2,7 +2,7 @@
 // watches, and (with the right to publish) a publisher planning its own channels' trees.
 //
 // - Membership: the mesh (mesh/mesh.ts): links, gossip records, chat.
-// - Publisher: PublishedStream + one ChannelPublisher per channel (session/publisher.ts).
+// - Publisher: PublishedStream + one ChannelPublisher per channel (session/publishedStream.ts, session/channelPublisher.ts).
 // - Subscriber: one Subscription per watched channel (session/subscription.ts).
 // - Relay: one RelayNode for every channel, forwarding over the mesh links' media channels.
 // - Capacity: an upload probe to 3 neighbours, split into relay slots per watched channel.
@@ -20,7 +20,8 @@ import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
 import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor, uplinkIsFull } from './capacity'
 import { CONGESTION_DEFAULTS, CongestionController, type CongestionConfig } from './congestion'
-import { PublishedStream, type ChannelPublisher, type PublisherContext, type ShareOptions } from './publisher'
+import type { ChannelPublisher, PublisherContext } from './channelPublisher'
+import { PublishedStream, type ShareOptions } from './publishedStream'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'

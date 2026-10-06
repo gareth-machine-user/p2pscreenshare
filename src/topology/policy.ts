@@ -1,7 +1,7 @@
 // Publisher-side tree policy that is independent of networking: the planner's tuning, how long
 // reattach requests are batched, when a late parent loses its children, which keyframe requests
 // are honoured, and when a child's complaint counts against its parent. ChannelPublisher
-// (session/publisher.ts) runs it for real; the simulator (sim/simulator.ts) runs the same code.
+// (session/channelPublisher.ts) runs it for real; the simulator (sim/simulator.ts) runs the same code.
 import type { PlannerConfig } from './model'
 
 /** Peers must have subscribed this long before they are trusted as relays (ms). */

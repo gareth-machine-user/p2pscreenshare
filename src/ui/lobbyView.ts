@@ -1,5 +1,5 @@
 // Pure rules behind the lobby page (Lobby.svelte), kept out of the component so they can be tested.
-import type { ShareOptions } from '../session/publisher'
+import type { ShareOptions } from '../session/publishedStream'
 import { numParam, sizeParam } from './route'
 import { QUALITY_PRESETS, type ShareSettings } from './settings.svelte'
 

@@ -62,7 +62,7 @@ const BUFFER_MS = 60
 const LATE_EXTRA_MS = 250
 
 // Lossy viewers (simulateLossy). Subscriber-side constants mirror session/subscription.ts,
-// publisher-side ones session/publisher.ts.
+// publisher-side ones session/channelPublisher.ts.
 const PARENT_GRACE_MS = 3000
 const REATTACH_COOLDOWN_MS = 4000
 const KEY_REQUEST_INTERVAL_MS = 500

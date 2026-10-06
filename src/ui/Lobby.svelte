@@ -4,7 +4,7 @@
   import type { PublishPolicy } from '../mesh/auth'
   import { DEFAULT_ICE } from '../net/bootstrap'
   import { PeerSession } from '../session/peerSession'
-  import type { ShareOptions } from '../session/publisher'
+  import type { ShareOptions } from '../session/publishedStream'
   import { fmtKbps, fmtMs, iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
   import { applyAutoQuality, resolveShareOptions, stageMessage } from './lobbyView'
   import { ownerSeed, QUALITY_PRESETS, saveSettings, settings, type QualityPreset } from './settings.svelte'

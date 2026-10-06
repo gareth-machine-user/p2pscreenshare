@@ -12,7 +12,7 @@ const ownWire = (v: number) => COPIES * stripeKbpsFor(v, K, true)
 /** The best video bitrate a wire ceiling can carry (no other traffic). */
 const sustainable = (wire: number) => videoKbpsForWire(wire, ownWire)
 
-/** publisher.ts PublishedStream.adaptBitrate: clamp to [300, ceiling], 50 kbps steps. */
+/** publishedStream.ts PublishedStream.adaptBitrate: clamp to [300, ceiling], 50 kbps steps. */
 const applyRate = (kbps: number, ceiling: number) => Math.round(Math.min(ceiling, Math.max(300, kbps)) / 50) * 50
 
 /** The policy this replaced (PeerSession.adaptBitrate before congestion.ts), for comparison. */

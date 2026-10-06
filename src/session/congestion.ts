@@ -127,9 +127,9 @@ export interface CongestionDecision {
   reason: string
 }
 
-/** Bitrates are changed in steps of 50 kbps (publisher.ts); smaller moves are noise. */
+/** Bitrates are changed in steps of 50 kbps (publishedStream.ts); smaller moves are noise. */
 const MIN_CHANGE_KBPS = 50
-/** The encoder's floor (publisher.ts MIN_ADAPTIVE_KBPS). */
+/** The encoder's floor (publishedStream.ts MIN_ADAPTIVE_KBPS). */
 const FLOOR_KBPS = 300
 /** What was sent is no estimate below this share of the stream's demand. */
 const UNRELIABLE_SHARE = 0.05
