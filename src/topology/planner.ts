@@ -16,18 +16,83 @@ import { stripeCount } from './model'
 export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConfig, now: number): PlanResult {
   const S = stripeCount(cfg)
   const peers = [...peersIn].sort((a, b) => a.joinedAt - b.joinedAt || cmp(a.id, b.id))
-  const byId = new Map(peers.map((p) => [p.id, p]))
 
   // 1. Relay slots per peer: what it offered for this channel, capped.
   const slots: Record<string, number> = {}
   for (const p of peers) slots[p.id] = Math.max(0, Math.min(cfg.maxFanout, Math.floor(p.slots) || 0))
   const score = (p: PlannerPeer) => slots[p.id] / (1 + p.failures)
+
+  // 2. Home stripes.
+  const home = assignHomes(peers, current, cfg, slots, score, now)
+
+  // 3. Root slots per stripe.
+  const hostPerStripe = rootSlotsPerStripe(cfg)
+
+  // 4. Build each stripe tree.
+  const ctx: PlanContext = {
+    cfg,
+    current,
+    peers,
+    byId: new Map(peers.map((p) => [p.id, p])),
+    slots,
+    home,
+    score,
+    parents: {},
+    depth: {},
+    overcommitted: 0,
+    rootOver: [],
+  }
+  for (const p of peers) {
+    ctx.parents[p.id] = new Array(S).fill(null)
+    ctx.depth[p.id] = new Array(S).fill(0)
+  }
+  for (let s = 0; s < S; s++) new StripeBuilder(ctx, s, hostPerStripe[s]).build()
+
+  // 5. Shed root overcommit where parity allows.
+  shedRootOvercommit(ctx)
+
+  // 6. Diff against the current topology.
+  const changes = diffTopology(peers, current, ctx.parents, S)
+
+  return { topology: { parents: ctx.parents, home }, changes, depth: ctx.depth, overcommitted: ctx.overcommitted, slots }
+}
+
+/** State shared by the planning steps. */
+interface PlanContext {
+  cfg: PlannerConfig
+  current: Topology
+  /** Sorted by join time, then id. */
+  peers: PlannerPeer[]
+  byId: Map<string, PlannerPeer>
+  slots: Record<string, number>
+  home: Record<string, number | null>
+  score: (p: PlannerPeer) => number
+  /** Output, filled stripe by stripe. */
+  parents: Record<string, (string | null)[]>
+  depth: Record<string, number[]>
+  /** Attachments that exceed some parent's estimated capacity. */
+  overcommitted: number
+  /** Attachments that overcommit the root (the publisher), in placement order. */
+  rootOver: { peer: string; stripe: number }[]
+}
+
+/**
+ * Home stripes: eligible relays (some slots, and either already relaying or subscribed long enough)
+ * keep their existing assignment; new relays go to the stripe with least supply, strongest first.
+ */
+function assignHomes(
+  peers: PlannerPeer[],
+  current: Topology,
+  cfg: PlannerConfig,
+  slots: Record<string, number>,
+  score: (p: PlannerPeer) => number,
+  now: number,
+): Record<string, number | null> {
+  const S = stripeCount(cfg)
   const wasRelay = (p: PlannerPeer) => current.home[p.id] != null && current.home[p.id]! < S
   const eligible = peers.filter(
     (p) => slots[p.id] >= 1 && (wasRelay(p) || now - p.joinedAt >= cfg.minUptimeMsForRelay),
   )
-
-  // 2. Home stripes: keep existing assignments, give new relays to the stripe with least supply.
   const home: Record<string, number | null> = {}
   for (const p of peers) home[p.id] = null
   const supply = new Array<number>(S).fill(0)
@@ -47,34 +112,47 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     home[p.id] = s
     supply[s] += slots[p.id]
   }
+  return home
+}
 
-  // 3. Root slots per stripe (at least one each: the publisher must emit every stripe).
+/**
+ * Root slots per stripe, at least one each (the publisher must emit every stripe). A fixed split,
+ * not supply-dependent, so membership changes don't reshuffle host slots.
+ */
+function rootSlotsPerStripe(cfg: PlannerConfig): number[] {
+  const S = stripeCount(cfg)
   const hostSlots = Math.max(S, Math.floor(cfg.rootSlots) || 0)
-  // Fixed split (not supply-dependent) so membership changes don't reshuffle host slots.
-  const hostPerStripe = [...Array(S).keys()].map((s) => Math.floor(hostSlots / S) + (s < hostSlots % S ? 1 : 0))
+  return [...Array(S).keys()].map((s) => Math.floor(hostSlots / S) + (s < hostSlots % S ? 1 : 0))
+}
 
-  // 4. Build each stripe tree.
-  const parents: Record<string, (string | null)[]> = {}
-  const depth: Record<string, number[]> = {}
-  for (const p of peers) {
-    parents[p.id] = new Array(S).fill(null)
-    depth[p.id] = new Array(S).fill(0)
-  }
-  let overcommitted = 0
-  /** Attachments that overcommit the root (the publisher), by stripe. */
-  const rootOver: { peer: string; stripe: number }[] = []
+/** Builds one stripe's tree into the context's parents and depth. */
+class StripeBuilder {
+  private readonly remaining: Map<string, number>
+  private readonly capOf: Map<string, number>
+  private readonly load: Map<string, number>
+  private readonly nodeDepth: Map<string, number>
+  private readonly placedRelays: string[]
+  private readonly placed = new Set<string>()
+  private readonly relays: PlannerPeer[]
+  private readonly relaySet: Set<string>
+  private readonly leaves: PlannerPeer[]
 
-  for (let s = 0; s < S; s++) {
-    const remaining = new Map<string, number>([[cfg.hostId, hostPerStripe[s]]])
-    const capOf = new Map<string, number>([[cfg.hostId, hostPerStripe[s]]])
-    const load = new Map<string, number>([[cfg.hostId, 0]])
-    const nodeDepth = new Map<string, number>([[cfg.hostId, 0]])
-    const placedRelays: string[] = [cfg.hostId]
+  constructor(
+    private readonly ctx: PlanContext,
+    private readonly s: number,
+    hostSlots: number,
+  ) {
+    const { cfg, current, peers, byId, home, score } = ctx
+    this.remaining = new Map([[cfg.hostId, hostSlots]])
+    this.capOf = new Map([[cfg.hostId, hostSlots]])
+    this.load = new Map([[cfg.hostId, 0]])
+    this.nodeDepth = new Map([[cfg.hostId, 0]])
+    this.placedRelays = [cfg.hostId]
 
     // Existing relays keep their level (shallowest first) so a newcomer doesn't displace a whole
     // subtree; new relays are then placed strongest-first.
     const curDepth = currentDepths(current, s, cfg.hostId, (id) => byId.has(id) && home[id] === s)
-    const relays = peers
+    this.relays = peers
       .filter((p) => home[p.id] === s)
       .sort(
         (a, b) =>
@@ -82,124 +160,147 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
           score(b) - score(a) ||
           cmp(a.id, b.id),
       )
-    const relaySet = new Set(relays.map((p) => p.id))
-    const leaves = peers.filter((p) => !relaySet.has(p.id))
-
-    const canLink = (child: PlannerPeer, parentId: string) => {
-      if (parentId === child.id) return false
-      if (child.avoid.includes(parentId)) return false
-      const parent = byId.get(parentId)
-      return !parent || !parent.avoid.includes(child.id)
-    }
-
-    const starved = (id: string) => byId.get(id)?.starved?.includes(s) ?? false
-
-    /** Distance from a parent to a child: RTT plus the parent's lateness on this stripe. */
-    const cost = (parentId: string, childId: string): number | null => {
-      const rtt = cfg.rtt?.(parentId, childId) ?? null
-      if (rtt === null) return null
-      return rtt + (cfg.lateness?.(parentId, s) ?? 0)
-    }
-
-    const bestFree = (p: PlannerPeer): string | null => {
-      let best: string | null = null
-      for (const id of placedRelays) {
-        if ((remaining.get(id) ?? 0) <= 0 || !canLink(p, id) || starved(id)) continue
-        if (best === null || better(p.id, id, best)) best = id
-      }
-      return best
-    }
-
-    /** Current parent, if it is placed, has room, and is not much worse than the best option. */
-    const keepable = (p: PlannerPeer, best: string | null): string | null => {
-      const cur = current.parents[p.id]?.[s] ?? null
-      if (cur === null || !nodeDepth.has(cur) || (remaining.get(cur) ?? 0) <= 0 || !canLink(p, cur)) return null
-      if (best === null || best === cur) return cur
-      const dCur = nodeDepth.get(cur)!
-      const dBest = nodeDepth.get(best)!
-      if (dCur > dBest + cfg.switchGain) return null
-      // A parent no deeper that is much closer is worth a move.
-      const cCur = cost(cur, p.id)
-      const cBest = cost(best, p.id)
-      if (dBest <= dCur && cCur !== null && cBest !== null && cBest + (cfg.rttSwitchMs ?? 40) < cCur) return null
-      return cur
-    }
-
-    const attach = (p: PlannerPeer, chosen: string | null) => {
-      parents[p.id][s] = chosen
-      placed.add(p.id)
-      if (chosen === null) return
-      remaining.set(chosen, (remaining.get(chosen) ?? 0) - 1)
-      load.set(chosen, load.get(chosen)! + 1)
-      const d = nodeDepth.get(chosen)! + 1
-      depth[p.id][s] = d
-      if (relaySet.has(p.id)) {
-        nodeDepth.set(p.id, d)
-        remaining.set(p.id, slots[p.id])
-        capOf.set(p.id, slots[p.id])
-        load.set(p.id, 0)
-        placedRelays.push(p.id)
-      }
-    }
-
-    /** Pass 1: keep a still-valid current attachment. */
-    const tryKeep = (p: PlannerPeer) => {
-      const cur = keepable(p, bestFree(p))
-      if (cur !== null) attach(p, cur)
-    }
-
-    /** Pass 2: place anywhere (preferring the current parent), overcommitting if necessary. */
-    const placeAny = (p: PlannerPeer) => {
-      if (placed.has(p.id)) return
-      const best = bestFree(p)
-      let chosen = keepable(p, best) ?? best
-      if (chosen === null) {
-        const cur = current.parents[p.id]?.[s] ?? null
-        if (cur !== null && nodeDepth.has(cur) && canLink(p, cur)) {
-          // No free capacity anywhere: stay put rather than shuffling overcommitted children.
-          chosen = cur
-        } else {
-          let leastRatio = Infinity
-          for (const id of placedRelays) {
-            if (!canLink(p, id)) continue
-            const ratio = (load.get(id)! + 1) / Math.max(capOf.get(id)!, 0.5)
-            if (ratio < leastRatio) {
-              leastRatio = ratio
-              chosen = id
-            }
-          }
-        }
-        if (chosen !== null) overcommitted++
-        if (chosen === cfg.hostId) rootOver.push({ peer: p.id, stripe: s })
-      }
-      attach(p, chosen)
-    }
-
-    // For `child`: shallower first, then closer (RTT + lateness), then more spare capacity, then id.
-    const better = (child: string, a: string, b: string) => {
-      const da = nodeDepth.get(a)!
-      const db = nodeDepth.get(b)!
-      if (da !== db) return da < db
-      const ca = cost(a, child)
-      const cb = cost(b, child)
-      if (ca !== null && cb !== null && ca !== cb) return ca < cb
-      const ra = remaining.get(a)!
-      const rb = remaining.get(b)!
-      if (ra !== rb) return ra > rb
-      return cmp(a, b) < 0
-    }
-
-    const placed = new Set<string>()
-    relays.forEach(tryKeep)
-    ;[...relays].sort((a, b) => score(b) - score(a) || cmp(a.id, b.id)).forEach(placeAny)
-    leaves.forEach(tryKeep)
-    leaves.forEach(placeAny)
+    this.relaySet = new Set(this.relays.map((p) => p.id))
+    this.leaves = peers.filter((p) => !this.relaySet.has(p.id))
   }
 
-  // 5. Shed root overcommit where parity allows. The publisher's uplink carries every stripe, so
-  // overloading it delays all of them for everyone; a peer that still gets k other stripes just
-  // decodes from those. (Newest attachments go first.) A relay keeps its home stripe: its children
-  // there depend on it. Only stripes whose parent chain reaches the root count as received.
+  build(): void {
+    const { score } = this.ctx
+    this.relays.forEach((p) => this.tryKeep(p))
+    ;[...this.relays].sort((a, b) => score(b) - score(a) || cmp(a.id, b.id)).forEach((p) => this.placeAny(p))
+    this.leaves.forEach((p) => this.tryKeep(p))
+    this.leaves.forEach((p) => this.placeAny(p))
+  }
+
+  /** Pass 1: keep a still-valid current attachment. */
+  private tryKeep(p: PlannerPeer): void {
+    const cur = this.keepable(p, this.bestFree(p))
+    if (cur !== null) this.attach(p, cur)
+  }
+
+  /** Pass 2: place anywhere (preferring the current parent), overcommitting if necessary. */
+  private placeAny(p: PlannerPeer): void {
+    if (this.placed.has(p.id)) return
+    const best = this.bestFree(p)
+    let chosen = this.keepable(p, best) ?? best
+    if (chosen === null) {
+      chosen = this.overcommitTarget(p)
+      if (chosen !== null) this.ctx.overcommitted++
+      if (chosen === this.ctx.cfg.hostId) this.ctx.rootOver.push({ peer: p.id, stripe: this.s })
+    }
+    this.attach(p, chosen)
+  }
+
+  /**
+   * No free capacity anywhere: stay with the current parent rather than shuffling overcommitted
+   * children, else take the relay least loaded relative to its capacity.
+   */
+  private overcommitTarget(p: PlannerPeer): string | null {
+    const cur = this.currentParent(p)
+    if (cur !== null && this.nodeDepth.has(cur) && this.canLink(p, cur)) return cur
+    let chosen: string | null = null
+    let leastRatio = Infinity
+    for (const id of this.placedRelays) {
+      if (!this.canLink(p, id)) continue
+      const ratio = (this.load.get(id)! + 1) / Math.max(this.capOf.get(id)!, 0.5)
+      if (ratio < leastRatio) {
+        leastRatio = ratio
+        chosen = id
+      }
+    }
+    return chosen
+  }
+
+  private attach(p: PlannerPeer, chosen: string | null): void {
+    const { parents, depth, slots } = this.ctx
+    parents[p.id][this.s] = chosen
+    this.placed.add(p.id)
+    if (chosen === null) return
+    this.remaining.set(chosen, (this.remaining.get(chosen) ?? 0) - 1)
+    this.load.set(chosen, this.load.get(chosen)! + 1)
+    const d = this.nodeDepth.get(chosen)! + 1
+    depth[p.id][this.s] = d
+    if (this.relaySet.has(p.id)) {
+      this.nodeDepth.set(p.id, d)
+      this.remaining.set(p.id, slots[p.id])
+      this.capOf.set(p.id, slots[p.id])
+      this.load.set(p.id, 0)
+      this.placedRelays.push(p.id)
+    }
+  }
+
+  private currentParent(p: PlannerPeer): string | null {
+    return this.ctx.current.parents[p.id]?.[this.s] ?? null
+  }
+
+  private bestFree(p: PlannerPeer): string | null {
+    let best: string | null = null
+    for (const id of this.placedRelays) {
+      if ((this.remaining.get(id) ?? 0) <= 0 || !this.canLink(p, id) || this.starved(id)) continue
+      if (best === null || this.better(p.id, id, best)) best = id
+    }
+    return best
+  }
+
+  /** Current parent, if it is placed, has room, and is not much worse than the best option. */
+  private keepable(p: PlannerPeer, best: string | null): string | null {
+    const cfg = this.ctx.cfg
+    const cur = this.currentParent(p)
+    if (cur === null || !this.nodeDepth.has(cur) || (this.remaining.get(cur) ?? 0) <= 0 || !this.canLink(p, cur)) return null
+    if (best === null || best === cur) return cur
+    const dCur = this.nodeDepth.get(cur)!
+    const dBest = this.nodeDepth.get(best)!
+    if (dCur > dBest + cfg.switchGain) return null
+    // A parent no deeper that is much closer is worth a move.
+    const cCur = this.cost(cur, p.id)
+    const cBest = this.cost(best, p.id)
+    if (dBest <= dCur && cCur !== null && cBest !== null && cBest + cfg.rttSwitchMs < cCur) return null
+    return cur
+  }
+
+  /** For `child`: shallower first, then closer (RTT + lateness), then more spare capacity, then id. */
+  private better(child: string, a: string, b: string): boolean {
+    const da = this.nodeDepth.get(a)!
+    const db = this.nodeDepth.get(b)!
+    if (da !== db) return da < db
+    const ca = this.cost(a, child)
+    const cb = this.cost(b, child)
+    if (ca !== null && cb !== null && ca !== cb) return ca < cb
+    const ra = this.remaining.get(a)!
+    const rb = this.remaining.get(b)!
+    if (ra !== rb) return ra > rb
+    return cmp(a, b) < 0
+  }
+
+  /** Distance from a parent to a child: RTT plus the parent's lateness on this stripe. */
+  private cost(parentId: string, childId: string): number | null {
+    const cfg = this.ctx.cfg
+    const rtt = cfg.rtt?.(parentId, childId) ?? null
+    if (rtt === null) return null
+    return rtt + (cfg.lateness?.(parentId, this.s) ?? 0)
+  }
+
+  private canLink(child: PlannerPeer, parentId: string): boolean {
+    if (parentId === child.id) return false
+    if (child.avoid.includes(parentId)) return false
+    const parent = this.ctx.byId.get(parentId)
+    return !parent || !parent.avoid.includes(child.id)
+  }
+
+  private starved(id: string): boolean {
+    return this.ctx.byId.get(id)?.starved?.includes(this.s) ?? false
+  }
+}
+
+/**
+ * Sheds root overcommit where parity allows. The publisher's uplink carries every stripe, so
+ * overloading it delays all of them for everyone; a peer that still gets k other stripes just
+ * decodes from those. (Newest attachments go first.) A relay keeps its home stripe: its children
+ * there depend on it. Only stripes whose parent chain reaches the root count as received.
+ */
+function shedRootOvercommit(ctx: PlanContext): void {
+  const { cfg, peers, parents, depth, home } = ctx
+  const S = stripeCount(cfg)
   const reachesRoot = (id: string, s: number): boolean => {
     let cur: string | null = id
     for (let i = 0; i <= peers.length && cur !== null; i++) {
@@ -208,18 +309,25 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     }
     return false
   }
-  for (const { peer, stripe } of rootOver.reverse()) {
+  for (const { peer, stripe } of [...ctx.rootOver].reverse()) {
     if (home[peer] === stripe) continue
     let live = 0
     for (let s = 0; s < S; s++) if (reachesRoot(peer, s)) live++
     if (live > cfg.k) {
       parents[peer][stripe] = null
       depth[peer][stripe] = 0
-      overcommitted--
+      ctx.overcommitted--
     }
   }
+}
 
-  // 6. Diff against the current topology.
+/** Parent changes from `current` to `parents`, in peer order, then stripe order. */
+function diffTopology(
+  peers: PlannerPeer[],
+  current: Topology,
+  parents: Record<string, (string | null)[]>,
+  S: number,
+): ParentChange[] {
   const changes: ParentChange[] = []
   for (const p of peers) {
     for (let s = 0; s < S; s++) {
@@ -228,8 +336,7 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
       if (from !== to) changes.push({ peer: p.id, stripe: s, from, to })
     }
   }
-
-  return { topology: { parents, home }, changes, depth, overcommitted, slots }
+  return changes
 }
 
 function argmin(xs: number[]): number {

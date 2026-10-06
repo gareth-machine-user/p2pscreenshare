@@ -14,7 +14,7 @@ export interface PlannerConfig {
   /** Keep the current parent unless a parent this many levels shallower is available... */
   switchGain: number
   /** ...or one at most as deep that is this much closer (RTT plus lateness penalty, ms). */
-  rttSwitchMs?: number
+  rttSwitchMs: number
   /** Round-trip time between two peers (ms), when known. Ties between equally deep parents go to the closest. */
   rtt?: (a: string, b: string) => number | null
   /** How late a parent's deliveries arrive on a stripe (ms), added to its RTT as a penalty. */
@@ -71,5 +71,31 @@ export function stripeCount(c: Pick<PlannerConfig, 'k' | 'm'>): number {
 export function childrenOf(t: Topology, id: string, stripe: number): string[] {
   const out: string[] = []
   for (const [peer, ps] of Object.entries(t.parents)) if (ps[stripe] === id) out.push(peer)
+  return out
+}
+
+/**
+ * Everything below `root` in `stripe` (not including `root` itself), derived from the parent map.
+ * Safe on malformed maps: each peer is visited once.
+ */
+export function subtree(t: Topology, root: string, stripe: number): string[] {
+  const kids = new Map<string, string[]>()
+  for (const [peer, ps] of Object.entries(t.parents)) {
+    const par = ps[stripe]
+    if (!par) continue
+    const list = kids.get(par)
+    if (list) list.push(peer)
+    else kids.set(par, [peer])
+  }
+  const out: string[] = []
+  const seen = new Set<string>([root])
+  const stack = [...(kids.get(root) ?? [])]
+  while (stack.length) {
+    const n = stack.pop()!
+    if (seen.has(n)) continue
+    seen.add(n)
+    out.push(n)
+    stack.push(...(kids.get(n) ?? []))
+  }
   return out
 }

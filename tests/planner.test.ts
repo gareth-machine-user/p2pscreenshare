@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { emptyTopology, type PlannerConfig, type PlannerPeer, type PlanResult } from '../src/topology/model'
+import { emptyTopology, subtree, type PlannerConfig, type PlannerPeer, type PlanResult } from '../src/topology/model'
 import { plan } from '../src/topology/planner'
+import { LATE_PARENT_FOR_MS, LateParentTracker } from '../src/topology/policy'
 
 const HOST = 'H'
 
@@ -13,6 +14,7 @@ function config(over: Partial<PlannerConfig> = {}): PlannerConfig {
     maxFanout: 12,
     minUptimeMsForRelay: 0,
     switchGain: 1,
+    rttSwitchMs: 40,
     ...over,
   }
 }
@@ -283,5 +285,35 @@ describe('planner', () => {
       const r2 = plan(next, r1.topology, cfg, 2000)
       checkInvariants(r2, next, cfg, false)
     }
+  })
+})
+
+describe('subtree', () => {
+  it('lists descendants in one stripe, excluding the root, and survives cycles', () => {
+    const t = { parents: { a: [HOST, HOST], b: ['a', HOST], c: ['b', 'a'], x: ['y', null], y: ['x', null] }, home: {} }
+    expect(subtree(t, 'a', 0).sort()).toEqual(['b', 'c'])
+    expect(subtree(t, 'a', 1)).toEqual(['c'])
+    expect(subtree(t, HOST, 1).sort()).toEqual(['a', 'b', 'c'])
+    expect(subtree(t, 'x', 0)).toEqual(['y'])
+  })
+})
+
+describe('LateParentTracker', () => {
+  it('averages excess lateness over children and evicts a parent late for too long, once', () => {
+    const late = new LateParentTracker()
+    const samples = [
+      { parent: 'p', stripe: 1, lateMs: 400, parentLateMs: 100 },
+      { parent: 'p', stripe: 1, lateMs: 150, parentLateMs: 100 },
+      { parent: 'q', stripe: 0, lateMs: 50, parentLateMs: 100 },
+    ]
+    expect(late.update(samples, 0)).toEqual([])
+    expect(late.get('p', 1)).toBe(175)
+    expect(late.get('q', 0)).toBe(0)
+    expect(late.update(samples, LATE_PARENT_FOR_MS - 1)).toEqual([])
+    expect(late.update(samples, LATE_PARENT_FOR_MS)).toEqual([{ parent: 'p', stripe: 1 }])
+    expect(late.update(samples, LATE_PARENT_FOR_MS + 1)).toEqual([])
+    // Back under the limit (or unmeasured) resets the clock.
+    late.update([], LATE_PARENT_FOR_MS + 2)
+    expect(late.update(samples, 2 * LATE_PARENT_FOR_MS)).toEqual([])
   })
 })

@@ -14,8 +14,9 @@ import { signFrame } from '../proto/signing'
 import type { EncoderRates, PublisherMsg, StreamInfo, SubscriberMsg, SubscriberStats, TopologyReport, UplinkRates } from '../proto/messages'
 import { RateWindow, round1 } from './rates'
 import type { RelayNode } from '../relay/relayNode'
-import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
+import { emptyTopology, subtree, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
+import { defaultPlannerConfig, LATE_PARENT_AVOID_MS, LateParentTracker, REATTACH_BATCH_MS, type LatenessSample } from '../topology/policy'
 import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
 import { after, every } from '../net/ticker'
 import { tuning } from '../tuning'
@@ -59,22 +60,27 @@ const SILENT_PARENT_AVOID_MS = 15_000
  * After a relay fails, its whole subtree goes silent on that stripe. Descendants' reattach requests
  * within this window blame the upstream failure, not their (healthy) parent.
  */
-export const UPSTREAM_DISRUPTION_MS = 6000
-/**
- * When a relay dies its whole subtree notices at about the same time. Reattach requests are
- * collected for this long and handled shallowest-first, so only the topmost complaint blames a
- * parent and the rest are recognized as collateral.
- */
-export const REATTACH_BATCH_MS = 400
+const UPSTREAM_DISRUPTION_MS = 6000
 /** A parent that children report as silent must answer a ping within this time. */
 const LIVENESS_TIMEOUT_MS = 1200
 /** A peer that failed a liveness ping stays out of the plan this long (or until it answers again). */
 const SUSPECT_HOLD_MS = 3000
 const TOPOLOGY_REPORT_MS = 3000
-/** A parent whose children's pieces arrive this much later than its own, for this long, loses them. */
-export const LATE_PARENT_MS = 150
-const LATE_PARENT_FOR_MS = 10_000
-const LATE_PARENT_AVOID_MS = 30_000
+/**
+ * Keyframe requests from subscribers are honoured at most this often. (Each subscriber also
+ * throttles its own requests, to one per 500 ms, in subscription.ts.)
+ */
+const KEY_REQUEST_MIN_INTERVAL_MS = 300
+/** Capture and encoding frame rate of the full channel. */
+const CAPTURE_FPS = 30
+/** Congestion control never takes the encoder below this, and moves it in these steps (kbps). */
+const MIN_ADAPTIVE_KBPS = 300
+const BITRATE_STEP_KBPS = 50
+/** Stripe rates are sampled this often, and the last STRIPE_SAMPLES samples (10 s) are kept. */
+const STRIPE_SAMPLE_MS = 250
+const STRIPE_SAMPLES = 40
+/** Test pattern size when none is given. */
+const DEFAULT_TEST_SIZE: [number, number] = [1280, 720]
 /** Audience upload counts as short when supply is below 90% of demand for this long. */
 const SHORT_SUPPLY_FOR_MS = 10_000
 /** At most this often, an overcommitted channel asks its subscribers to re-measure their upload. */
@@ -124,9 +130,8 @@ export class ChannelPublisher {
   private announcedStripeKbps = 0
   private lastAnnounceAt = 0
   private lastMeasureAt = performance.now()
-  /** Excess lateness (ms) per `${parent}:${stripe}`, from children's reports. */
-  readonly lateness = new Map<string, number>()
-  private lateSince = new Map<string, number>()
+  /** Excess lateness of parents, from children's reports, and which have been late too long. */
+  private late = new LateParentTracker()
   private shortSince: number | null = null
   private lastReprobeAsk = 0
   /** Set while the audience can't carry this channel: a bitrate it could carry. */
@@ -146,7 +151,7 @@ export class ChannelPublisher {
     this.timers.push(every(REPLAN_INTERVAL_MS, () => this.replan()))
     this.timers.push(every(250, () => this.checkLiveness()))
     this.timers.push(every(TOPOLOGY_REPORT_MS, () => void this.sendTopology()))
-    this.timers.push(every(250, () => this.measureStripes()))
+    this.timers.push(every(STRIPE_SAMPLE_MS, () => this.measureStripes()))
   }
 
   /**
@@ -161,7 +166,7 @@ export class ChannelPublisher {
     if (dt <= 0) return
     this.stripeSamples.push((Math.max(0, ...this.stripeBytes) * 8) / dt)
     this.stripeBytes = []
-    if (this.stripeSamples.length > 40) this.stripeSamples.shift()
+    if (this.stripeSamples.length > STRIPE_SAMPLES) this.stripeSamples.shift()
     const sorted = [...this.stripeSamples].sort((a, b) => a - b)
     this.measuredStripeKbps = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))]
     const kbps = this.stripeKbps
@@ -262,7 +267,7 @@ export class ChannelPublisher {
         return
       case 'need-key': {
         const now = performance.now()
-        if (now - this.lastKeyRequest > 300) {
+        if (now - this.lastKeyRequest > KEY_REQUEST_MIN_INTERVAL_MS) {
           this.lastKeyRequest = now
           this.requestKeyframe()
         }
@@ -405,21 +410,12 @@ export class ChannelPublisher {
   }
 
   private markSubtreeDisrupted(root: string, stripe: number, includeRoot = false): void {
-    const kids = new Map<string, string[]>()
-    for (const [peer, ps] of Object.entries(this.topology.parents)) {
-      const par = ps[stripe]
-      if (par) kids.set(par, [...(kids.get(par) ?? []), peer])
-    }
     const until = performance.now() + UPSTREAM_DISRUPTION_MS
-    const stack = includeRoot ? [root] : [...(kids.get(root) ?? [])]
-    const seen = new Set<string>()
-    while (stack.length) {
-      const n = stack.pop()!
-      if (seen.has(n)) continue
-      seen.add(n)
+    const nodes = subtree(this.topology, root, stripe)
+    if (includeRoot) nodes.push(root)
+    for (const n of nodes) {
       const key = `${n}:${stripe}`
       this.disruptedUntil.set(key, Math.max(this.disruptedUntil.get(key) ?? 0, until))
-      stack.push(...(kids.get(n) ?? []))
     }
   }
 
@@ -450,20 +446,22 @@ export class ChannelPublisher {
     return this.ctx.mesh.member(id)?.offers[String(this.id)] ?? 0
   }
 
+  /** Excess lateness (ms) per `${parent}:${stripe}`, from children's reports. */
+  get lateness(): ReadonlyMap<string, number> {
+    return this.late.lateness
+  }
+
   get plannerConfig(): PlannerConfig {
     const mesh = this.ctx.mesh
-    return {
+    return defaultPlannerConfig({
       hostId: this.ctx.selfId,
       k: this.k,
       m: this.m,
       rootSlots: this.ctx.rootSlots(this.id),
       maxFanout: MAX_FANOUT,
-      minUptimeMsForRelay: 4000,
-      switchGain: 1,
-      rttSwitchMs: 40,
       rtt: (a, b) => mesh.member(a)?.rtt[b] ?? mesh.member(b)?.rtt[a] ?? null,
-      lateness: (parent, stripe) => this.lateness.get(`${parent}:${stripe}`) ?? 0,
-    }
+      lateness: (parent, stripe) => this.late.get(parent, stripe),
+    })
   }
 
   /**
@@ -471,38 +469,21 @@ export class ChannelPublisher {
    * its children. A parent late by more than LATE_PARENT_MS for 10 s loses its children there.
    */
   private updateLateness(now: number): void {
-    const sums = new Map<string, { total: number; n: number }>()
+    const samples: LatenessSample[] = []
     for (const sub of this.subscribers.values()) {
       if (!sub.active || !sub.stats) continue
       sub.stats.stripes.forEach((st, s) => {
         const p = st.parent
         if (!p || p === this.ctx.selfId) return
         const own = this.subscribers.get(p)?.stats?.stripes[s]?.lateMs ?? 0
-        const key = `${p}:${s}`
-        const acc = sums.get(key) ?? { total: 0, n: 0 }
-        acc.total += Math.max(0, st.lateMs - own)
-        acc.n++
-        sums.set(key, acc)
+        samples.push({ parent: p, stripe: s, lateMs: st.lateMs, parentLateMs: own })
       })
     }
-    this.lateness.clear()
-    for (const [key, { total, n }] of sums) this.lateness.set(key, total / n)
-    for (const [key, late] of this.lateness) {
-      if (late <= LATE_PARENT_MS) {
-        this.lateSince.delete(key)
-        continue
-      }
-      const since = this.lateSince.get(key) ?? now
-      this.lateSince.set(key, since)
-      if (now - since < LATE_PARENT_FOR_MS) continue
-      // Consistently late: its children on this stripe move elsewhere for a while.
-      this.lateSince.delete(key)
-      const [parent, stripe] = [key.slice(0, key.lastIndexOf(':')), Number(key.slice(key.lastIndexOf(':') + 1))]
+    for (const { parent, stripe } of this.late.update(samples, now)) {
       for (const sub of this.subscribers.values()) {
         if (this.topology.parents[sub.id]?.[stripe] === parent) sub.avoid.set(parent, now + LATE_PARENT_AVOID_MS)
       }
     }
-    for (const key of [...this.lateSince.keys()]) if (!this.lateness.has(key)) this.lateSince.delete(key)
   }
 
   /** Whether the audience's offered slots can carry this channel (warns the publisher if not). */
@@ -663,12 +644,12 @@ export class ChannelPublisher {
 }
 
 /** Draws a random u32 channel id. */
-export function newChannelId(): number {
+function newChannelId(): number {
   return crypto.getRandomValues(new Uint32Array(1))[0]
 }
 
 /** The low-resolution preview channel every stream also publishes (tiles, weak downlinks). */
-export const PREVIEW = { width: 320, height: 180, fps: 5, kbps: 120 }
+const PREVIEW = { width: 320, height: 180, fps: 5, kbps: 120 }
 
 /**
  * A shared screen: one capture, encoded once per channel. The full-resolution channel carries the
@@ -713,8 +694,8 @@ export class PublishedStream {
     const o = this.opts
     let stream: MediaStream
     if (o.source === 'test') {
-      const [w, h] = o.testSize ?? [1280, 720]
-      const tp = testPattern(w, h, 30, o.audio)
+      const [w, h] = o.testSize ?? DEFAULT_TEST_SIZE
+      const tp = testPattern(w, h, CAPTURE_FPS, o.audio)
       stream = tp.stream
       this.stopSource = tp.stop
     } else {
@@ -739,7 +720,7 @@ export class PublishedStream {
     this.channels.push(full, preview)
 
     const vt = stream.getVideoTracks()[0]
-    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: 30, keyframeIntervalMs: tuning.keyframeIntervalMs })
+    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: CAPTURE_FPS, keyframeIntervalMs: tuning.keyframeIntervalMs })
     this.video.onFrame = (f) => full.emit(f)
     this.video.onStreamInfo = (info) => full.setStream({ ...info, audio: this.audioPipe?.info ?? undefined })
     this.video.onRawFrame = (frame) => this.feedPreview(frame)
@@ -793,7 +774,9 @@ export class PublishedStream {
     this.video.setBitrate(bitrateKbps)
     const track = this.localStream?.getVideoTracks()[0]
     if (maxSize && track && this.opts.source !== 'test') {
-      await track.applyConstraints({ width: { max: maxSize[0] }, height: { max: maxSize[1] }, frameRate: { ideal: 30, max: 30 } }).catch(() => {})
+      await track
+        .applyConstraints({ width: { max: maxSize[0] }, height: { max: maxSize[1] }, frameRate: { ideal: CAPTURE_FPS, max: CAPTURE_FPS } })
+        .catch((e) => console.warn('capture size change failed', e))
       ;(this.opts as { maxSize?: [number, number] }).maxSize = maxSize
     }
     full.limited = null
@@ -807,7 +790,7 @@ export class PublishedStream {
   adaptBitrate(kbps: number): void {
     const full = this.full
     if (!full || !this.video) return
-    const next = Math.round(Math.min(this.ceilingKbps, Math.max(300, kbps)) / 50) * 50
+    const next = Math.round(Math.min(this.ceilingKbps, Math.max(MIN_ADAPTIVE_KBPS, kbps)) / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS
     if (next === full.kbps) return
     full.kbps = next
     this.video.setBitrate(next)
