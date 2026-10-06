@@ -3,6 +3,7 @@
 // by a key is bound to exactly one peer id. The owner's key is the host key derived from the owner
 // seed (see net/lobby.ts), whose public half is pinned in the join code.
 import { fromBase64Url, hostIdentity, toBase64Url } from '../net/lobby'
+import { storageGet, storageSet } from '../util/storage'
 
 export interface PeerIdentity {
   /** 20 characters, base64url of the first 15 bytes of SHA-256(public key). */
@@ -39,6 +40,7 @@ export function importPublicKey(pubKey: string): Promise<CryptoKey | null> {
         if (raw.length !== 32) return null
         return await crypto.subtle.importKey('raw', raw, { name: 'Ed25519' }, true, ['verify'])
       } catch {
+        // bad base64 or not a valid key
         return null
       }
     })()
@@ -59,11 +61,12 @@ export async function verifyBytes(pubKey: string, sig: string, data: string | Ui
     const bytes = typeof data === 'string' ? enc.encode(data) : data
     return await crypto.subtle.verify({ name: 'Ed25519' }, key, fromBase64Url(sig), bytes as Uint8Array<ArrayBuffer>)
   } catch {
+    // malformed signature
     return false
   }
 }
 
-export async function identityFromKey(privateKey: CryptoKey): Promise<PeerIdentity> {
+async function identityFromKey(privateKey: CryptoKey): Promise<PeerIdentity> {
   const { x } = await crypto.subtle.exportKey('jwk', privateKey)
   return { id: await peerIdOf(x!), pubKey: x!, privateKey }
 }
@@ -94,21 +97,18 @@ export async function ownerIdFromCode(joinCode: string): Promise<string | null> 
 export async function loadIdentity(joinCode: string): Promise<PeerIdentity> {
   const storeKey = `p2pss:peer:${joinCode}`
   if (await claimTabLock(storeKey)) {
+    const raw = storageGet(storeKey)
     try {
-      const raw = localStorage.getItem(storeKey)
       if (raw) {
         const key = await crypto.subtle.importKey('jwk', JSON.parse(raw) as JsonWebKey, { name: 'Ed25519' }, true, ['sign'])
         return await identityFromKey(key)
       }
     } catch {
-      // unreadable or unavailable storage: make a new key
+      // unreadable stored key: make a new one
     }
     const { identity, jwk } = await generateIdentity()
-    try {
-      localStorage.setItem(storeKey, JSON.stringify(jwk))
-    } catch {
-      // storage unavailable: this identity lasts for this page only
-    }
+    // Without storage, this identity lasts for this page only.
+    storageSet(storeKey, JSON.stringify(jwk))
     return identity
   }
   return (await generateIdentity()).identity

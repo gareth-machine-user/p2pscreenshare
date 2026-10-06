@@ -125,6 +125,11 @@ export interface StoredRecord {
 
 export type Digest = Record<string, number>
 
+/** A direct link whose ping has gone unanswered this long is suspected. */
+export const SUSPECT_MS = 1500
+/** A peer nothing fresh was heard about, from anyone, for this long is gone. */
+export const GONE_MS = 6000
+
 export class RecordStore {
   private map = new Map<string, StoredRecord>()
   /** Versions of departed peers: older copies still circulating must not resurrect them. */
@@ -198,7 +203,7 @@ export class RecordStore {
 export class FailureDetector {
   private lastHeard = new Map<string, number>()
 
-  constructor(readonly goneMs = 6000) {}
+  constructor(readonly goneMs = GONE_MS) {}
 
   heard(id: string, now: number): void {
     this.lastHeard.set(id, Math.max(now, this.lastHeard.get(id) ?? -Infinity))
@@ -227,7 +232,7 @@ export class FailureDetector {
 export function linkSuspected(
   link: { open: boolean; pingSentAt: number | null; lastPongAt: number },
   now: number,
-  suspectMs = 1500,
+  suspectMs = SUSPECT_MS,
 ): boolean {
   if (!link.open) return true
   return link.pingSentAt !== null && link.pingSentAt > link.lastPongAt && now - link.pingSentAt > suspectMs
@@ -241,7 +246,10 @@ export function doorPeers(members: { id: string; joinedAt: number }[], ownerId: 
   return doors
 }
 
+const RETRY_FIRST_MS = 60_000
+const RETRY_MAX_MS = 600_000
+
 /** Retry delay after the `attempt`-th failed mesh link: 60 s, doubling to 10 min. */
 export function retryDelayMs(attempt: number): number {
-  return Math.min(600_000, 60_000 * 2 ** Math.max(0, attempt - 1))
+  return Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * 2 ** Math.max(0, attempt - 1))
 }

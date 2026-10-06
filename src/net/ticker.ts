@@ -15,7 +15,8 @@ interface Task {
 
 const BASE_MS = 50
 const tasks = new Set<Task>()
-let started = false
+/** Stops the running base timer; null until started. */
+let stopBase: (() => void) | null = null
 
 function run(): void {
   const now = performance.now()
@@ -32,15 +33,16 @@ function run(): void {
 }
 
 function start(): void {
-  if (started) return
-  started = true
+  if (stopBase) return
   try {
     const src = `setInterval(() => postMessage(0), ${BASE_MS})`
     const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })))
     worker.onmessage = run
+    stopBase = () => worker.terminate()
   } catch {
     // No workers (e.g. unit tests): plain timers.
-    setInterval(run, BASE_MS)
+    const t = setInterval(run, BASE_MS)
+    stopBase = () => clearInterval(t)
   }
 }
 
@@ -62,4 +64,14 @@ export function after(ms: number, fn: () => void): () => void {
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => after(ms, r))
+}
+
+/**
+ * Tests only: drops every task and starts again on whatever timers are current, so tests can
+ * install fake timers (with a fake `performance.now`) and drive time deterministically.
+ */
+export function resetTicker(): void {
+  tasks.clear()
+  stopBase?.()
+  stopBase = null
 }

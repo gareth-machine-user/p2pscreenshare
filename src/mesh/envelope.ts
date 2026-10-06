@@ -22,7 +22,7 @@ export interface Typed {
 
 const DOMAIN = 'p2pscreenshare:env:v1\n'
 /** Bodies above this many bytes are compressed. */
-export const COMPRESS_OVER = 1024
+const COMPRESS_OVER = 1024
 /**
  * Most bytes a gzipped body may inflate to (a member's record, chat, the owner's decisions and
  * topology reports are all far smaller), so a tiny "gzip bomb" can't exhaust memory.
@@ -36,7 +36,7 @@ export async function seal<T extends Typed>(id: PeerIdentity, body: T, compressO
   return { k: id.pubKey, b, ...(z ? { z: 1 as const } : {}), s: await signBytes(id.privateKey, DOMAIN + b) }
 }
 
-export interface Opened<T> {
+interface Opened<T> {
   /** The author's peer id. */
   author: string
   body: T
@@ -52,6 +52,7 @@ export async function open<T extends Typed>(env: unknown, type: T['type']): Prom
     if (!body || body.type !== type) return null
     return { author: await peerIdOf(env.k), body }
   } catch {
+    // bad base64, gzip or JSON (or a gzip bomb)
     return null
   }
 }
@@ -59,11 +60,6 @@ export async function open<T extends Typed>(env: unknown, type: T['type']): Prom
 function isEnvelope(x: unknown): x is Envelope {
   const e = x as Envelope
   return !!e && typeof e.k === 'string' && typeof e.b === 'string' && typeof e.s === 'string'
-}
-
-/** Approximate wire size, for stats. */
-export function envelopeBytes(env: Envelope): number {
-  return env.k.length + env.b.length + env.s.length + 24
 }
 
 export async function gzip(text: string): Promise<Uint8Array> {
@@ -82,7 +78,7 @@ export async function gunzip(bytes: Uint8Array, maxBytes = MAX_INFLATED_BYTES): 
     if (done) break
     total += value.byteLength
     if (total > maxBytes) {
-      void reader.cancel().catch(() => {})
+      void reader.cancel().catch(() => {}) // we're throwing anyway
       throw new Error(`gzip body inflates past ${maxBytes} bytes`)
     }
     chunks.push(value)

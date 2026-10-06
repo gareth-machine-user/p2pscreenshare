@@ -69,6 +69,7 @@ export async function hostKeyFromCode(code: string): Promise<CryptoKey | null> {
     if (raw.length !== 32) return null
     return await crypto.subtle.importKey('raw', raw, { name: 'Ed25519' }, true, ['verify'])
   } catch {
+    // bad base64 or not a valid key
     return null
   }
 }
@@ -125,6 +126,7 @@ export async function openJson(keys: LobbyKeys, kind: 'offer' | 'answer', offerI
     )
     return JSON.parse(dec.decode(pt))
   } catch {
+    // wrong key (no join code) or tampered
     return null
   }
 }
@@ -141,6 +143,7 @@ export async function verifyOffer(hostKey: CryptoKey, offerId: string, body: Sig
   try {
     return await crypto.subtle.verify({ name: 'Ed25519' }, hostKey, fromBase64Url(body.sig), offerMessage(offerId, body))
   } catch {
+    // malformed signature
     return false
   }
 }

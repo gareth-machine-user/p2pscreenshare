@@ -57,6 +57,7 @@ export class TrackerClient {
     try {
       ws = new WebSocket(s.url)
     } catch {
+      // bad URL or blocked: try again later
       this.scheduleReconnect(s)
       return
     }
@@ -90,7 +91,7 @@ export class TrackerClient {
     try {
       msg = JSON.parse(String(raw))
     } catch {
-      return
+      return // not a tracker message
     }
     if (msg.info_hash !== this.infoHash) return
     if (msg['failure reason']) {

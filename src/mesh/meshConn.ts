@@ -10,9 +10,42 @@ const ICE_GATHER_TIMEOUT_MS = 2500
 const CONNECT_TIMEOUT_MS = 15_000
 const BIN_BUFFER_HIGH = 1024 * 1024
 
-type Ctl = { t: string; [k: string]: unknown }
+export type Ctl = { t: string; [k: string]: unknown }
 
-export class MeshConn implements MediaLink {
+/**
+ * What the mesh and the rendezvous use of a connection, so tests can substitute an in-memory one
+ * (tests/fakes/). MeshConn is the real thing.
+ */
+export interface PeerConn {
+  remoteId: string
+  offerer: string
+  readonly createdAt: number
+  readonly state: LinkState
+  readonly wasOpen: boolean
+  readonly haveRemote: boolean
+  readonly isOpen: boolean
+  readonly pingSentAt: number | null
+  readonly lastHeardAt: number
+  readonly rttMs: number | null
+  onCtl: (msg: Ctl) => void
+  onMedia: (data: Uint8Array) => void
+  onBin: (data: Uint8Array) => void
+  onStateChange: (state: LinkState) => void
+  onBufferLow: () => void
+  armTimeout(ms?: number): void
+  createOffer(): Promise<string>
+  acceptOffer(sdp: string): Promise<string>
+  acceptAnswer(sdp: string): Promise<void>
+  sendCtl(msg: object): boolean
+  ping(timeoutMs?: number): Promise<number>
+  statsRttMs(): Promise<number | null>
+  close(): void
+}
+
+/** Makes a connection to `remoteId` ('' when not yet known, e.g. a door's pooled offer). */
+export type ConnFactory<C extends PeerConn = PeerConn> = (iceServers: RTCIceServer[], remoteId: string) => C
+
+export class MeshConn implements MediaLink, PeerConn {
   readonly pc: RTCPeerConnection
   readonly ctl: RTCDataChannel
   readonly media: RTCDataChannel
@@ -71,7 +104,7 @@ export class MeshConn implements MediaLink {
       try {
         msg = JSON.parse(ev.data as string)
       } catch {
-        return
+        return // not JSON, so not from a peer running this code
       }
       this.lastHeardAt = performance.now()
       // Answered here, from the message handler: background-tab timer throttling can't delay it.
@@ -147,6 +180,7 @@ export class MeshConn implements MediaLink {
       this.bytesSent += data.byteLength
       return true
     } catch {
+      // closed between the check and the send
       return false
     }
   }
@@ -157,6 +191,7 @@ export class MeshConn implements MediaLink {
       this.ctl.send(JSON.stringify(msg))
       return true
     } catch {
+      // closed between the check and the send
       return false
     }
   }
@@ -164,14 +199,13 @@ export class MeshConn implements MediaLink {
   /** The probe channel as a MediaLink, so probe traffic can share the uplink queue fairly. */
   get probeLink(): MediaLink {
     const bin = this.bin
-    // eslint-disable-next-line @typescript-eslint/no-this-alias
-    const conn = this
+    const state = () => this.state
     return (this._probeLink ??= {
       get isOpen() {
         return bin.readyState === 'open'
       },
       get state() {
-        return conn.state
+        return state()
       },
       get bufferedAmount() {
         return bin.bufferedAmount
@@ -182,6 +216,7 @@ export class MeshConn implements MediaLink {
           bin.send(data as Uint8Array<ArrayBuffer>)
           return true
         } catch {
+          // closed between the check and the send
           return false
         }
       },
@@ -245,6 +280,7 @@ export class MeshConn implements MediaLink {
       })
       return rtt
     } catch {
+      // stats unavailable (connection closed)
       return null
     }
   }

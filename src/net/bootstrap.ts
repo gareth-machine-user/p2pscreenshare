@@ -15,7 +15,7 @@
 // tracker was flaky) merge, and each pair connects only once.
 import { open, seal, type Envelope } from '../mesh/envelope'
 import type { PeerIdentity } from '../mesh/identity'
-import { MeshConn } from '../mesh/meshConn'
+import { MeshConn, type ConnFactory, type PeerConn } from '../mesh/meshConn'
 import { lobbyKeys, openJson, sealJson, type LobbyKeys } from './lobby'
 import { DEFAULT_TRACKERS, randomPeerId, TrackerClient } from './tracker'
 import { every } from './ticker'
@@ -28,6 +28,7 @@ const OFFER_POOL = 4
 const ANNOUNCE_MS = 3000
 const SEEK_ANNOUNCE_MS = 15_000
 const OFFER_MAX_AGE_MS = 50_000
+const TRACKER_CLOSE_DELAY_MS = 200
 
 interface DoorOffer {
   type: 'door-offer' | 'door-answer'
@@ -36,16 +37,31 @@ interface DoorOffer {
   sdp: string
 }
 
-export interface RendezvousOptions {
+export interface RendezvousOptions<C extends PeerConn = MeshConn> {
   joinCode: string
   identity: PeerIdentity
   trackers?: string[]
   iceServers: RTCIceServer[]
+  /** Makes connections (default: a real MeshConn). */
+  connect?: ConnFactory<C>
 }
 
-export class Rendezvous {
+/** What the mesh uses of a rendezvous, so tests can bootstrap without a tracker (tests/fakes/). */
+export interface RendezvousPort<C extends PeerConn = MeshConn> {
+  onConnection: (conn: C) => void
+  onTrackerStatus: (connected: number, total: number) => void
+  shouldAnswer: (peerId: string) => boolean
+  admit: (peerId: string) => boolean
+  readonly isDoor: boolean
+  start(): Promise<void>
+  setDoor(on: boolean): void
+  setSeeking(on: boolean): void
+  close(): void
+}
+
+export class Rendezvous<C extends PeerConn = MeshConn> implements RendezvousPort<C> {
   /** A connection set up through the tracker; `conn.remoteId` is verified. */
-  onConnection: (conn: MeshConn) => void = () => {}
+  onConnection: (conn: C) => void = () => {}
   onTrackerStatus: (connected: number, total: number) => void = () => {}
   /** Whether to answer an offer from this (verified) peer. */
   shouldAnswer: (peerId: string) => boolean = () => false
@@ -54,7 +70,7 @@ export class Rendezvous {
 
   private keys!: LobbyKeys
   private tracker!: TrackerClient
-  private pool = new Map<string, { conn: MeshConn; sdp: string; at: number }>()
+  private pool = new Map<string, { conn: C; sdp: string; at: number }>()
   private filling = false
   private door = false
   private seeking = false
@@ -62,7 +78,12 @@ export class Rendezvous {
   private timers: (() => void)[] = []
   private closed = false
 
-  constructor(private opts: RendezvousOptions) {}
+  private connect: ConnFactory<C>
+
+  constructor(private opts: RendezvousOptions<C>) {
+    // Without a factory, C is MeshConn (the type parameter's default).
+    this.connect = opts.connect ?? (((ice, id) => new MeshConn(ice, id)) as ConnFactory as ConnFactory<C>)
+  }
 
   async start(): Promise<void> {
     this.keys = await lobbyKeys(this.opts.joinCode)
@@ -120,7 +141,7 @@ export class Rendezvous {
       const fresh = await Promise.all(
         Array.from({ length: Math.max(0, OFFER_POOL - this.pool.size) }, async () => {
           // The remote id is filled in once an answer arrives.
-          const conn = new MeshConn(this.opts.iceServers, '')
+          const conn = this.connect(this.opts.iceServers, '')
           conn.offerer = this.opts.identity.id
           const offerId = randomPeerId()
           try {
@@ -168,7 +189,7 @@ export class Rendezvous {
     // Guards against answering two offers from one peer at once; the mesh takes the connection
     // (and dedupes links) as soon as the answer is out, so the guard ends there.
     this.answering.add(offer.peerId)
-    const conn = new MeshConn(this.opts.iceServers, offer.peerId)
+    const conn = this.connect(this.opts.iceServers, offer.peerId)
     conn.offerer = offer.peerId
     try {
       const sdp = await conn.acceptOffer(offer.sdp)
@@ -195,6 +216,7 @@ export class Rendezvous {
       await o.conn.acceptAnswer(answer.sdp)
       this.onConnection(o.conn)
     } catch {
+      // a bad answer SDP: this offer is spent either way
       o.conn.close()
     }
     void this.fill()
@@ -206,6 +228,7 @@ export class Rendezvous {
     for (const o of this.pool.values()) o.conn.close()
     this.pool.clear()
     this.tracker?.announce({ event: 'stopped' })
-    setTimeout(() => this.tracker?.close(), 200)
+    // Give the 'stopped' announce a moment to go out.
+    setTimeout(() => this.tracker?.close(), TRACKER_CLOSE_DELAY_MS)
   }
 }
