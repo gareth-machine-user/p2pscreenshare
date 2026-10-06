@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CapacityEstimator, feasibilityRatio, feasibleBitrate, rebalanceWeights, splitBudget } from '../src/session/capacity'
+import { CapacityEstimator, feasibilityRatio, feasibleBitrate, rebalanceWeights, splitBudget, uplinkIsFull } from '../src/session/capacity'
 
 describe('budget split', () => {
   it('a viewer offers floor(B / stripe kbps) slots', () => {
@@ -96,5 +96,26 @@ describe('feasibility and auto quality', () => {
     const r = splitBudget(4000, [], [{ id: 1, stripeKbps: 0, weight: 1 }, { id: 2, stripeKbps: 600, weight: 1 }])
     expect(r.offers[1]).toBe(0)
     expect(Number.isFinite(r.offers[2])).toBe(true)
+  })
+})
+
+describe('is the uplink full?', () => {
+  const c = (congested: boolean) => ({ congested })
+  it('one slow receiver among several is not a full uplink', () => {
+    expect(uplinkIsFull([c(true), c(false), c(false)], 3000, 10_000)).toBeNull()
+    expect(uplinkIsFull([c(true), c(false)], 3000, 10_000)).toBeNull() // one of two viewers
+  })
+  it('most links congested together is', () => {
+    expect(uplinkIsFull([c(true), c(true), c(false)], 3000, 10_000)).toEqual({ congested: 2, active: 3 })
+    expect(uplinkIsFull([c(true), c(true)], 3000, 10_000)).toEqual({ congested: 2, active: 2 })
+  })
+  it('a single congested link counts only when it carries most of the measured upload', () => {
+    expect(uplinkIsFull([c(true)], 2000, 10_000)).toBeNull() // that receiver is slow
+    expect(uplinkIsFull([c(true)], 8000, 10_000)).toEqual({ congested: 1, active: 1 })
+    expect(uplinkIsFull([c(true)], 2000, null)).toEqual({ congested: 1, active: 1 }) // can't tell: assume full
+  })
+  it('nothing congested, or no links, is not full', () => {
+    expect(uplinkIsFull([c(false), c(false)], 9000, 10_000)).toBeNull()
+    expect(uplinkIsFull([], 0, null)).toBeNull()
   })
 })

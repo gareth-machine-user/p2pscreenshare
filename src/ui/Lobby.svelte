@@ -18,6 +18,7 @@
   import PresenterBar from './components/PresenterBar.svelte'
   import NameDialog from './components/NameDialog.svelte'
   import FrameStats from './components/FrameStats.svelte'
+  import { clampText } from './clamp'
   import Icon from './components/Icon.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
@@ -227,6 +228,10 @@
       revoked: session.revokedNotice,
       presenterAudio: session.publishing?.audio ?? null,
       limited: session.publishing?.full?.limited ?? null,
+      clamp: (() => {
+        const c = session.bitrateClamp()
+        return c ? clampText(c) : null
+      })(),
       kicked: session.kicked,
     }
   })
@@ -424,7 +429,7 @@
                   <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
                   <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
                 </div>
-                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.ccReason} />
+                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.ccReason} clamp={lobby?.clamp ?? null} />
               {:else}
                 <div class="stats-grid" data-testid="viewer-stats">
                   <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
@@ -473,6 +478,7 @@
           <PresenterBar
             audio={lobby.presenterAudio}
             limited={lobby.limited}
+            clamp={lobby.clamp}
             auto={session?.autoBitrate ?? false}
             quality={settings.share.quality}
             onmic={(m) => {

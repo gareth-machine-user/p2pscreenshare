@@ -98,7 +98,14 @@ export interface TopologyReport {
   rootSlots: number
   overcommitted: number
   changes: number
-  peers: { id: string; failures: number; avoid: string[]; stats: SubscriberStats | null }[]
+  peers: {
+    id: string
+    failures: number
+    avoid: string[]
+    stats: SubscriberStats | null
+    /** The publisher's own link to this peer, if it feeds it directly: drops/s and queueing. */
+    link?: { drops: number; queueMs: number; congested: boolean } | null
+  }[]
   /** The publisher's own encoder and uplink. */
   publisherStats?: { encoder: EncoderRates | null; uplink: UplinkRates | null }
 }

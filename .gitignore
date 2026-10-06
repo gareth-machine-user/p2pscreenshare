@@ -26,5 +26,5 @@ tools/nosme/*.so
 test-results
 playwright-report
 
-# Claude Code worktrees
+# Local Claude Code worktrees
 .claude/worktrees/

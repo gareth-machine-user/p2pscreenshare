@@ -23,6 +23,8 @@ interface FrameState {
   completePieces: number
   replay: boolean
   done: boolean
+  /** Counted as incomplete (missing pieces for over INCOMPLETE_MS). */
+  counted: boolean
   firstSeenAt: number
   header: Fragment['header']
 }
@@ -46,6 +48,9 @@ function wellFormed(frag: Fragment): boolean {
   return h.fragIdx === fragCount - 1 || len === MAX_FRAGMENT_PAYLOAD
 }
 
+/** A frame still missing pieces this long after its first fragment counts as incomplete. */
+const INCOMPLETE_MS = 1000
+
 /**
  * Collects fragments (from any stripe, any order, with duplicates) and emits each frame once,
  * as soon as any k of its k+m pieces are complete.
@@ -53,13 +58,14 @@ function wellFormed(frag: Fragment): boolean {
 export class Reassembler {
   private frames = new Map<string, FrameState>()
   private lastPrune = 0
-  /** Video frames that were dropped without ever getting k complete pieces. */
+  /** Video frames still without k complete pieces 1 s after their first fragment (counted promptly,
+   * so loss reports describe the present, not frames from seconds ago). */
   incomplete = 0
 
   constructor(private onFrame: (frame: AssembledFrame) => void) {}
 
   push(frag: Fragment, now: number): void {
-    if (now - this.lastPrune > 1000) this.prune(now)
+    if (now - this.lastPrune > 250) this.prune(now)
     if (!wellFormed(frag)) return
     const h = frag.header
     const id = `${h.channel}:${h.audio ? 'a' : 'v'}:${h.epoch}:${h.frameSeq}`
@@ -74,6 +80,7 @@ export class Reassembler {
         completePieces: 0,
         replay: false,
         done: false,
+        counted: false,
         firstSeenAt: now,
         header: h,
       }
@@ -108,6 +115,8 @@ export class Reassembler {
     const data = decodePieces(st.pieces, st.k, st.m, st.frameLen)
     if (!data) return
     st.done = true
+    // It made it after all (e.g. a retransmission).
+    if (st.counted) this.incomplete--
     st.pieces = []
     st.partial.clear()
     const h = st.header
@@ -129,10 +138,11 @@ export class Reassembler {
   private prune(now: number): void {
     this.lastPrune = now
     for (const [id, st] of this.frames) {
-      if (now - st.firstSeenAt > RETAIN_MS) {
-        if (!st.done && !st.header.audio) this.incomplete++
-        this.frames.delete(id)
+      if (!st.done && !st.counted && !st.header.audio && now - st.firstSeenAt > INCOMPLETE_MS) {
+        st.counted = true
+        this.incomplete++
       }
+      if (now - st.firstSeenAt > RETAIN_MS) this.frames.delete(id)
     }
   }
 

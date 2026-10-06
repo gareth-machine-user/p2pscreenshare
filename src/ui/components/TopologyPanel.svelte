@@ -51,6 +51,7 @@
           <th title="Frames in per second, and frames lost per second (incomplete, late, undecodable or skipped)">In / lost /s</th>
           <th title="Uplink fragments dropped per second for missing their deadline, by temporal layer">Drops T0/T1/T2</th>
           <th title="Average time fragments wait in this peer's uplink queue">Queue</th>
+          <th title="The presenter's own link to this viewer (if fed directly): live fragments dropped per second and queueing. A congested link here with the rest fine means this viewer's connection is slow, not the presenter's uplink.">From presenter</th>
         </tr>
       </thead>
       <tbody>
@@ -68,6 +69,7 @@
             <td class:warn={(r.lost ?? 0) > 0.5}>{r.stats?.loss ? `${r.stats.loss.incomingFps} / ${Math.round((r.lost ?? 0) * 10) / 10}` : '—'}</td>
             <td class:warn={!!r.drops && r.drops[0] + r.drops[1] + r.drops[2] > 0.5}>{r.drops ? r.drops.join(' / ') : '—'}</td>
             <td>{fmtMs(r.queueMs)}</td>
+            <td class:warn={!!r.link?.congested} data-testid="link-from-presenter">{r.link ? `${r.link.drops}/s · ${fmtMs(r.link.queueMs)}` : '—'}</td>
           </tr>
         {/each}
       </tbody>

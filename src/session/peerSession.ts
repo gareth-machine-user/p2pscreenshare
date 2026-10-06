@@ -17,7 +17,7 @@ import { isTopologyReport, parsePeerMsg, type EncoderRates, type PeerMsg, type T
 import { RateWindow, round1 } from './rates'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
-import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor } from './capacity'
+import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor, uplinkIsFull } from './capacity'
 import { PublishedStream, type ChannelPublisher, type PublisherContext, type ShareOptions } from './publisher'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
@@ -63,19 +63,24 @@ const REBALANCE_MS = 10_000
 const AUTO_RESTART_GAP_MS = 30_000
 /**
  * Congestion control for a presenter's bitrate: back off by 25% (at most every 4 s) while its uplink
- * drops fragments or queues them for long, or the median viewer loses frames; after 10 s clean,
- * creep back up by 15% (at most every 10 s), never above the chosen quality.
+ * drops fragments or queues them for long, or the median viewer loses frames; after 5 s clean,
+ * climb back by 25% every 5 s, never above the chosen quality.
  */
 const CC_DOWN = 0.75
 /** Clearly swamped (dropping a lot, or queueing over twice the limit): halve instead. */
 const CC_DOWN_SEVERE = 0.5
 const CC_SEVERE_DROPS_PER_S = 50
-const CC_UP = 1.15
+const CC_UP = 1.25
 const CC_DOWN_GAP_MS = 4000
-const CC_UP_AFTER_MS = 10_000
+const CC_UP_AFTER_MS = 5000
 const CC_DROPS_PER_S = 5
 const CC_QUEUE_MS = tuning.ccQueueMs
-const CC_VIEWER_LOSS = 0.15
+/** A link is congested when it drops this many live fragments per second (or queues past CC_QUEUE_MS). */
+const LINK_DROPS_PER_S = 2
+/** The uplink is full when more than this share of active links is congested at once. */
+const UPLINK_FULL_SHARE = 0.5
+/** With a single active link, also require sending at least this share of the measured upload. */
+const SINGLE_LINK_FULL_SHARE = 0.7
 
 /** Auto quality falls back to the preview when the full stream stalls this long... */
 const AUTO_STALL_MS = 6000
@@ -153,6 +158,13 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private ccCleanSince: number | null = null
   /** Why the congestion controller last moved the bitrate (shown in Stats). */
   ccReason: string | null = null
+  /** What last made the controller lower the bitrate, and the uplink rate it saw then. */
+  private ccCause: { kind: 'uplink'; sendingKbps: number } | null = null
+  /** Per peer: live-media drops/s and queueing on the link from this peer (Topology panel). */
+  readonly linkRates = new Map<string, { drops: number; queueMs: number; congested: boolean }>()
+  /** Whether this peer's uplink itself is full (most links congested together). */
+  uplinkFull: { congested: number; active: number } | null = null
+  private linkLast = new Map<object, { sent: number; drops: number; qSum: number; qN: number }>()
   private lastAutoRestart = -Infinity
   private stallSince: number | null = null
   private smoothSince: number | null = null
@@ -602,25 +614,18 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const up = this.uplinkStatsNow
     if (!s || !full || !up) return
     const drops = up.drops[0] + up.drops[1] + up.drops[2]
-    const losses = [...full.subscribers.values()]
-      .filter((x) => x.active && x.stats?.loss)
-      .map((x) => {
-        const l = x.stats!.loss!
-        const lost = l.incomplete + l.late + l.undecodable + l.skipped
-        return lost / Math.max(1, l.incomingFps + lost)
-      })
-      .sort((a, b) => a - b)
-    const viewerLoss = losses.length ? losses[Math.floor(losses.length / 2)] : 0
-    const reason =
-      drops > CC_DROPS_PER_S
-        ? `uplink dropping ${Math.round(drops)} fragments/s`
-        : up.queueMs > CC_QUEUE_MS
-          ? `uplink queueing ${up.queueMs} ms`
-          : viewerLoss > CC_VIEWER_LOSS
-            ? `viewers losing ${Math.round(viewerLoss * 100)}% of frames`
-            : null
+    // Only a full uplink lowers the bitrate. One slow viewer congests only its own link, which
+    // already sheds enhancement frames for that viewer alone; its Auto quality can fall back to
+    // the preview. Viewers' own losses (their downlinks, relays) don't count either.
+    const full_ = this.uplinkFull
+    const reason = full_
+      ? `your uplink is full (${full_.congested} of ${full_.active} links congested; ${drops > CC_DROPS_PER_S ? `${Math.round(drops)} fragments/s dropped` : `${up.queueMs} ms queueing`})`
+      : null
     if (reason) {
       this.ccCleanSince = null
+      // While full, what the uplink manages to send is about what it can carry.
+      const sendingKbps = Math.max(up.kbps, (this.ccCause?.sendingKbps ?? 0) * 0.8)
+      this.ccCause = { kind: 'uplink', sendingKbps }
       if (now - this.ccLastDown >= CC_DOWN_GAP_MS && full.kbps > 300) {
         this.ccLastDown = now
         this.ccReason = `lowered: ${reason}`
@@ -630,10 +635,48 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       return
     }
     this.ccCleanSince ??= now
-    if (full.kbps < s.ceilingKbps && !full.limited && now - this.ccCleanSince >= CC_UP_AFTER_MS && now - this.ccLastUp >= CC_UP_AFTER_MS) {
+    // Climb back, but not past what the audience's relay slots can carry (when that's the limit).
+    const cap = full.limited ? Math.max(full.limited.feasibleKbps, full.kbps) : s.ceilingKbps
+    if (full.kbps < Math.min(cap, s.ceilingKbps) && now - this.ccCleanSince >= CC_UP_AFTER_MS && now - this.ccLastUp >= CC_UP_AFTER_MS) {
       this.ccLastUp = now
-      this.ccReason = 'raised: no congestion for 10 s'
-      s.adaptBitrate(full.kbps * CC_UP)
+      this.ccReason = 'raised: no congestion for 5 s'
+      s.adaptBitrate(Math.min(cap, full.kbps * CC_UP))
+      if (full.kbps >= s.ceilingKbps) this.ccCause = null
+    }
+  }
+
+  /**
+   * Why the presenter's bitrate is below its chosen quality, in numbers: what its uplink manages
+   * to send, and what this stream needs at the chosen quality (one stripe per direct child, for
+   * every stripe). Null when it runs at full quality.
+   */
+  bitrateClamp(): {
+    currentKbps: number
+    ceilingKbps: number
+    cause: 'uplink' | 'audience'
+    sendingKbps: number
+    neededKbps: number
+    directEdges: number
+    stripes: number
+    viewerLossPct: number
+  } | null {
+    const s = this.publishing
+    const full = s?.full
+    if (!s || !full || full.kbps >= s.ceilingKbps) return null
+    let directEdges = 0
+    for (const ps of Object.values(full.topology.parents)) for (const p of ps) if (p === this.selfId) directEdges++
+    directEdges = Math.max(directEdges, full.subscribers.size ? full.stripes : 0)
+    // Nominal stripe rate at the chosen quality: a lower bound (encoders overshoot).
+    const stripeAtCeiling = stripeKbpsFor(s.ceilingKbps, full.k, full.withAudio)
+    return {
+      currentKbps: full.kbps,
+      ceilingKbps: s.ceilingKbps,
+      cause: this.ccCause?.kind ?? (full.limited ? 'audience' : 'uplink'),
+      sendingKbps: Math.round(this.ccCause?.sendingKbps ?? this.uplinkStatsNow?.kbps ?? 0),
+      neededKbps: Math.round(directEdges * stripeAtCeiling),
+      directEdges,
+      stripes: full.stripes,
+      viewerLossPct: 0,
     }
   }
 
@@ -768,11 +811,42 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       queueMs: dN > 0 ? Math.round(dSum / dN) : 0,
     }
     this.encoderStatsNow = this.publishing?.sampleEncoder() ?? null
+    this.sampleLinks(dt)
     this.adaptBitrate(now)
-    this.capacity.observe(this.uplinkNow.kbps, this.uplinkNow.dropRate)
+    // Drops on one slow link say nothing about this peer's upload: only a full uplink caps it.
+    this.capacity.observe(this.uplinkNow.kbps, this.uplinkFull ? this.uplinkNow.dropRate : 0)
     const dropRate = Math.round(this.uplinkNow.dropRate * 1000) / 1000
     if (dropRate !== (this.mesh.record.dropRate ?? 0)) this.mesh.updateRecord({ dropRate })
     this.updateOffers()
+  }
+
+  /**
+   * Per-link rates over the last window, and whether the uplink itself is full: at least half of
+   * the links carrying media are congested at once (with a single link, it must also be sending
+   * close to the measured upload; otherwise it's that receiver that is slow).
+   */
+  private sampleLinks(dt: number): void {
+    this.linkRates.clear()
+    for (const [link, c] of this.uplink.perLink) {
+      const conn = [...this.mesh.conns.values()].find((x) => x === link)
+      if (!conn) continue
+      const last = this.linkLast.get(link) ?? { sent: 0, drops: 0, qSum: 0, qN: 0 }
+      this.linkLast.set(link, { sent: c.sentItems, drops: c.drops, qSum: c.queueDelaySum, qN: c.queueDelayN })
+      const sent = c.sentItems - last.sent
+      const drops = (c.drops - last.drops) / dt
+      const qN = c.queueDelayN - last.qN
+      const queueMs = qN > 0 ? Math.round((c.queueDelaySum - last.qSum) / qN) : 0
+      if (sent === 0 && drops === 0) continue
+      const isCongested = drops > LINK_DROPS_PER_S || queueMs > CC_QUEUE_MS
+      this.linkRates.set(conn.remoteId, { drops: round1(drops), queueMs, congested: isCongested })
+    }
+    for (const link of this.linkLast.keys()) if (!this.uplink.perLink.has(link as never)) this.linkLast.delete(link)
+    this.uplinkFull = uplinkIsFull([...this.linkRates.values()], this.uplinkNow.kbps, this.capacity.probeKbps, UPLINK_FULL_SHARE, SINGLE_LINK_FULL_SHARE)
+  }
+
+  /** The link from this peer to `peer`, over the last window. */
+  linkRate(peer: string): { drops: number; queueMs: number; congested: boolean } | null {
+    return this.linkRates.get(peer) ?? null
   }
 
   /** Measures this peer's upload (see uploadProbe.ts); null if a probe is already running. */
