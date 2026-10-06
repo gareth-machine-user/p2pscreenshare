@@ -330,3 +330,34 @@ export function blameInput(
     parentFeedStale: parentSt !== undefined && !fresh(parentSt.lastRecvAgoMs, freshMs),
   }
 }
+
+/** A child's linkOpen reattach request, as the publisher batches them. */
+export interface Accusation {
+  child: string
+  parent: string
+  stripe: number
+  now: number
+}
+
+/**
+ * Judges a batch of reattach complaints (ChannelPublisher's, and the simulator's): records each in
+ * `log`, excused or not, and returns those that count against their parent (shouldBlameParent).
+ * The whole batch is recorded first: a child complaining about several parents at once is its own
+ * downlink's fault, and siblings in the same batch corroborate each other.
+ */
+export function judgeComplaints(
+  accused: readonly Accusation[],
+  log: ComplaintLog,
+  statsOf: (id: string) => StatsSnapshot | null,
+  now: number,
+  freshMs: number,
+): Accusation[] {
+  const batch = [...log.recent(now), ...accused.map((c) => ({ ...c, at: c.now, excused: false }))]
+  for (const c of accused) {
+    const input = blameInput(c, statsOf(c.child), statsOf(c.parent), batch, freshMs)
+    const excused = input.parentFeedStale || childStripeEvidence(c, statsOf(c.child), batch, freshMs) === 'stale'
+    log.add({ ...c, at: c.now, excused })
+  }
+  const recent = log.recent(now)
+  return accused.filter((c) => shouldBlameParent(blameInput(c, statsOf(c.child), statsOf(c.parent), recent, freshMs)))
+}

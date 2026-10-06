@@ -14,16 +14,15 @@ import type { RelayNode } from '../relay/relayNode'
 import { emptyTopology, subtree, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
 import {
-  blameInput,
-  childStripeEvidence,
   ComplaintLog,
   defaultPlannerConfig,
+  judgeComplaints,
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
   LateParentTracker,
   PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
-  shouldBlameParent,
+  type Accusation,
   type LatenessSample,
   type StatsSnapshot,
 } from '../topology/policy'
@@ -356,7 +355,7 @@ export class ChannelPublisher {
     const now = performance.now()
     let changed = false
     /** linkOpen complaints about relays, judged once the whole batch is known. */
-    const accused: { child: string; parent: string; stripe: number; now: number }[] = []
+    const accused: Accusation[] = []
     for (const { child, stripe, linkOpen, at } of batch) {
       const sub = this.subscribers.get(child)
       if (!sub?.active) continue
@@ -384,29 +383,18 @@ export class ChannelPublisher {
 
   /**
    * One child's complaint lowers a relay's rank for everyone, so it must not come from the child's
-   * own bad downlink: a parent is blamed only on corroboration (shouldBlameParent). Returns the
+   * own bad downlink: a parent is blamed only on corroboration (judgeComplaints). Returns the
    * blamed parents, to be pinged.
    */
-  private judgeParents(accused: { child: string; parent: string; stripe: number; now: number }[]): Set<string> {
-    const freshMs = tuning.stripeSilenceMs / 2
+  private judgeParents(accused: Accusation[]): Set<string> {
     const snapshot = (id: string): StatsSnapshot | null => {
       const sub = this.subscribers.get(id)
       return sub?.stats ? { at: sub.statsAt, stripes: sub.stats.stripes } : null
     }
-    const now = performance.now()
-    // Record the whole batch first: a child complaining about several parents at once is its own
-    // downlink's fault, and siblings in the same batch corroborate each other.
-    const batch = [...this.complaints.recent(now), ...accused.map((c) => ({ ...c, at: c.now, excused: false }))]
-    for (const c of accused) {
-      const input = blameInput(c, snapshot(c.child), snapshot(c.parent), batch, freshMs)
-      const excused = input.parentFeedStale || childStripeEvidence(c, snapshot(c.child), batch, freshMs) === 'stale'
-      this.complaints.add({ ...c, at: c.now, excused })
-    }
-    const recent = this.complaints.recent(now)
     const blamed = new Set<string>()
-    for (const c of accused) {
+    for (const c of judgeComplaints(accused, this.complaints, snapshot, performance.now(), tuning.stripeSilenceMs / 2)) {
       const pp = this.subscribers.get(c.parent)
-      if (!pp || !shouldBlameParent(blameInput(c, snapshot(c.child), snapshot(c.parent), recent, freshMs))) continue
+      if (!pp) continue
       // The parent is unreliable: rank it lower, and check that it's still there.
       pp.failures++
       blamed.add(c.parent)
