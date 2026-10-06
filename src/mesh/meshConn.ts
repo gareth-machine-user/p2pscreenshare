@@ -7,7 +7,7 @@ import { LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from 
 import { tuning } from '../tuning'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
-const CONNECT_TIMEOUT_MS = 15_000
+export const CONNECT_TIMEOUT_MS = 15_000
 const BIN_BUFFER_HIGH = 1024 * 1024
 
 export type Ctl = { t: string; [k: string]: unknown }
@@ -16,7 +16,7 @@ export type Ctl = { t: string; [k: string]: unknown }
  * What the mesh and the rendezvous use of a connection, so tests can substitute an in-memory one
  * (tests/fakes/). MeshConn is the real thing.
  */
-export interface PeerConn {
+export interface PeerConn extends MediaLink {
   remoteId: string
   offerer: string
   readonly createdAt: number
@@ -39,7 +39,90 @@ export interface PeerConn {
   sendCtl(msg: object): boolean
   ping(timeoutMs?: number): Promise<number>
   statsRttMs(): Promise<number | null>
+  /** Whether the selected candidate pair goes through a TURN relay (null: unknown). */
+  usesRelay(): Promise<boolean | null>
+  /** The `bin` channel as a probe link (see uploadProbe.ts). */
+  readonly probeLink: ProbeLink
   close(): void
+}
+
+/** Waits for ICE gathering (signaling is not trickled), bounded by a timeout; returns the local SDP. */
+export async function gatherComplete(pc: RTCPeerConnection): Promise<string> {
+  if (pc.iceGatheringState !== 'complete') {
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, ICE_GATHER_TIMEOUT_MS)
+      pc.addEventListener('icegatheringstatechange', () => {
+        if (pc.iceGatheringState === 'complete') {
+          clearTimeout(t)
+          resolve()
+        }
+      })
+    })
+  }
+  return pc.localDescription!.sdp
+}
+
+/**
+ * Whether a connection's selected candidate pair is relayed through TURN (either end a `relay`
+ * candidate). Null when stats don't say (closed, not yet selected).
+ */
+export async function selectedPairRelayed(pc: RTCPeerConnection): Promise<boolean | null> {
+  try {
+    const stats = await pc.getStats()
+    let pairId: string | undefined
+    stats.forEach((r) => {
+      if (r.type === 'transport' && typeof r.selectedCandidatePairId === 'string') pairId = r.selectedCandidatePairId
+    })
+    let pair: { localCandidateId?: string; remoteCandidateId?: string } | undefined
+    stats.forEach((r) => {
+      if (r.type !== 'candidate-pair') return
+      // Chrome names the pair from the transport; Firefox flags it `selected`.
+      if (pairId ? r.id === pairId : r.selected === true || (r.nominated && r.state === 'succeeded')) pair ??= r
+    })
+    if (!pair) return null
+    const type = (id?: string) => (id ? (stats.get(id) as { candidateType?: string } | undefined)?.candidateType : undefined)
+    const local = type(pair.localCandidateId)
+    const remote = type(pair.remoteCandidateId)
+    if (local === undefined && remote === undefined) return null
+    return local === 'relay' || remote === 'relay'
+  } catch {
+    // stats unavailable (connection closed)
+    return null
+  }
+}
+
+/** A reliable `bin` channel as a ProbeLink (buffer-low events drive the probe's refills). */
+export function binProbeLink(bin: RTCDataChannel, state: () => LinkState): ProbeLink {
+  const link: ProbeLink = {
+    get isOpen() {
+      return bin.readyState === 'open'
+    },
+    get state() {
+      return state()
+    },
+    get bufferedAmount() {
+      return bin.bufferedAmount
+    },
+    onBufferLow: null,
+    get bufferLowThreshold() {
+      return bin.bufferedAmountLowThreshold
+    },
+    set bufferLowThreshold(v: number) {
+      bin.bufferedAmountLowThreshold = v
+    },
+    send(data: Uint8Array) {
+      if (bin.readyState !== 'open') return false
+      try {
+        bin.send(data as Uint8Array<ArrayBuffer>)
+        return true
+      } catch {
+        // closed between the check and the send
+        return false
+      }
+    },
+  }
+  bin.addEventListener('bufferedamountlow', () => link.onBufferLow?.())
+  return link
 }
 
 /** Makes a connection to `remoteId` ('' when not yet known, e.g. a door's pooled offer). */
@@ -130,19 +213,8 @@ export class MeshConn implements MediaLink, PeerConn {
   }
 
   /** Waits for ICE gathering (signaling is not trickled), bounded by a timeout. */
-  async gathered(): Promise<string> {
-    if (this.pc.iceGatheringState !== 'complete') {
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, ICE_GATHER_TIMEOUT_MS)
-        this.pc.addEventListener('icegatheringstatechange', () => {
-          if (this.pc.iceGatheringState === 'complete') {
-            clearTimeout(t)
-            resolve()
-          }
-        })
-      })
-    }
-    return this.pc.localDescription!.sdp
+  gathered(): Promise<string> {
+    return gatherComplete(this.pc)
   }
 
   async createOffer(): Promise<string> {
@@ -198,43 +270,14 @@ export class MeshConn implements MediaLink, PeerConn {
 
   /** The probe channel as a MediaLink, so probe traffic can share the uplink queue fairly. */
   get probeLink(): ProbeLink {
-    const bin = this.bin
-    const state = () => this.state
-    if (!this._probeLink) {
-      const link: ProbeLink = {
-        get isOpen() {
-          return bin.readyState === 'open'
-        },
-        get state() {
-          return state()
-        },
-        get bufferedAmount() {
-          return bin.bufferedAmount
-        },
-        onBufferLow: null,
-        get bufferLowThreshold() {
-          return bin.bufferedAmountLowThreshold
-        },
-        set bufferLowThreshold(v: number) {
-          bin.bufferedAmountLowThreshold = v
-        },
-        send(data: Uint8Array) {
-          if (bin.readyState !== 'open') return false
-          try {
-            bin.send(data as Uint8Array<ArrayBuffer>)
-            return true
-          } catch {
-            // closed between the check and the send
-            return false
-          }
-        },
-      }
-      bin.addEventListener('bufferedamountlow', () => link.onBufferLow?.())
-      this._probeLink = link
-    }
+    this._probeLink ??= binProbeLink(this.bin, () => this.state)
     return this._probeLink
   }
   private _probeLink: ProbeLink | null = null
+
+  usesRelay(): Promise<boolean | null> {
+    return selectedPairRelayed(this.pc)
+  }
 
   /** Sends on the probe channel, waiting while its buffer is full. */
   async sendBin(data: Uint8Array): Promise<void> {

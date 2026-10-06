@@ -5,7 +5,7 @@
   import { DEFAULT_ICE } from '../net/bootstrap'
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publisher'
-  import { fmtKbps, fmtMs, iceFrom, lobbyUrl, randomId, trackersFrom } from './route'
+  import { fmtKbps, fmtMs, iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
   import { applyAutoQuality, resolveShareOptions, stageMessage } from './lobbyView'
   import { ownerSeed, QUALITY_PRESETS, saveSettings, settings, type QualityPreset } from './settings.svelte'
   import Stage from './components/Stage.svelte'
@@ -89,6 +89,7 @@
       iceServers,
       capKbps: capParam ? Number(capParam) : null,
       block: params.get('block')?.split(',').filter(Boolean),
+      lanes: lanesFrom(params),
     })
     s.onChange = onChange
     s.quality = settings.view.quality

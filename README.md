@@ -89,6 +89,7 @@ Useful URL parameters (put them in the page query or the hash query):
 | `k`, `m`, `bitrate`, `quality=auto` | With `share=1`: data and parity stripes, video kbps, Auto quality |
 | `source=test&res=640x360&audio=1&mic=1` | With `share=1`: animated test pattern (prints the clock), a test tone, the microphone |
 | `block=name1,name2` | Debug: refuse mesh links with these members, as if ICE failed |
+| `lanes=2` | Connections per peer pair, 1–4 (default 2; `1` = a single connection). See [Lanes](#lanes-experimental) |
 
 `#/host?stream=<seed>` (an owner link from older versions) still works: it stores the seed and
 redirects to the lobby page.
@@ -156,6 +157,47 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
 8. **Applying changes.** The publisher tells the new parent `add-child` and the child `set-parent`
    over their mesh links. Once the child reports `stripe-ok` from the new parent, the old parent
    gets `remove-child`.
+
+### Lanes (experimental)
+
+One WebRTC connection is one SCTP association with one Reno-like congestion window (Chrome's
+dcSCTP: 5 MB receive window, bursts of 4 packets of 1191 bytes), which on real WAN paths tops out
+around 10–25 Mbps whatever the uplink. A presenter feeding one viewer at 16 Mbps with 4+1 stripes
+needs about 21.6 Mbps on that one connection. So each mesh pair opens **media lanes**
+(`src/mesh/lane.ts`, `src/mesh/lanes.ts`): extra RTCPeerConnections that carry only an unordered
+`media` channel (same packet lifetime as the mesh link's) and a `bin` channel for probes.
+
+- **Setting.** `lanes=N` (page or hash query), 1–4 connections per pair, **default 2** (the mesh
+  link plus one lane). `lanes=1` is exactly the single-connection behaviour. A pair uses the
+  smaller of the two peers' settings, so one side with `lanes=1` turns lanes off for its pairs.
+- **Signaling** goes over the pair's authenticated `ctl` channel (`lane-offer`, `lane-answer`,
+  `lane-close`), never the tracker; the lower peer id offers. Lanes open 1 s after the mesh link
+  opens (never during the tracker rendezvous), and not at all if the link's selected candidate
+  pair is relayed by TURN (checked with `getStats`). They close with the mesh link, so on leave,
+  kick and ban too.
+- **Sending.** Stripe *s* of any channel goes over slot *s* mod *K* of the pair, slot 0 being the
+  mesh link. A lane that isn't open (yet, or while it reconnects) falls back to the mesh link, so
+  the mapping only changes when a lane is given up for good. Each lane has its own uplink queue;
+  the receiver de-duplicates by fragment id, so the split is invisible downstream. Audio, which
+  rides every stripe, therefore also travels over every lane.
+- **Congestion.** Each lane is its own flow: a peer counts as congested only when most of its
+  active lanes are (one lane at its window is that connection's ceiling, not the uplink), and the
+  upload probe runs over every lane of each neighbour at once, so in a two-peer lobby it measures
+  the lanes together rather than one connection's ceiling.
+- **Connection budget.** Chromium allows 500 RTCPeerConnections per page, and closed ones may
+  count until the page reloads. With the default of 2, a 50-peer lobby uses 98 per page. A failed
+  lane is retried after 5 s, then 30 s, and a pair that has had 3 lane failures gets no more
+  lanes; a page creates at most 200 lanes in its lifetime.
+
+**Comparing.** Open the same lobby with `lanes=1`, the default, and `lanes=4` on both presenter
+and viewer (e.g. `…/#/lobby/<code>?lanes=4`; reload the page after changing it), share with the
+**1080p Ultra-Hi** (16 Mbps) or **4K** (20 Mbps) preset, and compare: the **Peers** panel shows
+"N lanes" next to each open link (or "TURN" when lanes were skipped) and each peer's measured
+upload; the presenter's **Stats** show **Bitrate control** (whether congestion control lowered the
+bitrate, and why), **Your uplink** (send rate, dropped T0/T1/T2 fragments) and **Queueing delay**;
+the viewer's Stats show incomplete and late frames. With one connection at its ceiling, queueing
+and drops climb and the bitrate is lowered below the preset; with lanes the same stream should
+hold the preset.
 
 ### Security
 
@@ -405,7 +447,7 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Keyframe / replay deadline | 4 s | 2 / 2.5 s | Keyframes and GOP replays survive overload |
 | Jitter buffer | 99th percentile + 120 ms, ≥ 150 ms | 95th percentile + 40 ms, ≥ 30 ms | Far fewer late or skipped frames on jittery paths |
 | Media channel retransmits | up to 3 s | up to 1 s | Lost packets are re-sent instead of lost |
-| Congestion back-off | queueing > 800 ms | queueing > 250 ms | The bitrate drops only on real congestion |
+| Congestion back-off | queueing > 800 ms (swamped > 1600 ms) | queueing > 250 ms (swamped > 500 ms) | The bitrate drops only on real congestion, to just below what the uplink carried |
 | Stripe-silence detection | 1.5 s | 1 s | Fewer false reattaches |
 | Keyframe interval | 10 s | 2 s | Keyframes are expensive, and with constant bitrate each one briefly blurs the picture to fit the budget; joiners start from the cached GOP and a viewer that loses its decode chain asks for one |
 
@@ -423,8 +465,19 @@ Rate control, in both profiles:
   for long), and with a single link only if that link carries most of the measured upload. One
   slow viewer congests just its own link, which sheds enhancement frames for that viewer alone
   (and its Auto quality can fall back to the preview); viewers' own losses don't move the bitrate
-  either. When full, it cuts by 25% (by half when clearly swamped); after 5 s clean it climbs back
-  by 25% every 5 s, never above the chosen quality or what the audience's relay slots can carry.
+  either. When full, it settles just below what the uplink actually carried instead of halving
+  (`session/congestion.ts`): what was sent while congested, minus the uplink's other traffic
+  (measured while uncongested: the preview, relayed channels), converted from wire to video
+  bitrate with the stripe overhead (one stripe copy per direct child, `stripeKbpsFor`), gives the
+  sustainable video rate; the bitrate goes to 90% of it (at least a 10% cut, at most a 50% one).
+  Only when nothing measurable got through does it cut blind, by 25% (by half when swamped). It
+  then waits while the backlog drains, and after 5 s clean returns to 95% of the rate where the
+  uplink filled, then probes above it by 5% every 10 s while nothing queues. Each time the uplink
+  fills again at about the same rate, it probes half as often (up to every 40 s); after a minute
+  without queueing the remembered rate expires and it climbs by 25% every 5 s. Never above the
+  chosen quality or what the audience's relay slots can carry. On one WebRTC connection that tops
+  out at 14 Mbps, a 16 Mbps stream settles at 90–105% of the 10.2 Mbps it can carry, with about
+  ten changes in three minutes (the old 25%/halving policy swung between 5.5 and 15 Mbps).
   Catch-up replays to newly attached viewers don't count as congestion. Changes apply in place,
   with no new capture. Topology shows each directly fed viewer's link from the presenter, so a slow
   peer is easy to spot.
@@ -454,6 +507,7 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
 | `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*`, `mediaMaxPacketLifeTimeMs`, `ccQueueMs` | `tuning.ts` | see the table above | Uplink layer deadlines, jitter buffer, retransmits and congestion back-off: latency vs complete, smooth frames |
+| `CONGESTION_DEFAULTS` | `session/congestion.ts` | settle at 90% of the carried rate; return to 95%; probe +5% every 10–40 s; forget after 60 s | Higher shares and faster probing use more of the uplink but queue more often |
 
 ## Tests
 

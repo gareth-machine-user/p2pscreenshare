@@ -54,6 +54,12 @@ export interface ProbeTarget {
   readonly remoteId: string
   readonly isOpen: boolean
   readonly probeLink: ProbeLink
+  /**
+   * With media lanes (mesh/lanes.ts): the probe links of every open connection to this neighbour,
+   * probed in parallel, so the probe measures what the pair's connections carry together rather
+   * than one connection's congestion window. Default: just `probeLink`.
+   */
+  readonly probeLinks?: readonly ProbeLink[]
 }
 
 /** The narrow slice of PeerSession the probe needs. */
@@ -113,8 +119,8 @@ export class UploadProbe {
   }
 
   /**
-   * Measures this peer's upload: a 1.5 s probe sent in parallel to up to 3 random neighbours,
-   * which report bytes received. Their sum, plus whatever the uplink sent meanwhile (relayed or
+   * Measures this peer's upload: a 1.5 s probe sent in parallel to up to 3 random neighbours (over
+   * each one's every lane), which report bytes received. Their sum, plus whatever the uplink sent meanwhile (relayed or
    * published media share the same pipe), is the estimate. Several receivers mean we measure our
    * own uplink, not one receiver's downlink. Null when there was nobody to probe, or the probe was
    * discarded as untrustworthy (see probeDiscardReason).
@@ -144,12 +150,15 @@ export class UploadProbe {
       const start = performance.now()
       const sentBefore = uplink.stats.sentBytes
       const droppedBefore = uplink.stats.droppedBackground
-      const lanes = targets.map((c) => ({
-        link: c.probeLink,
-        enqueued: 0,
-        bufferMax: PROBE_BUFFER_MIN,
-        threshold: c.probeLink.bufferLowThreshold,
-      }))
+      // One flow per connection: a neighbour with media lanes is probed over all of them at once.
+      const lanes = targets
+        .flatMap((c) => (c.probeLinks?.length ? c.probeLinks : [c.probeLink]))
+        .map((link) => ({
+          link,
+          enqueued: 0,
+          bufferMax: PROBE_BUFFER_MIN,
+          threshold: link.bufferLowThreshold,
+        }))
       const probeId = crypto.getRandomValues(new Uint32Array(1))[0]
       const chunk = () => {
         const c = new Uint8Array(PROBE_CHUNK)

@@ -1,3 +1,5 @@
+import { clampLanes } from '../mesh/lanes'
+
 export type Route =
   | { page: 'home' }
   /** Legacy owner link carrying the private seed (`stream`); redirected to the lobby page. */
@@ -52,6 +54,16 @@ export function trackersFrom(params: URLSearchParams): string[] | undefined {
     .map((s) => s.trim())
     .filter(Boolean)
   return list?.length ? list : undefined
+}
+
+/**
+ * Media lanes: connections per mesh pair, `?lanes=N` (page query or hash query), 1..4. Default 2;
+ * `lanes=1` is a single connection per pair. Malformed values give the default, out-of-range ones
+ * are clamped.
+ */
+export function lanesFrom(params: URLSearchParams): number {
+  const raw = params.get('lanes') ?? new URLSearchParams(location.search).get('lanes')
+  return clampLanes(raw === null || raw.trim() === '' ? undefined : Number(raw))
 }
 
 export function numParam(params: URLSearchParams, key: string, fallback: number): number {

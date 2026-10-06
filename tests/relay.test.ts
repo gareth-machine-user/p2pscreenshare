@@ -257,3 +257,29 @@ describe('relay node: replay on request (need-gop)', () => {
     expect(node.rejected).toBe(1)
   })
 })
+
+describe('relay node: media lanes', () => {
+  it('sends each stripe over the link the lookup picks for it (forwarding and replays)', async () => {
+    const sent: { link: string; stripe: number; replay: boolean }[] = []
+    const uplink = {
+      send: (link: MediaLink & { name: string }, data: Uint8Array) => {
+        const h = decodeFragment(data)!.header
+        sent.push({ link: link.name, stripe: h.stripe, replay: h.replay })
+      },
+    } as unknown as Uplink
+    // Two lanes per peer: even stripes on the mesh link, odd ones on lane 1.
+    const node = new RelayNode(uplink, (peer, stripe) => ({ isOpen: true, name: `${peer}/${stripe % 2}` }) as unknown as MediaLink)
+    node.verifier = async () => true
+    for (const s of [0, 1, 2]) node.addChild(CH, s, 'c')
+    await feed(node, [0, 1, 2].map((s) => frag({ seq: 1, key: true, stripe: s })))
+    expect(sent).toEqual([
+      { link: 'c/0', stripe: 0, replay: false },
+      { link: 'c/1', stripe: 1, replay: false },
+      { link: 'c/0', stripe: 2, replay: false },
+    ])
+    sent.length = 0
+    // A new child's catch-up replay goes over the stripe's lane too.
+    node.addChild(CH, 1, 'd')
+    expect(sent).toEqual([{ link: 'd/1', stripe: 1, replay: true }])
+  })
+})

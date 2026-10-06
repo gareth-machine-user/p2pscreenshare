@@ -32,6 +32,7 @@ async function makeLobby(n: number): Promise<Lobby> {
         name: `p${i}`,
         iceServers: [],
         connect: net.factory(identity.id),
+        connectLane: net.laneFactory(identity.id),
         rendezvous: net.rendezvousFor(identity.id),
         storage: memoryStore(),
       }),

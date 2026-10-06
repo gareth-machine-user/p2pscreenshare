@@ -6,9 +6,15 @@
 // attempt fails at its deadline, as ICE would). FakeRendezvous stands in for the tracker: every
 // door offers itself to every seeker and door in the lobby, with the mesh's own answer/admit rules.
 //
+// Media lanes (mesh/lanes.ts) are FakeLanes, made by `laneFactory`, with the same handshake. Each
+// connection end (a FakeConn or a FakeLane) has a media and a bin channel that share the
+// connection's send rate, `connRateBytesPerS` (null: unlimited), like one SCTP association's
+// congestion window: sends queue up in `bufferedAmount` and buffer-low events fire as it drains.
+//
 // Everything is driven by timers, so tests run it under fake timers (see clock.ts).
 import type { RendezvousOptions, RendezvousPort } from '../../src/net/bootstrap'
-import type { LinkState } from '../../src/net/link'
+import { LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../../src/net/link'
+import type { LaneConn } from '../../src/mesh/lane'
 import type { Ctl, PeerConn } from '../../src/mesh/meshConn'
 import { every } from '../../src/net/ticker'
 
@@ -20,11 +26,23 @@ export interface FakeNetworkOptions {
   delayMs?: number
   /** Chance that a message between two peers is dropped (0..1; the ctl channel is reliable, so keep 0 unless testing loss). */
   loss?: number
+  /** Send rate of each connection's media + bin channels (bytes/s); null: unlimited. */
+  connRateBytesPerS?: number | null
 }
 
 export class FakeNetwork {
   readonly delayMs: number
   loss: number
+  /** Send rate of each connection (bytes/s, media and bin together); null: unlimited. */
+  connRateBytesPerS: number | null
+  /** Pairs whose lanes can't connect (their mesh links still can). */
+  private laneBlocked = new Set<string>()
+  /** Pairs whose selected path is relayed by TURN (usesRelay() says so). */
+  private relayedPairs = new Set<string>()
+  private laneOffers = new Map<string, FakeLane>()
+  private laneAnswers = new Map<string, FakeLane>()
+  /** Every lane made, for assertions. */
+  readonly lanes: FakeLane[] = []
   /** Pairs that can't connect (as if ICE failed); key from pairKey. */
   private blockedPairs = new Set<string>()
   /** Pairs whose traffic is dropped (a partition: open links stay "open" but go silent). */
@@ -41,6 +59,59 @@ export class FakeNetwork {
   constructor(opts: FakeNetworkOptions = {}) {
     this.delayMs = opts.delayMs ?? 5
     this.loss = opts.loss ?? 0
+    this.connRateBytesPerS = opts.connRateBytesPerS ?? null
+  }
+
+  /** The lane factory for the peer `localId` (Mesh's `connectLane` option). */
+  laneFactory(localId: string): (iceServers: RTCIceServer[], remoteId: string, index: number) => FakeLane {
+    return (_ice, remoteId, index) => {
+      const l = new FakeLane(this, localId, remoteId, index, `l${++this.seq}`)
+      this.lanes.push(l)
+      return l
+    }
+  }
+
+  /** Lanes between the pair fail to connect (as if ICE failed); their mesh link is unaffected. */
+  blockLanes(a: string, b: string): void {
+    this.laneBlocked.add(pairKey(a, b))
+  }
+
+  /** The pair's mesh link reports a TURN-relayed path. */
+  setRelayed(a: string, b: string): void {
+    this.relayedPairs.add(pairKey(a, b))
+  }
+
+  isRelayed(a: string, b: string): boolean {
+    return this.relayedPairs.has(pairKey(a, b))
+  }
+
+  canConnectLane(a: string, b: string): boolean {
+    return this.canConnect(a, b) && !this.laneBlocked.has(pairKey(a, b))
+  }
+
+  registerLaneOffer(token: string, lane: FakeLane): void {
+    this.laneOffers.set(token, lane)
+  }
+
+  takeLaneOffer(token: string): FakeLane | undefined {
+    const l = this.laneOffers.get(token)
+    this.laneOffers.delete(token)
+    return l
+  }
+
+  registerLaneAnswer(token: string, lane: FakeLane): void {
+    this.laneAnswers.set(token, lane)
+  }
+
+  takeLaneAnswer(token: string): FakeLane | undefined {
+    const l = this.laneAnswers.get(token)
+    this.laneAnswers.delete(token)
+    return l
+  }
+
+  /** Open lanes `localId` holds towards `remoteId`. */
+  openLanes(localId: string, remoteId: string): FakeLane[] {
+    return this.lanes.filter((l) => l.localId === localId && l.remoteId === remoteId && l.state === 'open')
   }
 
   /** The connection factory for the peer `localId` (Mesh's `connect` option). */
@@ -79,6 +150,7 @@ export class FakeNetwork {
   }
 
   heal(): void {
+    this.laneBlocked.clear()
     this.blockedPairs.clear()
     this.cutPairs.clear()
     this.isolated.clear()
@@ -147,7 +219,72 @@ function pairKey(a: string, b: string): string {
   return a < b ? `${a}|${b}` : `${b}|${a}`
 }
 
-export class FakeConn implements PeerConn {
+/** A connection end, as its channels see it. */
+interface FakeEnd {
+  readonly localId: string
+  readonly state: LinkState
+  readonly far: FakeEnd | null
+  /** When the connection's send rate frees up (all its channels queue behind each other). */
+  wireFreeAt: number
+  receiveData(kind: 'media' | 'bin', data: Uint8Array): void
+}
+
+/**
+ * One channel of a connection end (media or bin), as a ProbeLink: sends leave at the connection's
+ * rate, meanwhile counting in `bufferedAmount`, and arrive one network delay later.
+ */
+export class FakeChannel implements ProbeLink {
+  bufferedAmount = 0
+  bufferLowThreshold = 0
+  onBufferLow: (() => void) | null = null
+  sentBytes = 0
+
+  constructor(
+    private net: FakeNetwork,
+    private end: FakeEnd,
+    private kind: 'media' | 'bin',
+  ) {}
+
+  get isOpen(): boolean {
+    return this.end.state === 'open'
+  }
+
+  get state(): LinkState {
+    return this.end.state
+  }
+
+  send(data: Uint8Array): boolean {
+    if (!this.isOpen) return false
+    this.sentBytes += data.byteLength
+    const rate = this.net.connRateBytesPerS
+    if (rate === null) {
+      this.deliver(data)
+      return true
+    }
+    const now = performance.now()
+    const departAt = Math.max(now, this.end.wireFreeAt) + (data.byteLength / rate) * 1000
+    this.end.wireFreeAt = departAt
+    this.bufferedAmount += data.byteLength
+    setTimeout(() => {
+      const before = this.bufferedAmount
+      this.bufferedAmount -= data.byteLength
+      if (this.end.state !== 'open') return
+      this.deliver(data)
+      if (before > this.bufferLowThreshold && this.bufferedAmount <= this.bufferLowThreshold) this.onBufferLow?.()
+    }, departAt - now)
+    return true
+  }
+
+  private deliver(data: Uint8Array): void {
+    const far = this.end.far
+    if (!far || this.net.dropped(this.end.localId, far.localId)) return
+    this.net.later(() => {
+      if (far.state === 'open') far.receiveData(this.kind, data)
+    })
+  }
+}
+
+export class FakeConn implements PeerConn, FakeEnd {
   offerer = ''
   readonly createdAt = performance.now()
   state: LinkState = 'connecting'
@@ -167,6 +304,9 @@ export class FakeConn implements PeerConn {
   peer: FakeConn | null = null
   /** Ctl messages sent, for assertions. */
   readonly sent: Ctl[] = []
+  wireFreeAt = 0
+  readonly media: FakeChannel
+  readonly bin: FakeChannel
   private timeout: ReturnType<typeof setTimeout> | null = null
   private pingSeq = 0
   private pongWaiters = new Map<number, { sentAt: number; resolve: (remoteClock: number) => void }>()
@@ -176,10 +316,40 @@ export class FakeConn implements PeerConn {
     readonly localId: string,
     public remoteId: string,
     readonly token: string,
-  ) {}
+  ) {
+    this.media = new FakeChannel(net, this, 'media')
+    this.media.bufferLowThreshold = LINK_BUFFER_LOW
+    this.media.onBufferLow = () => this.onBufferLow()
+    this.bin = new FakeChannel(net, this, 'bin')
+  }
 
   get isOpen(): boolean {
     return this.state === 'open'
+  }
+
+  get far(): FakeEnd | null {
+    return this.peer
+  }
+
+  get bufferedAmount(): number {
+    return this.media.bufferedAmount
+  }
+
+  get probeLink(): ProbeLink {
+    return this.bin
+  }
+
+  send(data: Uint8Array): boolean {
+    return this.media.send(data)
+  }
+
+  receiveData(kind: 'media' | 'bin', data: Uint8Array): void {
+    if (kind === 'media') this.onMedia(data)
+    else this.onBin(data)
+  }
+
+  async usesRelay(): Promise<boolean | null> {
+    return this.net.isRelayed(this.localId, this.remoteId)
   }
 
   armTimeout(ms = CONNECT_TIMEOUT_MS): void {
@@ -287,6 +457,116 @@ export class FakeConn implements PeerConn {
     this.setState('closed')
     // The remote's channels close too, if the news can get there.
     if (wasLive && peer && !this.net.dropped(this.localId, peer.localId)) this.net.later(() => peer.setState('closed'))
+  }
+
+  private setState(state: LinkState): void {
+    if (this.state === state || this.state === 'closed' || this.state === 'failed') return
+    this.state = state
+    if (state === 'open') this.wasOpen = true
+    if (state !== 'connecting' && this.timeout !== null) clearTimeout(this.timeout)
+    this.onStateChange(state)
+  }
+}
+
+/** A media lane in memory (see FakeConn for the handshake). */
+export class FakeLane implements LaneConn, FakeEnd {
+  state: LinkState = 'connecting'
+  wasOpen = false
+  peer: FakeLane | null = null
+  wireFreeAt = 0
+  readonly media: FakeChannel
+  readonly bin: FakeChannel
+  onMedia: (data: Uint8Array) => void = () => {}
+  onBin: (data: Uint8Array) => void = () => {}
+  onStateChange: (state: LinkState) => void = () => {}
+  onBufferLow: () => void = () => {}
+  private timeout: ReturnType<typeof setTimeout> | null = null
+
+  constructor(
+    private net: FakeNetwork,
+    readonly localId: string,
+    readonly remoteId: string,
+    readonly index: number,
+    readonly token: string,
+  ) {
+    this.media = new FakeChannel(net, this, 'media')
+    this.media.bufferLowThreshold = LINK_BUFFER_LOW
+    this.media.onBufferLow = () => this.onBufferLow()
+    this.bin = new FakeChannel(net, this, 'bin')
+  }
+
+  get isOpen(): boolean {
+    return this.state === 'open'
+  }
+
+  get far(): FakeEnd | null {
+    return this.peer
+  }
+
+  get bufferedAmount(): number {
+    return this.media.bufferedAmount
+  }
+
+  get probeLink(): ProbeLink {
+    return this.bin
+  }
+
+  send(data: Uint8Array): boolean {
+    return this.media.send(data)
+  }
+
+  receiveData(kind: 'media' | 'bin', data: Uint8Array): void {
+    if (kind === 'media') this.onMedia(data)
+    else this.onBin(data)
+  }
+
+  armTimeout(ms = CONNECT_TIMEOUT_MS): void {
+    if (this.timeout !== null || this.state !== 'connecting') return
+    this.timeout = setTimeout(() => {
+      if (this.state === 'connecting') this.setState('failed')
+    }, ms)
+  }
+
+  async createOffer(): Promise<string> {
+    this.net.registerLaneOffer(this.token, this)
+    return this.token
+  }
+
+  async acceptOffer(sdp: string): Promise<string> {
+    const offerer = this.net.takeLaneOffer(sdp)
+    if (!offerer) throw new Error(`unknown lane offer ${sdp}`)
+    this.peer = offerer
+    this.armTimeout()
+    this.net.registerLaneAnswer(this.token, this)
+    return this.token
+  }
+
+  async acceptAnswer(sdp: string): Promise<void> {
+    const answerer = this.net.takeLaneAnswer(sdp)
+    if (!answerer || answerer.peer !== this) throw new Error(`unknown lane answer ${sdp}`)
+    this.peer = answerer
+    this.armTimeout()
+    if (!this.net.canConnectLane(this.localId, answerer.localId)) return
+    setTimeout(() => {
+      if (!this.net.canConnectLane(this.localId, answerer.localId)) return
+      if (this.state !== 'connecting' || answerer.state !== 'connecting') return
+      this.setState('open')
+      answerer.setState('open')
+    }, this.net.delayMs * 2)
+  }
+
+  close(): void {
+    const peer = this.peer
+    const wasLive = this.state === 'open' || this.state === 'connecting'
+    this.setState('closed')
+    if (wasLive && peer && !this.net.dropped(this.localId, peer.localId)) this.net.later(() => peer.setState('closed'))
+  }
+
+  /** Tests: the lane's connection fails (as if its path died), on both ends. */
+  fail(): void {
+    const peer = this.peer
+    this.setState('failed')
+    peer?.setState('failed')
   }
 
   private setState(state: LinkState): void {

@@ -10,6 +10,7 @@ import { ban, grant, isBanned, mayPublish as mayPublishDoc, revoke, setPolicy, t
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
 import { Mesh } from '../mesh/mesh'
+import { laneSample, peerLinkRates, type LaneSample } from '../mesh/lanes'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { fromBase64Url } from '../net/lobby'
 import { Uplink } from '../net/uplink'
@@ -18,6 +19,7 @@ import { RateWindow, round1 } from './rates'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
 import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor, uplinkIsFull } from './capacity'
+import { CONGESTION_DEFAULTS, CongestionController, type CongestionConfig } from './congestion'
 import { PublishedStream, type ChannelPublisher, type PublisherContext, type ShareOptions } from './publisher'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
@@ -37,6 +39,8 @@ export interface PeerSessionOptions {
   capKbps: number | null
   /** Debug: refuse mesh links with members of these names. */
   block?: string[]
+  /** Connections per pair (media lanes, mesh/lanes.ts): 1..4, default 2; 1 = the mesh link only. */
+  lanes?: number
 }
 
 export interface LiveChannel {
@@ -62,17 +66,12 @@ const REBALANCE_MS = 10_000
 /** Auto quality: wait this long between automatic restarts of a stream. */
 const AUTO_RESTART_GAP_MS = 30_000
 /**
- * Congestion control for a presenter's bitrate: back off by 25% (at most every 4 s) while its uplink
- * drops fragments or queues them for long, or the median viewer loses frames; after 5 s clean,
- * climb back by 25% every 5 s, never above the chosen quality.
+ * Congestion control for a presenter's bitrate (session/congestion.ts): while its uplink is full,
+ * settle just below the rate the uplink actually carried; after 5 s clean, return to that rate and
+ * probe above it slowly, never above the chosen quality.
  */
-const CC_DOWN = 0.75
-/** Clearly swamped (dropping a lot, or queueing over twice the limit): halve instead. */
-const CC_DOWN_SEVERE = 0.5
-const CC_SEVERE_DROPS_PER_S = 50
-const CC_UP = 1.25
-const CC_DOWN_GAP_MS = 4000
-const CC_UP_AFTER_MS = 5000
+const CC_CONFIG: CongestionConfig = { ...CONGESTION_DEFAULTS, severeQueueMs: 2 * tuning.ccQueueMs }
+/** The reason shown names drops above this rate (per second), else the queueing. */
 const CC_DROPS_PER_S = 5
 const CC_QUEUE_MS = tuning.ccQueueMs
 /** A link is congested when it drops this many live fragments per second (or queues past CC_QUEUE_MS). */
@@ -153,9 +152,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private reconcileTimer: (() => void) | null = null
   private timers: (() => void)[] = []
   private topoWatching = new Set<number>()
-  private ccLastDown = -Infinity
-  private ccLastUp = -Infinity
-  private ccCleanSince: number | null = null
+  private cc = new CongestionController(CC_CONFIG)
   /** Why the congestion controller last moved the bitrate (shown in Stats). */
   ccReason: string | null = null
   /** What last made the controller lower the bitrate, and the uplink rate it saw then. */
@@ -164,7 +161,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   readonly linkRates = new Map<string, { drops: number; queueMs: number; congested: boolean }>()
   /** Whether this peer's uplink itself is full (most links congested together). */
   uplinkFull: { congested: number; active: number } | null = null
-  private linkLast = new Map<object, { sent: number; drops: number; qSum: number; qN: number }>()
+  private linkLast = new Map<object, { sent: number; bytes: number; drops: number; qSum: number; qN: number }>()
   private lastAutoRestart = -Infinity
   private stallSince: number | null = null
   private smoothSince: number | null = null
@@ -184,12 +181,20 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       trackers: opts.trackers,
       iceServers: opts.iceServers,
       block: opts.block,
+      lanes: opts.lanes,
     })
-    this.relay = new RelayNode(this.uplink, (id) => this.mesh.linkFor(id))
+    // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
+    this.relay = new RelayNode(this.uplink, (id, stripe) => this.mesh.mediaLinkFor(id, stripe))
     this.relay.verifier = (raw, ch) => this.verify(raw, ch)
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
     this.uploadProbe = new UploadProbe({
-      targets: () => this.mesh.conns.values(),
+      targets: () =>
+        [...this.mesh.conns.values()].map((c) => ({
+          remoteId: c.remoteId,
+          isOpen: c.isOpen,
+          probeLink: c.probeLink,
+          probeLinks: this.mesh.probeLinksFor(c.remoteId),
+        })),
       uplink: this.uplink,
       capacity: this.capacity,
       sendTo: (to, msg) => this.sendTo(to, msg),
@@ -622,31 +627,38 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     // already sheds enhancement frames for that viewer alone; its Auto quality can fall back to
     // the preview. Viewers' own losses (their downlinks, relays) don't count either.
     const full_ = this.uplinkFull
-    const reason = full_
-      ? `your uplink is full (${full_.congested} of ${full_.active} links congested; ${drops > CC_DROPS_PER_S ? `${Math.round(drops)} fragments/s dropped` : `${up.queueMs} ms queueing`})`
-      : null
-    if (reason) {
-      this.ccCleanSince = null
-      // While full, what the uplink manages to send is about what it can carry.
-      const sendingKbps = Math.max(up.kbps, (this.ccCause?.sendingKbps ?? 0) * 0.8)
-      this.ccCause = { kind: 'uplink', sendingKbps }
-      if (now - this.ccLastDown >= CC_DOWN_GAP_MS && full.kbps > 300) {
-        this.ccLastDown = now
-        this.ccReason = `lowered: ${reason}`
-        const severe = drops > CC_SEVERE_DROPS_PER_S || up.queueMs > 2 * CC_QUEUE_MS
-        s.adaptBitrate(full.kbps * (severe ? CC_DOWN_SEVERE : CC_DOWN))
-      }
-      return
-    }
-    this.ccCleanSince ??= now
     // Climb back, but not past what the audience's relay slots can carry (when that's the limit).
     const cap = full.limited ? Math.max(full.limited.feasibleKbps, full.kbps) : s.ceilingKbps
-    if (full.kbps < Math.min(cap, s.ceilingKbps) && now - this.ccCleanSince >= CC_UP_AFTER_MS && now - this.ccLastUp >= CC_UP_AFTER_MS) {
-      this.ccLastUp = now
-      this.ccReason = 'raised: no congestion for 5 s'
-      s.adaptBitrate(Math.min(cap, full.kbps * CC_UP))
-      if (full.kbps >= s.ceilingKbps) this.ccCause = null
-    }
+    // This stream's wire rate at a video bitrate: one stripe copy per direct child. The preview
+    // channel and relayed channels are the controller's "other" traffic.
+    const edges = this.directEdges(full)
+    const ownWireKbpsAt = (v: number) => edges * stripeKbpsFor(v, full.k, full.withAudio)
+    const d = this.cc.sample({
+      now,
+      full: !!full_,
+      sentKbps: up.kbps,
+      currentKbps: full.kbps,
+      maxKbps: Math.min(cap, s.ceilingKbps),
+      dropsPerS: drops,
+      queueMs: up.queueMs,
+      ownWireKbpsAt,
+    })
+    // While full, what the uplink manages to send is about what it can carry.
+    if (full_) this.ccCause = { kind: 'uplink', sendingKbps: this.cc.sendingKbps ?? up.kbps }
+    if (!d) return
+    if (full_) {
+      const what = drops > CC_DROPS_PER_S ? `${Math.round(drops)} fragments/s dropped` : `${up.queueMs} ms queueing`
+      this.ccReason = `lowered: your uplink is full (${full_.congested} of ${full_.active} links congested; ${what}); ${d.reason}`
+    } else this.ccReason = `raised: ${d.reason}`
+    s.adaptBitrate(d.kbps)
+    if (full.kbps >= s.ceilingKbps) this.ccCause = null
+  }
+
+  /** Stripe copies this peer sends of its own channel: one per direct child (at least one per stripe once anyone watches). */
+  private directEdges(full: ChannelPublisher): number {
+    let n = 0
+    for (const ps of Object.values(full.topology.parents)) for (const p of ps) if (p === this.selfId) n++
+    return Math.max(n, full.subscribers.size ? full.stripes : 0)
   }
 
   /**
@@ -667,9 +679,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const s = this.publishing
     const full = s?.full
     if (!s || !full || full.kbps >= s.ceilingKbps) return null
-    let directEdges = 0
-    for (const ps of Object.values(full.topology.parents)) for (const p of ps) if (p === this.selfId) directEdges++
-    directEdges = Math.max(directEdges, full.subscribers.size ? full.stripes : 0)
+    const directEdges = this.directEdges(full)
     // Nominal stripe rate at the chosen quality: a lower bound (encoders overshoot).
     const stripeAtCeiling = stripeKbpsFor(s.ceilingKbps, full.k, full.withAudio)
     return {
@@ -829,25 +839,40 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   /**
-   * Per-link rates over the last window, and whether the uplink itself is full: at least half of
-   * the links carrying media are congested at once (with a single link, it must also be sending
+   * Per-peer rates over the last window, and whether the uplink itself is full: at least half of
+   * the peers being sent media are congested at once (with a single peer, it must also be sending
    * close to the measured upload; otherwise it's that receiver that is slow).
+   *
+   * With media lanes a peer has several connections, each with its own congestion window. A peer
+   * counts as congested only when most of its active lanes are: one lane backing up is that
+   * connection's ceiling, which the stripes on the other lanes don't share. Peers, not lanes, go
+   * to uplinkIsFull, so the single-receiver rule still applies to a two-peer lobby, against a probe
+   * that measured all the lanes together.
    */
   private sampleLinks(dt: number): void {
     this.linkRates.clear()
+    const samples: LaneSample[] = []
     for (const [link, c] of this.uplink.perLink) {
-      const conn = [...this.mesh.conns.values()].find((x) => x === link)
-      if (!conn) continue
-      const last = this.linkLast.get(link) ?? { sent: 0, drops: 0, qSum: 0, qN: 0 }
-      this.linkLast.set(link, { sent: c.sentItems, drops: c.drops, qSum: c.queueDelaySum, qN: c.queueDelayN })
-      const sent = c.sentItems - last.sent
-      const drops = (c.drops - last.drops) / dt
-      const qN = c.queueDelayN - last.qN
-      const queueMs = qN > 0 ? Math.round((c.queueDelaySum - last.qSum) / qN) : 0
-      if (sent === 0 && drops === 0) continue
-      const isCongested = drops > LINK_DROPS_PER_S || queueMs > CC_QUEUE_MS
-      this.linkRates.set(conn.remoteId, { drops: round1(drops), queueMs, congested: isCongested })
+      const peer = this.mesh.peerOfLink(link)
+      if (!peer) continue
+      const last = this.linkLast.get(link) ?? { sent: 0, bytes: 0, drops: 0, qSum: 0, qN: 0 }
+      this.linkLast.set(link, { sent: c.sentItems, bytes: c.sentBytes, drops: c.drops, qSum: c.queueDelaySum, qN: c.queueDelayN })
+      const sample = laneSample(
+        peer,
+        {
+          sentItems: c.sentItems - last.sent,
+          sentBytes: c.sentBytes - last.bytes,
+          drops: c.drops - last.drops,
+          queueSum: c.queueDelaySum - last.qSum,
+          queueN: c.queueDelayN - last.qN,
+        },
+        link.bufferedAmount,
+        dt,
+        { dropsPerS: LINK_DROPS_PER_S, queueMs: CC_QUEUE_MS },
+      )
+      if (sample) samples.push(sample)
     }
+    for (const [peer, r] of peerLinkRates(samples)) this.linkRates.set(peer, r)
     for (const link of this.linkLast.keys()) if (!this.uplink.perLink.has(link as never)) this.linkLast.delete(link)
     this.uplinkFull = uplinkIsFull([...this.linkRates.values()], this.uplinkNow.kbps, this.capacity.probeKbps, UPLINK_FULL_SHARE, SINGLE_LINK_FULL_SHARE)
   }

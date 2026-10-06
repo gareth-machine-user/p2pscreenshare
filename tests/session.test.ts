@@ -247,4 +247,36 @@ describe('upload probe (sending side)', () => {
     expect(maxThreshold).toBeGreaterThan(200 * 1024)
   })
 
+  it('probes every lane of a neighbour in parallel and reports their sum', async () => {
+    // One neighbour, three connections, each draining 1 MB/s (its own congestion window).
+    const lanes = [new StubProbeLink(), new StubProbeLink(), new StubProbeLink()]
+    const sent: { to: string; msg: PeerMsg }[] = []
+    const probes: number[] = []
+    const p = new UploadProbe({
+      targets: () => [{ remoteId: 'v', isOpen: true, probeLink: lanes[0], probeLinks: lanes }],
+      uplink: new Uplink(),
+      capacity: {
+        probeKbps: null,
+        setProbe: (k) => {
+          probes.push(k)
+          return true
+        },
+      },
+      sendTo: (to, msg) => sent.push({ to, msg }),
+      onProbed: () => {},
+    })
+    const result = p.probe()
+    for (let t = 0; t < PROBE_DURATION_MS + 100; t++) {
+      for (const l of lanes) l.drain(1000)
+      await vi.advanceTimersByTimeAsync(1)
+    }
+    // One end marker for the neighbour, which reports what arrived on all its lanes together.
+    expect(sent.filter((s) => s.msg.t === 'probe-end')).toHaveLength(1)
+    for (const l of lanes) expect(l.sent).toBeGreaterThan(1000 * PROBE_DURATION_MS * 0.9)
+    p.onResult('v', { bytes: lanes.reduce((a, l) => a + l.sent, 0), ms: PROBE_DURATION_MS })
+    const kbps = await result
+    // ~3 × 8 Mbps: the aggregate, not one connection's ceiling.
+    expect(kbps).toBeGreaterThan(3 * 8000 * 0.9)
+    expect(probes).toEqual([kbps])
+  })
 })

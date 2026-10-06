@@ -14,11 +14,17 @@
 // When a pair's mesh link fails before opening (typically a NAT pair without TURN), both sides list
 // each other as `unreachable` in their records, and retry after 60 s with backoff to 10 min. The
 // pair stays in the lobby; planners just never make it a tree edge.
+//
+// Once a pair's mesh link is open, it may add media lanes: extra connections for its media only,
+// signaled over the link's ctl channel (lanes.ts). mediaLinkFor picks the one carrying a stripe.
 import { Rendezvous, type RendezvousOptions, type RendezvousPort } from '../net/bootstrap'
 import { emptyAuth, isBanned, type AuthDoc } from './auth'
 import { open, seal, type Envelope, type Typed } from './envelope'
 import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn, type ConnFactory, type PeerConn } from './meshConn'
+import { Lane, type LaneFactory } from './lane'
+import { clampLanes, isLaneMsg, Lanes, type LaneMsg } from './lanes'
+import type { MediaLink, ProbeLink } from '../net/link'
 import { doorPeers, FailureDetector, GONE_MS, isMemberRecord, linkSuspected, RecordStore, retryDelayMs, SUSPECT_MS, type Digest, type MemberRecord } from './records'
 import { every } from '../net/ticker'
 import { storageGet, storageSet } from '../util/storage'
@@ -91,6 +97,7 @@ type MeshMsg =
   | { t: 'sig'; to: string; env: Envelope }
   | { t: 'chat'; env: Envelope }
   | { t: 'app'; m: unknown }
+  | LaneMsg
 
 export interface MeshOptions<C extends PeerConn = MeshConn> {
   joinCode: string
@@ -103,6 +110,10 @@ export interface MeshOptions<C extends PeerConn = MeshConn> {
   block?: string[]
   /** Tests: makes connections (default: a real MeshConn). */
   connect?: ConnFactory<C>
+  /** Connections per pair (media lanes, see lanes.ts): 1..4, default 2. 1 = the mesh link only. */
+  lanes?: number
+  /** Tests: makes lanes (default: a real Lane). */
+  connectLane?: LaneFactory
   /** Tests: makes the rendezvous (default: tracker bootstrap, net/bootstrap.ts). */
   rendezvous?: (opts: RendezvousOptions<C>) => RendezvousPort<C>
   /** Tests: where the owner keeps its decisions (default: localStorage). Must not throw. */
@@ -171,6 +182,8 @@ export class Mesh<C extends PeerConn = MeshConn> {
   private bannedIds = new Set<string>()
   private rendezvous: RendezvousPort<C>
   private connect: ConnFactory<C>
+  /** Extra media connections per pair. */
+  readonly lanes: Lanes
   private chatEnvs: Envelope[] = []
   private chatSent = new RateWindow(CHAT_RATE)
   private chatByAuthor = new Map<string, RateWindow>()
@@ -230,6 +243,17 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
     this.rendezvous.shouldAnswer = (id) => this.shouldAnswerDoor(id)
     this.rendezvous.admit = (id) => !this.offline && !this.isBlocked(id) && !this.isBannedPeer(id)
+    const connectLane = opts.connectLane ?? ((ice, id, i) => new Lane(ice, id, i))
+    this.lanes = new Lanes({
+      selfId: this.selfId,
+      iceServers: opts.iceServers,
+      wanted: clampLanes(opts.lanes),
+      connect: connectLane,
+      onMedia: (data, from) => this.onMedia(data, from),
+      onBinary: (data, from) => this.onBinary(data, from),
+      onBufferLow: () => this.onBufferLow(),
+      onChange: () => this.onChange(),
+    })
   }
 
   async start(): Promise<void> {
@@ -306,6 +330,32 @@ export class Mesh<C extends PeerConn = MeshConn> {
   linkFor(id: string): C | undefined {
     const c = this.conns.get(id)
     return c?.isOpen ? c : undefined
+  }
+
+  /**
+   * The link that carries `stripe` to `id`: one of the pair's media lanes when open, else the mesh
+   * link itself (see lanes.ts). Undefined without an open mesh link.
+   */
+  mediaLinkFor(id: string, stripe: number): MediaLink | undefined {
+    const c = this.linkFor(id)
+    return c ? this.lanes.linkFor(c, stripe) : undefined
+  }
+
+  /** Probe links to `id`: the mesh link's and each open lane's (parallel flows). */
+  probeLinksFor(id: string): ProbeLink[] {
+    const c = this.linkFor(id)
+    return c ? [c.probeLink, ...this.lanes.probeLinks(id)] : []
+  }
+
+  /** Open connections to `id` (the mesh link plus open lanes; 0 without a mesh link). */
+  laneCount(id: string): number {
+    return this.linkFor(id) ? 1 + this.lanes.openLanes(id).length : 0
+  }
+
+  /** Whose link this is (a mesh link or a lane), if any. */
+  peerOfLink(link: unknown): string | undefined {
+    for (const c of this.conns.values()) if (c === link) return c.remoteId
+    return this.lanes.peerOf(link)
   }
 
   /** Whether the direct link to `id` is missing or its pings go unanswered. */
@@ -418,6 +468,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
     this.rendezvous.close()
     setTimeout(() => {
+      this.lanes.closeAll()
       for (const c of this.conns.values()) c.close()
       this.conns.clear()
     }, LEAVE_CLOSE_DELAY_MS)
@@ -462,6 +513,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
       const wasOpen = prev.isOpen
       prev.onStateChange = () => {}
       prev.close()
+      this.lanes.primaryClosed(prev)
       this.pendingOffers.delete(id)
       if (wasOpen) this.onLinkClose(id)
     }
@@ -499,12 +551,15 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
     if (this.authEnv) conn.sendCtl({ t: 'auth', env: this.authEnv })
     conn.sendCtl({ t: 'digest', d: this.digest(), a: this.auth.version })
+    // Only now, with the mesh link open (never during the tracker rendezvous): media lanes.
+    this.lanes.primaryOpened(conn)
     this.onLinkOpen(id)
     this.onChange()
   }
 
   private onClosed(conn: C): void {
     const id = conn.remoteId
+    this.lanes.primaryClosed(conn)
     if (this.conns.get(id) !== conn) return
     this.conns.delete(id)
     this.pendingOffers.delete(id)
@@ -767,6 +822,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
         const c = this.conns.get(rec.id)!
         c.onStateChange = () => {}
         c.close()
+        this.lanes.primaryClosed(c)
         this.conns.delete(rec.id)
         this.markUnreachable(rec.id)
       }
@@ -894,6 +950,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
         break
       case 'app':
         this.onApp(msg.m, from)
+        break
+      case 'lane-offer':
+      case 'lane-answer':
+      case 'lane-close':
+        if (isLaneMsg(msg)) this.lanes.handle(msg, conn)
         break
     }
   }

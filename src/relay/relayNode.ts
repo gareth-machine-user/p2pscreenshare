@@ -85,7 +85,11 @@ export class RelayNode {
 
   constructor(
     private uplink: Uplink,
-    private linkFor: (peerId: string) => MediaLink | undefined,
+    /**
+     * The link that carries a stripe to a peer: with media lanes (mesh/lanes.ts), stripes of one
+     * pair spread over several connections. Undefined while there is no open link.
+     */
+    private linkFor: (peerId: string, stripe: number) => MediaLink | undefined,
   ) {}
 
   childrenOf(channel: number, stripe: number): string[] {
@@ -109,7 +113,7 @@ export class RelayNode {
     }
     if (set.has(child)) return
     set.add(child)
-    this.replayTo(key, child)
+    this.replayTo(key, stripe, child)
   }
 
   /**
@@ -117,10 +121,10 @@ export class RelayNode {
    * child on, at most once per REPLAY_REQUEST_MIN_MS. Requests from anyone else are ignored.
    */
   requestReplay(channel: number, stripes: number[], child: string): void {
-    const link = this.linkFor(child)
-    if (!link?.isOpen) return
     for (const stripe of new Set(stripes)) {
       const key = treeKey(channel, stripe)
+      const link = this.linkFor(child, stripe)
+      if (!link?.isOpen) continue
       if (!this.children.get(key)?.has(child) || this.replayedRecently(key, child)) continue
       this.noteReplay(key, child)
       this.sendCache(key, link)
@@ -170,11 +174,11 @@ export class RelayNode {
   }
 
   /** Replays the cached GOP once the link to `child` is open. */
-  private replayTo(key: string, child: string, attempt = 0): void {
-    const link = this.linkFor(child)
+  private replayTo(key: string, stripe: number, child: string, attempt = 0): void {
+    const link = this.linkFor(child, stripe)
     if (!link || !link.isOpen) {
       if (attempt < 60 && this.children.get(key)?.has(child)) {
-        after(200, () => this.replayTo(key, child, attempt + 1))
+        after(200, () => this.replayTo(key, stripe, child, attempt + 1))
       }
       return
     }
@@ -262,7 +266,7 @@ export class RelayNode {
       const frame = h.fragCount > 1 ? `${h.channel >>> 0}:${h.stripe}:${h.epoch}:${h.frameSeq}` : undefined
       for (const child of kids) {
         if (child === from) continue
-        const link = this.linkFor(child)
+        const link = this.linkFor(child, h.stripe)
         if (link) this.uplink.send(link, frag.raw, layer, maxAge, false, frame)
       }
     }

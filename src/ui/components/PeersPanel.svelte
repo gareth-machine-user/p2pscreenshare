@@ -22,6 +22,9 @@
         name: r.name || r.id.slice(0, 6),
         self,
         status: self ? 'you' : mesh.linkStatus(r.id),
+        // Media lanes: open connections to this peer (mesh/lanes.ts); TURN-relayed pairs use one.
+        lanes: self ? 0 : mesh.laneCount(r.id),
+        turn: !self && mesh.lanes.relayed(r.id),
         rtt: self ? null : (mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
         capacity: r.capacityKbps,
         unreachable: unreachable.size,
@@ -43,7 +46,7 @@
             {#each badges(r.id) as b}<span class="badge">{b}</span>{/each}
             {#if r.limited}<span class="badge warn" data-testid="limited">limited connectivity</span>{/if}
           </td>
-          <td data-testid="link-status">{r.status}</td>
+          <td data-testid="link-status">{r.status}{#if r.lanes > 1}<span class="badge" data-testid="lanes" title="Connections carrying media to this peer">{r.lanes} lanes</span>{:else if r.turn}<span class="badge" title="Relayed through TURN: a single connection">TURN</span>{/if}</td>
           <td>{fmtMs(r.rtt)}</td>
           <td>{fmtKbps(r.capacity)}</td>
           <td data-testid="unreachable-count">{r.unreachable || ''}</td>
