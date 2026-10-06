@@ -67,8 +67,6 @@ npm run tracker             # ws://localhost:8000
   "limited connectivity") and **Topology** (the stream's relay trees, fetched from its presenter).
 - **Moderation.** The owner can stop anyone's stream from its tile menu (which revokes their right
   to share) and kick members from the Peers panel.
-- **Names.** Guests may join and watch anonymously, but pick a name (remembered) before sharing,
-  asking to share, or sending their first chat message.
 - **Names.** Guests may join and watch anonymously, but pick a name before sharing, asking to
   share, or sending their first chat message. It is remembered; change it from the name field on
   the home page (it applies the next time a lobby loads).
@@ -237,41 +235,46 @@ Not handled yet:
 
 `npm run sim -- --peers 200 --seconds 300` runs one publisher's planner under churn with a mix of
 residential uplinks: 25% at 0.5 Mbps, 35% at 2 Mbps, 25% at 8 Mbps and 15% at 30 Mbps. Viewers
-stay a mean of 240 s, and the stream is 2.5 Mbps. Peers offer slots from a noisy upload estimate,
+stay a mean of 240 s, and the stream is 2.5 Mbps with audio (each stripe carries the audio, as in
+the app; `--audio 0` drops it). The simulator uses the app's own planner, planner config, stripe
+bitrate formula and late-parent policy (`topology/policy.ts`), and `tests/sim.test.ts` runs a small
+scenario on every `npm test` to catch regressions. Peers offer slots from a noisy upload estimate,
 re-measured every 10 s, and the publisher sees offers and joins `--gossip` ms late (default 500).
-When a peer leaves, its subtree loses that stripe for `--repair` ms (default 2500, matching the
-mesh e2e measurement above). A viewer stalls while more than `m` of its stripes are missing.
+When a peer leaves, its subtree loses that stripe for `--repair` ms (default 2225: the app's
+stripe-silence timeout, the health-check interval, the reattach batch and relinking). A viewer stalls while more than `m` of its stripes are missing.
 
 ```
 k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent changes/min
 -----+--------+--------+-----------+---------+-----------+------------+-------------------
-1  0 |    323 |    396 |         5 |   2.167 |     30.62 |       0.00 |                331
-2  0 |    307 |    372 |         4 |   2.761 |     39.89 |       0.00 |                515
-4  0 |    343 |    401 |         4 |   6.882 |     98.61 |       0.00 |                960
-4  1 |    319 |    380 |         4 |   0.499 |     11.16 |       0.00 |               1432
-4  2 |    323 |    377 |         4 |   0.084 |      1.40 |       0.05 |               2104
-8  2 |    345 |    411 |         4 |   0.377 |      6.16 |       1.52 |               3404
+1  0 |    350 |    419 |         5 |   2.736 |     43.18 |       0.00 |                375
+2  0 |    316 |    362 |         4 |   2.847 |     44.70 |       0.00 |                650
+4  0 |    342 |    416 |         4 |   6.885 |    104.90 |       0.00 |               1108
+4  1 |    337 |    391 |         5 |   0.355 |     10.79 |       0.05 |               1804
+4  2 |    340 |    388 |         5 |   0.006 |      0.18 |       2.35 |               2347
+8  2 |    348 |    401 |         4 |   0.221 |      4.76 |      53.76 |               2848
 ```
 
 "Degraded" means some viewer's k-th best stripe passes through a parent whose children need more
-than its true upload. Other options: `--lifetime`, `--repair`, `--gossip`, `--fanout`,
-`--only 4:1,8:2`, and the sweeps below.
+than its true upload. 8+2 degrades heavily because every one of its 10 stripes carries the audio
+(about 440 kbps a stripe), and most of the upload that could carry them sits with a few strong
+peers that the 16-child fanout cap holds back (see below; with `--fanout 48` it is 0). Other options:
+`--lifetime`, `--repair`, `--gossip`, `--fanout`, `--audio`, `--only 4:1,8:2`, and the sweeps below.
 
 Two scenarios exercise the hardening:
 
 ```
 $ npm run sim -- --sweep late --peers 100      # relays that forward 250 ms late, 4+1 stripes
 late share | handled | p50 ms | p95 ms | stall %
-        0% |     yes |    311 |    354 |   0.235
-       10% |      no |    320 |    570 |   0.235
-       10% |     yes |    314 |    505 |   0.247
-       25% |      no |    482 |    595 |   0.235
-       25% |     yes |    343 |    580 |   0.255
+        0% |     yes |    334 |    394 |   0.262
+       10% |      no |    348 |    591 |   0.262
+       10% |     yes |    340 |    576 |   0.288
+       25% |      no |    494 |    650 |   0.262
+       25% |     yes |    402 |    605 |   0.288
 
 $ npm run sim -- --sweep competing --peers 60  # two publishers, everyone watches both
 rebalancing | overcommitted A | overcommitted B | degraded % A | degraded % B
-         no |             0.0 |            98.0 |         0.00 |        85.00
-        yes |             4.6 |            38.5 |         0.00 |         0.00
+         no |             0.0 |           108.0 |         0.00 |        93.33
+        yes |             7.4 |            39.8 |         0.00 |         0.00
 ```
 
 ## Tuning
@@ -284,51 +287,52 @@ events per viewer-hour in parentheses:
 ```
 k  m | overhead |         life 60s |        life 240s |        life 900s | degraded % (240s)
 -----+----------+------------------+------------------+------------------+------------------
-1  0 |       0% |    8.960 (128.5) |     2.311 (32.5) |     0.757 (10.9) |              0.00
-2  0 |       0% |   12.275 (171.1) |     2.908 (41.4) |     0.967 (13.9) |              0.00
-2  1 |      50% |     2.088 (52.8) |      0.113 (4.9) |      0.006 (0.5) |              0.00
-2  2 |     100% |     0.403 (10.8) |      0.001 (0.0) |      0.000 (0.0) |              2.37
-4  0 |       0% |   25.872 (327.1) |    7.579 (107.3) |     2.387 (34.3) |              0.00
-4  1 |      25% |    5.264 (128.8) |     0.397 (10.3) |      0.039 (1.1) |              0.09
-4  2 |      50% |     1.428 (41.8) |      0.045 (0.8) |      0.000 (0.0) |              0.17
-4  3 |      75% |      0.278 (6.8) |      0.011 (0.2) |      0.000 (0.0) |              3.12
-8  0 |       0% |   45.684 (502.6) |   14.583 (196.8) |     3.707 (52.9) |              5.13
-8  2 |      25% |    3.294 (111.1) |      0.204 (3.7) |      0.000 (0.0) |              2.34
-8  4 |      50% |      0.339 (8.6) |      0.036 (0.5) |      0.000 (0.0) |             25.01
+1  0 |       0% |    7.468 (118.0) |     2.574 (39.8) |      0.482 (7.7) |              0.00
+2  0 |       0% |   11.897 (179.8) |     3.327 (51.6) |     1.380 (21.6) |              0.00
+2  1 |      50% |     1.721 (46.0) |      0.174 (3.7) |      0.020 (1.0) |              0.06
+2  2 |     100% |     0.378 (10.0) |      0.012 (0.3) |      0.000 (0.0) |             10.95
+4  0 |       0% |   24.457 (349.8) |    7.009 (106.1) |     1.790 (27.5) |              0.11
+4  1 |      25% |    4.731 (124.9) |     0.545 (15.0) |      0.014 (1.4) |              1.04
+4  2 |      50% |     0.936 (31.5) |      0.017 (0.8) |      0.000 (0.0) |              7.47
+4  3 |      75% |      0.262 (7.3) |      0.000 (0.0) |      0.000 (0.0) |             17.76
+8  0 |       0% |   44.167 (554.8) |   14.243 (208.0) |     3.449 (53.6) |             41.87
+8  2 |      25% |     3.116 (97.0) |      0.130 (4.4) |      0.000 (0.0) |             68.58
+8  4 |      50% |      0.311 (7.4) |      0.002 (0.0) |      0.000 (0.0) |             90.29
 ```
 
 Takeaways:
 
 - **Striping without parity makes things worse.** A viewer depends on `k` parents instead of one,
-  and losing any of them stalls it. At 240 s lifetimes, stall time is 2.3% for k=1, 2.9% for k=2,
-  7.6% for k=4 and 14.6% for k=8.
+  and losing any of them stalls it. At 240 s lifetimes, stall time is 2.6% for k=1, 3.3% for k=2,
+  7.0% for k=4 and 14.2% for k=8.
 - **The first parity stripe is the big win.** It turns a single failure from a stall into nothing.
-  k=4/m=1 (25% overhead) stalls about 6× less than a single tree, and k=2/m=1 about 20× less.
+  k=4/m=1 (25% overhead) stalls about 5× less than a single tree, and k=2/m=1 about 15× less.
 - **Each further parity stripe still helps, by less.** A stall now needs `m+1` overlapping failures
-  within one repair window: at 240 s lifetimes, k=4 goes 0.397% → 0.045% → 0.011% as m goes 1 → 3.
+  within one repair window: at 240 s lifetimes, k=4 goes 0.545% → 0.017% → 0.000% as m goes 1 → 3.
 - **For the same overhead, more stripes are more resilient.** At 50% overhead, stall time is
-  0.113% for 2+1, 0.045% for 4+2 and 0.036% for 8+4. The costs are more parents per viewer
+  0.174% for 2+1, 0.017% for 4+2 and 0.002% for 8+4. The costs are more parents per viewer
   (`k+m`), more planner churn (parent changes per minute rise roughly with `k+m`), and more relays
   needed before every stripe has one.
-- **Churn sets the baseline; repair time scales it.** With 60 s lifetimes, even 4+2 stalls 1.4% of
-  the time. Halving repair time (`--repair 1250`) cuts stall time 1.9× with m=0 (stalls get shorter)
-  and 3× with m=1 (overlapping failures must land in a shorter window): 0.397% → 0.132% for 4+1.
+- **Churn sets the baseline; repair time scales it.** With 60 s lifetimes, even 4+2 stalls 0.9% of
+  the time. Halving repair time (`--repair 1112`) cuts stall time 1.9× with m=0 (stalls get shorter)
+  and 3.5× with m=1 (overlapping failures must land in a shorter window): 0.545% → 0.157% for 4+1.
 - **Parity isn't free.** Every viewer downloads `(k+m)/k` × the bitrate, and relays upload the same
   overhead. When the audience's total upload is tight, more parity means more overloaded relays.
   That shows up as "degraded": dropped enhancement frames, lower fps.
 
-**About the "degraded" column.** Its high values for 8+4 come mostly from the 16-child
-`maxFanout` cap. With small stripes, strong peers hit the cap long before their upload limit, so
-their spare capacity goes unused. With `--fanout 48` the column is 0 for all of these. Bigger
-subtrees have a cost, though: each departure affects more viewers (4+2 and 4+3 stall more).
+**About the "degraded" column.** Its high values for 8+m come mostly from the 16-child
+`maxFanout` cap. Strong peers hit the cap long before their upload limit, so their spare capacity
+goes unused, and every stripe carrying the audio makes more stripes cost more. With `--fanout 48`
+the column is 0 for all of these. Bigger subtrees have a cost, though: each departure affects more
+viewers (4+2 and 8+2 stall more).
 
 ```
                 fanout 16                     fanout 48
 k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
-4  2 |   0.084 |       0.05 |    323      0.103 |       0.00 |    315
-4  3 |   0.021 |       0.27 |    321      0.208 |       0.00 |    308
-8  2 |   0.377 |       1.52 |    345      0.163 |       0.00 |    302
-8  4 |   0.072 |      19.28 |    331      0.021 |       0.00 |    313
+4  2 |   0.006 |       2.35 |    340      0.558 |       0.00 |    330
+4  3 |   0.000 |       7.91 |    334      0.004 |       0.00 |    345
+8  2 |   0.221 |      53.76 |    348      0.531 |       0.00 |    334
+8  4 |   0.004 |      85.60 |    350      0.007 |       0.00 |    344
 ```
 
 ### Recommendations
@@ -348,9 +352,9 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 
 | Knob | Quality (default) | Latency | Why |
 |---|---|---|---|
-| Uplink deadlines T0 / T1 / T2 | 2500 / 1500 / 800 ms | 900 / 350 / 180 ms | Bursts drain from the queue instead of costing frames |
+| Uplink deadlines T0 / T1 / T2+ | 2500 / 1500 / 800 ms | 900 / 350 / 180 ms | Bursts drain from the queue instead of costing frames |
 | Keyframe / replay deadline | 4 s | 2 / 2.5 s | Keyframes and GOP replays survive overload |
-| Jitter buffer | 99th percentile + 120 ms, ≥ 150 ms | 95th percentile + 40 ms | Far fewer late or skipped frames on jittery paths |
+| Jitter buffer | 99th percentile + 120 ms, ≥ 150 ms | 95th percentile + 40 ms, ≥ 30 ms | Far fewer late or skipped frames on jittery paths |
 | Media channel retransmits | up to 3 s | up to 1 s | Lost packets are re-sent instead of lost |
 | Congestion back-off | queueing > 800 ms | queueing > 250 ms | The bitrate drops only on real congestion |
 | Stripe-silence detection | 1.5 s | 1 s | Fewer false reattaches |
@@ -382,21 +386,32 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | Quality preset | Share dialog | Auto (2.5 Mbps, adapts) | Lower bitrate → more relay slots per peer → shallower, more robust trees |
 | `HEADROOM` | `session/capacity.ts` | 0.75 | Share of measured upload a peer offers. Lower is safer against bad estimates and leaves room for keyframe bursts. |
 | `MAX_FANOUT` | `session/capacity.ts` | 16 | Children per relay. Higher uses strong peers fully but enlarges each failure's blast radius. |
-| `minUptimeMsForRelay` | `ChannelPublisher.plannerConfig` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |
-| `switchGain`, `rttSwitchMs` | `ChannelPublisher.plannerConfig` | 1, 40 | How many levels shallower (or ms closer) a parent must be before a peer is moved. Higher means less churn. |
-| `STRIPE_SILENCE_MS` | `tuning.ts` | 1500 (quality) | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
-| `REATTACH_BATCH_MS`, `LIVENESS_TIMEOUT_MS` | `session/publisher.ts` | 400, 1200 | Collateral-blame window, and the dead-parent confirmation timeout |
+| `MIN_UPTIME_MS_FOR_RELAY` | `topology/policy.ts` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |
+| `SWITCH_GAIN`, `RTT_SWITCH_MS` | `topology/policy.ts` | 1, 40 | How many levels shallower (or ms closer) a parent must be before a peer is moved. Higher means less churn. |
+| `stripeSilenceMs` | `tuning.ts` | 1500 (quality), 1000 (latency) | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
+| `REATTACH_BATCH_MS` | `topology/policy.ts` | 400 | Collateral-blame window: reattach requests collected this long are handled shallowest-first |
+| `LATE_PARENT_MS`, `LATE_PARENT_FOR_MS`, `LATE_PARENT_AVOID_MS` | `topology/policy.ts` | 150, 10000, 30000 | How late, for how long, a parent may be before its children avoid it, and for how long |
+| `LIVENESS_TIMEOUT_MS` | `session/publisher.ts` | 1200 | The dead-parent confirmation timeout |
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
-| `keyframeIntervalMs` | `tuning.ts` | 10000 (quality) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
-| Layer deadlines, jitter buffer, retransmits | `tuning.ts` | see the table above | Latency vs complete, smooth frames |
+| `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
+| `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*`, `mediaMaxPacketLifeTimeMs`, `ccQueueMs` | `tuning.ts` | see the table above | Uplink layer deadlines, jitter buffer, retransmits and congestion back-off: latency vs complete, smooth frames |
 
 ## Tests
 
 ```sh
-npm test                    # unit: framing, FEC, reassembly, jitter buffer, planner, gossip, capacity
-npm run check               # svelte-check + tsc
+npm test                    # unit tests (vitest), see below
+npm run check               # svelte-check + tsc (app, vite config, and tests/sim/tools/e2e)
 npm run e2e                 # Playwright: local tracker + dev server + several browser contexts
 ```
+
+The unit tests (`tests/`) cover:
+- media and wire format: framing, FEC, reassembly, the jitter buffer, the uplink queue, message
+  validation
+- trees and sessions: the planner, capacity and budget splits, relaying, subscriptions, stage
+  selection, channel ownership, the upload probe
+- the mesh and security: gossip and failure detection, lobby codes, publish rights, fragment
+  signing
+- the UI's pure logic: routes and URL parameters, stored settings, share options and stage messages
 
 The e2e suite covers:
 - hardening: auto quality lowers the bitrate for an audience that can't carry the stream; a kicked
@@ -415,10 +430,15 @@ The e2e suite covers:
   blamed by their own children, and a departed leaf is pruned from its parent at once
 
 `up=<kbps>` shapes a page's real uplink (publisher included), so e2e scenarios must be feasible:
-the publisher only plans its own budget, but an overcommitted plan genuinely queues.
+the publisher only plans its own budget, but an overcommitted plan genuinely queues. On a slow
+machine, relax the performance thresholds with `E2E_MIN_FPS` (default 15), `E2E_MIN_FAILOVER_FPS`
+(10) and `E2E_MAX_LATENCY_MS` (1500).
 
-**NixOS / ARM64 VMs.** Playwright's bundled browser needs FHS libraries, so point it at a system
-Chromium. Some ARM64 VMs (Apple Virtualization) advertise SME but trap SME instructions. That
+Where Playwright's bundled browser doesn't run, set `CHROMIUM_PATH` to a system Chromium (or
+Chrome) binary and the e2e suite launches that instead.
+
+**NixOS / ARM64 VMs.** Playwright's bundled browser needs FHS libraries, so point
+`CHROMIUM_PATH` at a system Chromium. Some ARM64 VMs (Apple Virtualization) advertise SME but trap SME instructions. That
 crashes Chromium (SIGILL) when it creates a VideoFrame. Build the shim in `tools/nosme` and pass it
 to the browser:
 
