@@ -36,6 +36,8 @@ const RETAIN_MS = 6000
 export class Reassembler {
   private frames = new Map<string, FrameState>()
   private lastPrune = 0
+  /** Video frames that were dropped without ever getting k complete pieces. */
+  incomplete = 0
 
   constructor(private onFrame: (frame: AssembledFrame) => void) {}
 
@@ -108,7 +110,10 @@ export class Reassembler {
   private prune(now: number): void {
     this.lastPrune = now
     for (const [id, st] of this.frames) {
-      if (now - st.firstSeenAt > RETAIN_MS) this.frames.delete(id)
+      if (now - st.firstSeenAt > RETAIN_MS) {
+        if (!st.done && !st.header.audio) this.incomplete++
+        this.frames.delete(id)
+      }
     }
   }
 

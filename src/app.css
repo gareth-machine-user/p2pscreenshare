@@ -645,3 +645,8 @@ button.danger {
   color: #f2c94c;
   background: rgba(242, 201, 76, 0.08);
 }
+
+.warn,
+td.warn {
+  color: #f2c94c;
+}

@@ -6,7 +6,8 @@ import type { Mesh } from '../mesh/mesh'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { wallClock } from '../net/clock'
 import type { Fragment } from '../proto/framing'
-import type { PublisherMsg, StripeStat, SubscriberMsg, SubscriberStats } from '../proto/messages'
+import type { LossRates, PublisherMsg, StripeStat, SubscriberMsg, SubscriberStats, UplinkRates } from '../proto/messages'
+import { RateWindow, round1 } from './rates'
 import { treeKey, type RelayNode } from '../relay/relayNode'
 import { every } from '../net/ticker'
 
@@ -32,6 +33,8 @@ export interface SubscriptionContext {
   readonly capKbps: number | null
   capacityKbps(): number | null
   uplinkSample(): { kbps: number; dropRate: number }
+  /** This peer's uplink over the last window (drops by layer, queueing delay). */
+  uplinkRates(): UplinkRates | null
   onChange(): void
 }
 
@@ -44,6 +47,10 @@ export class Subscription {
   lastStats: SubscriberStats | null = null
   /** Per-stripe smoothed lateness behind the earliest stripe (ms). */
   readonly lateMs: number[] = []
+  /** Where frames went missing, per second over the last stats window. */
+  loss: LossRates | null = null
+  private framesIn = 0
+  private lossWindow = new RateWindow<LossRates>()
 
   private reassembler: Reassembler
   private pendingOk = new Map<number, string>()
@@ -62,7 +69,10 @@ export class Subscription {
   ) {
     this.ann = ann
     this.player = new Player(null, () => this.requestKeyframe())
-    this.reassembler = new Reassembler((f) => this.player.push(f))
+    this.reassembler = new Reassembler((f) => {
+      if (!f.audio) this.framesIn++
+      this.player.push(f)
+    })
     this.setAnnouncement(ann)
     this.subscribe()
     this.timers.push(every(HEALTH_INTERVAL_MS, () => this.checkHealth()))
@@ -180,6 +190,21 @@ export class Subscription {
     if (best) this.player.clockOffset = best.offset
   }
 
+  private sampleLoss(): LossRates {
+    const p = this.player.stats
+    const r = this.lossWindow.sample({
+      incomingFps: this.framesIn,
+      incomplete: this.reassembler.incomplete,
+      late: p.late,
+      undecodable: p.undecodable,
+      skipped: p.skipped,
+      notRendered: p.notRendered,
+    })
+    const out = {} as LossRates
+    for (const k of Object.keys(r) as (keyof LossRates)[]) out[k] = round1(r[k])
+    return out
+  }
+
   get stats(): SubscriberStats {
     const now = performance.now()
     const p = this.player.stats
@@ -205,10 +230,13 @@ export class Subscription {
       decodedFrames: p.decodedFrames,
       droppedFrames: p.droppedFrames,
       waitingForKeyframe: p.waitingForKeyframe,
+      loss: this.loss ?? undefined,
+      uplinkRates: this.ctx.uplinkRates() ?? undefined,
     }
   }
 
   private async sendStats(): Promise<void> {
+    this.loss = this.sampleLoss()
     const stats = this.stats
     this.lastStats = stats
     this.send({ t: 'stats', ch: this.channel, stats })

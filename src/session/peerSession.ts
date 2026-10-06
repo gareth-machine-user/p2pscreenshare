@@ -13,7 +13,8 @@ import { Mesh } from '../mesh/mesh'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { fromBase64Url } from '../net/lobby'
 import { Uplink } from '../net/uplink'
-import type { PeerMsg, PublisherMsg, SubscriberMsg, TopologyReport } from '../proto/messages'
+import type { EncoderRates, PeerMsg, PublisherMsg, SubscriberMsg, TopologyReport, UplinkRates } from '../proto/messages'
+import { RateWindow, round1 } from './rates'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
 import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor } from './capacity'
@@ -119,6 +120,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private probeReplies = new Map<string, (r: { bytes: number; ms: number }) => void>()
   private uplinkSampleAt = { at: performance.now(), sent: 0, sentItems: 0, dropped: 0 }
   private uplinkNow = { kbps: 0, dropRate: 0 }
+  /** This peer's uplink and (when presenting) encoder, per second over the last 2 s window. */
+  uplinkStatsNow: UplinkRates | null = null
+  encoderStatsNow: EncoderRates | null = null
+  private uplinkWindow = new RateWindow<{ bytes: number; t0: number; t1: number; t2: number; stalls: number }>()
+  private lastQueueDelay = { sum: 0, n: 0 }
   private reconcileTimer: (() => void) | null = null
   private timers: (() => void)[] = []
   private topoWatching = new Set<number>()
@@ -485,6 +491,14 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     return this.uplinkNow
   }
 
+  uplinkRates(): UplinkRates | null {
+    return this.uplinkStatsNow
+  }
+
+  publisherStats(): { encoder: EncoderRates | null; uplink: UplinkRates | null } {
+    return { encoder: this.encoderStatsNow, uplink: this.uplinkStatsNow }
+  }
+
   /** Recomputes the budget split and gossips the offered slots if they changed. */
   private updateOffers(): void {
     const own = this.ownChannels().map((c) => ({ id: c.id, stripeKbps: c.stripeKbps, stripes: c.stripes }))
@@ -653,6 +667,17 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       dropRate: items + dropped > 0 ? dropped / (items + dropped) : 0,
     }
     this.uplinkSampleAt = { at: now, sent: s.sentBytes, sentItems: s.sentItems, dropped: s.droppedItems }
+    const r = this.uplinkWindow.sample({ bytes: s.sentBytes, t0: s.droppedByLayer[0], t1: s.droppedByLayer[1], t2: s.droppedByLayer[2] + s.droppedByLayer[3], stalls: s.bufferStalls })
+    const dSum = s.queueDelaySum - this.lastQueueDelay.sum
+    const dN = s.queueDelayN - this.lastQueueDelay.n
+    this.lastQueueDelay = { sum: s.queueDelaySum, n: s.queueDelayN }
+    this.uplinkStatsNow = {
+      kbps: Math.round((r.bytes * 8) / 1000),
+      drops: [round1(r.t0), round1(r.t1), round1(r.t2)],
+      stalls: round1(r.stalls),
+      queueMs: dN > 0 ? Math.round(dSum / dN) : 0,
+    }
+    this.encoderStatsNow = this.publishing?.sampleEncoder() ?? null
     this.capacity.observe(this.uplinkNow.kbps, this.uplinkNow.dropRate)
     const dropRate = Math.round(this.uplinkNow.dropRate * 1000) / 1000
     if (dropRate !== (this.mesh.record.dropRate ?? 0)) this.mesh.updateRecord({ dropRate })

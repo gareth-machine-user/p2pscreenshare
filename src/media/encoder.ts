@@ -73,8 +73,22 @@ export class VideoPipeline {
   private reader: ReturnType<typeof frameReader> | null = null
   private captureTimes = new Map<number, number>()
   private lastInfoKey = ''
+  /** Counters (cumulative): frames captured, dropped because the encoder was behind, encoded. */
   framesIn = 0
   framesDropped = 0
+  framesEncoded = 0
+  keyframes = 0
+  bytesOut = 0
+  /** Smoothed time from handing a frame to the encoder to getting its chunk (ms). */
+  encodeMs = 0
+  /** Largest encoded frame since the last read (see takeMaxFrameBytes). */
+  private maxFrameBytes = 0
+
+  takeMaxFrameBytes(): number {
+    const m = this.maxFrameBytes
+    this.maxFrameBytes = 0
+    return m
+  }
 
   constructor(
     /** The capture track, or null for a pipeline fed with encodeExternal (the preview). */
@@ -195,6 +209,12 @@ export class VideoPipeline {
   private handleChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {
     const captureTime = this.captureTimes.get(chunk.timestamp) ?? wallClock()
     this.captureTimes.delete(chunk.timestamp)
+    const took = wallClock() - captureTime
+    this.encodeMs = this.framesEncoded === 0 ? took : this.encodeMs * 0.9 + took * 0.1
+    this.framesEncoded++
+    if (chunk.type === 'key') this.keyframes++
+    this.bytesOut += chunk.byteLength
+    this.maxFrameBytes = Math.max(this.maxFrameBytes, chunk.byteLength)
     if (this.captureTimes.size > 120) this.captureTimes.clear()
 
     if (meta?.decoderConfig) {

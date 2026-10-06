@@ -22,6 +22,49 @@ export interface StripeStat {
   lateMs: number
 }
 
+/** Where a viewer's frames went missing, per second over the last stats window. */
+export interface LossRates {
+  /** Frames that became decodable (k pieces arrived). */
+  incomingFps: number
+  /** Frames dropped without ever getting k complete pieces (fragments lost or dropped upstream). */
+  incomplete: number
+  /** Frames that arrived after their play time. */
+  late: number
+  /** Frames whose reference frame was missing. */
+  undecodable: number
+  /** Frames given up on while waiting for a missing one. */
+  skipped: number
+  /** Decoded frames replaced by a newer one before they could be shown. */
+  notRendered: number
+}
+
+/** A peer's uplink, per second over the last stats window. */
+export interface UplinkRates {
+  kbps: number
+  /** Media fragments dropped for missing their queueing deadline, by temporal layer T0, T1, T2. */
+  drops: [number, number, number]
+  /** Send-buffer stalls (a child's data channel was full). */
+  stalls: number
+  /** Average time sent fragments waited in the queue (ms). */
+  queueMs: number
+}
+
+/** A publisher's encoder, per second over the last stats window. */
+export interface EncoderRates {
+  codec: string | null
+  targetKbps: number
+  kbps: number
+  captureFps: number
+  encodedFps: number
+  /** Captured frames dropped because the encoder was behind. */
+  droppedFps: number
+  keyframes: number
+  /** Smoothed encode time per frame (ms). */
+  encodeMs: number
+  /** Largest frame in the window (KB). */
+  maxFrameKB: number
+}
+
 /** A subscriber's report to the channel's publisher, every 2 s. */
 export interface SubscriberStats {
   /** Debug upload cap, if any. */
@@ -37,6 +80,8 @@ export interface SubscriberStats {
   decodedFrames: number
   droppedFrames: number
   waitingForKeyframe: boolean
+  loss?: LossRates
+  uplinkRates?: UplinkRates
 }
 
 /** What a publisher knows about one channel's trees (Topology panel). */
@@ -52,6 +97,8 @@ export interface TopologyReport {
   overcommitted: number
   changes: number
   peers: { id: string; failures: number; avoid: string[]; stats: SubscriberStats | null }[]
+  /** The publisher's own encoder and uplink. */
+  publisherStats?: { encoder: EncoderRates | null; uplink: UplinkRates | null }
 }
 
 export type SubscriberMsg =

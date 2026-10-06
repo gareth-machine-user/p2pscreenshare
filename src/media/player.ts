@@ -18,6 +18,12 @@ export interface PlayerStats {
   waitingForKeyframe: boolean
   width: number
   height: number
+  /** Cumulative: frames that arrived after their play time, whose reference was missing, that
+   * were skipped waiting for a missing frame, and decoded frames replaced before being shown. */
+  late: number
+  undecodable: number
+  skipped: number
+  notRendered: number
 }
 
 /**
@@ -42,6 +48,7 @@ export class Player {
   private latencySamples: number[] = []
   private lastRendered: VideoFrame | null = null
   private closed = false
+  private notRendered = 0
   width = 0
   height = 0
 
@@ -146,11 +153,17 @@ export class Player {
     // Show the newest frame that is due; drop older due frames.
     let due: Pending | null = null
     while (this.renderQueue.length && this.renderQueue[0].renderAt <= now) {
-      if (due) due.frame.close()
+      if (due) {
+        due.frame.close()
+        this.notRendered++
+      }
       due = this.renderQueue.shift()!
     }
     // Guard against unbounded growth if the clock jumps.
-    while (this.renderQueue.length > 90) this.renderQueue.shift()!.frame.close()
+    while (this.renderQueue.length > 90) {
+      this.renderQueue.shift()!.frame.close()
+      this.notRendered++
+    }
     if (!due) return
     this.render(due.frame, now)
   }
@@ -186,6 +199,10 @@ export class Player {
       waitingForKeyframe: this.scheduler.waitingForKeyframe,
       width: this.width,
       height: this.height,
+      late: s.droppedLate,
+      undecodable: s.droppedUndecodable,
+      skipped: s.skippedMissing,
+      notRendered: this.notRendered,
     }
   }
 

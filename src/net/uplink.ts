@@ -18,6 +18,17 @@ export interface UplinkStats {
   droppedItems: number
   sentItems: number
   queuedBytes: number
+  /** Media items dropped for missing their queueing deadline, by temporal layer (T0..T3). */
+  droppedByLayer: number[]
+  /** Background (probe) items dropped. */
+  droppedBackground: number
+  /** Items the data channel refused (link closing). */
+  sendFailed: number
+  /** Drains that found a link's send buffer full while it had items waiting. */
+  bufferStalls: number
+  /** Sum and count of time spent queued by sent media items (ms), for an average. */
+  queueDelaySum: number
+  queueDelayN: number
 }
 
 /**
@@ -33,7 +44,18 @@ export class Uplink {
   private draining = false
   /** Where the next drain pass starts (round-robin across drains). */
   private cursor = 0
-  stats: UplinkStats = { sentBytes: 0, droppedItems: 0, sentItems: 0, queuedBytes: 0 }
+  stats: UplinkStats = {
+    sentBytes: 0,
+    droppedItems: 0,
+    sentItems: 0,
+    queuedBytes: 0,
+    droppedByLayer: [0, 0, 0, 0],
+    droppedBackground: 0,
+    sendFailed: 0,
+    bufferStalls: 0,
+    queueDelaySum: 0,
+    queueDelayN: 0,
+  }
 
   constructor(public capKbps: number | null = null) {}
 
@@ -98,6 +120,18 @@ export class Uplink {
     try {
       const now = performance.now()
       this.refill(now)
+      // Expired items go once per drain (not once per pass: that made a congested drain quadratic).
+      for (const [link, q] of this.queues) {
+        if (!q.length) continue
+        const bg = this.background.has(link)
+        let kept = 0
+        for (const it of q) {
+          if (now - it.enqueuedAt > it.maxAge) this.drop(it, bg)
+          else q[kept++] = it
+        }
+        q.length = kept
+        if (kept && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) this.stats.bufferStalls++
+      }
       let progress = true
       let waitingOnTokens = false
       // Round-robin one item per link per pass so children share the uplink fairly. Each drain
@@ -119,7 +153,6 @@ export class Uplink {
             if (link.state === 'closed' || link.state === 'failed') this.forget(link)
             continue
           }
-          for (let j = q.length - 1; j >= 0; j--) if (now - q[j].enqueuedAt > q[j].maxAge) this.drop(q.splice(j, 1)[0])
           if (!q.length || link.bufferedAmount > LINK_BUFFER_HIGH) continue
           const it = q[0]
           // Tokens may go negative (debt), so messages larger than the burst still get through.
@@ -133,8 +166,13 @@ export class Uplink {
             this.tokens -= it.data.byteLength
             this.stats.sentBytes += it.data.byteLength
             this.stats.sentItems++
+            if (!this.background.has(link)) {
+              this.stats.queueDelaySum += now - it.enqueuedAt
+              this.stats.queueDelayN++
+            }
           } else {
             this.stats.droppedItems++
+            this.stats.sendFailed++
           }
           this.cursor = idx + 1
           progress = true
@@ -152,9 +190,11 @@ export class Uplink {
     }
   }
 
-  private drop(it: Item): void {
+  private drop(it: Item, background = false): void {
     this.stats.queuedBytes -= it.data.byteLength
     this.stats.droppedItems++
+    if (background) this.stats.droppedBackground++
+    else this.stats.droppedByLayer[Math.min(3, it.layer)]++
   }
 
   /** Paces an arbitrary payload through the token bucket (used for the upload probe). */

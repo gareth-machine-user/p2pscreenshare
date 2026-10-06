@@ -11,7 +11,8 @@ import type { ChannelAnnouncement } from '../mesh/records'
 import { gzip } from '../mesh/envelope'
 import { toBase64Url } from '../net/lobby'
 import { signFrame } from '../proto/signing'
-import type { PublisherMsg, StreamInfo, SubscriberMsg, SubscriberStats, TopologyReport } from '../proto/messages'
+import type { EncoderRates, PublisherMsg, StreamInfo, SubscriberMsg, SubscriberStats, TopologyReport, UplinkRates } from '../proto/messages'
+import { RateWindow, round1 } from './rates'
 import type { RelayNode } from '../relay/relayNode'
 import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
@@ -44,6 +45,8 @@ export interface PublisherContext {
   rootSlots(channel: number): number
   /** A channel's announcement changed (codec config, deficit): re-gossip the record. */
   announce(): void
+  /** This peer's encoder and uplink over the last window (Topology panel). */
+  publisherStats(): { encoder: EncoderRates | null; uplink: UplinkRates | null }
   onChange(): void
 }
 
@@ -629,6 +632,7 @@ export class ChannelPublisher {
       overcommitted: this.lastPlan?.overcommitted ?? 0,
       changes: this.totalChanges,
       peers: [...this.subscribers.values()].map((s) => ({ id: s.id, failures: s.failures, avoid: [...s.avoid.keys()], stats: s.stats })),
+      publisherStats: this.ctx.publisherStats(),
     }
   }
 
@@ -779,6 +783,32 @@ export class PublishedStream {
     }
     full.limited = null
     this.ctx.announce()
+  }
+
+  private encoderWindow = new RateWindow<{ captured: number; encoded: number; dropped: number; keyframes: number; bytes: number }>()
+
+  /** The full channel's encoder over the window since the previous call. */
+  sampleEncoder(): EncoderRates | null {
+    const v = this.video
+    if (!v) return null
+    const r = this.encoderWindow.sample({
+      captured: v.framesIn,
+      encoded: v.framesEncoded,
+      dropped: v.framesDropped,
+      keyframes: v.keyframes,
+      bytes: v.bytesOut,
+    })
+    return {
+      codec: v.codec,
+      targetKbps: this.full?.kbps ?? this.opts.bitrateKbps,
+      kbps: Math.round((r.bytes * 8) / 1000),
+      captureFps: round1(r.captured),
+      encodedFps: round1(r.encoded),
+      droppedFps: round1(r.dropped),
+      keyframes: round1(r.keyframes),
+      encodeMs: round1(v.encodeMs),
+      maxFrameKB: round1(v.takeMaxFrameBytes() / 1024),
+    }
   }
 
   setSystemMuted(muted: boolean): void {

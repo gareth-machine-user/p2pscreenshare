@@ -16,6 +16,7 @@
   import RequestToasts from './components/RequestToasts.svelte'
   import PresenterBar from './components/PresenterBar.svelte'
   import NameDialog from './components/NameDialog.svelte'
+  import FrameStats from './components/FrameStats.svelte'
   import Icon from './components/Icon.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
@@ -317,6 +318,9 @@
       playerStats: p,
       hasAudio: !!sub?.ann.stream?.audio,
       capacity: s.capacity.estimateKbps,
+      loss: sub?.loss ?? null,
+      uplinkRates: s.uplinkStatsNow,
+      encoderRates: s.encoderStatsNow,
       channel: presenting ? (pub?.id ?? null) : (sub?.channel ?? null),
       tiles,
       pub: pub
@@ -440,6 +444,7 @@
                   <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
                   <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
                 </div>
+                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} />
               {:else}
                 <div class="stats-grid" data-testid="viewer-stats">
                   <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
@@ -452,6 +457,7 @@
                   <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
                   <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
                 </div>
+                <FrameStats loss={view.loss} renderedFps={view.playerStats?.fps ?? null} uplink={view.uplinkRates} />
                 {#if view.stats}
                   <table class="stripes">
                     <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th><th>Late</th></tr></thead>
