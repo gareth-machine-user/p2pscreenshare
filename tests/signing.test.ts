@@ -67,7 +67,20 @@ describe('fragment signatures', () => {
 
 describe('relay verification', () => {
   const uplink = { send: () => {} } as unknown as Uplink
-  const settle = () => new Promise((r) => setTimeout(r, 20))
+  // Waits for the verifications started so far (not a fixed delay, which is flaky under load),
+  // then for the relay's handlers that run after them.
+  const pending: Promise<unknown>[] = []
+  const tracked =
+    (verify: (raw: Uint8Array) => Promise<boolean>) =>
+    (raw: Uint8Array): Promise<boolean> => {
+      const p = verify(raw)
+      pending.push(p)
+      return p
+    }
+  const settle = async () => {
+    await Promise.allSettled(pending.splice(0))
+    await new Promise((r) => setTimeout(r, 0))
+  }
 
   function relay(): { node: RelayNode; got: number[] } {
     const node = new RelayNode(uplink, () => undefined)
@@ -85,7 +98,7 @@ describe('relay verification', () => {
 
   it('a forged fragment neither plays nor shadows the genuine one', async () => {
     const { node, got } = relay()
-    node.verifier = (raw) => verifyFragment(hostKey, raw)
+    node.verifier = tracked((raw) => verifyFragment(hostKey, raw))
     const genuine = (await signed())[0][0]
     const forged = genuine.slice()
     forged[40] ^= 0xff
@@ -100,7 +113,7 @@ describe('relay verification', () => {
 
   it('drops signed fragments replayed from outside the de-dup window', async () => {
     const { node, got } = relay()
-    node.verifier = (raw) => verifyFragment(hostKey, raw)
+    node.verifier = tracked((raw) => verifyFragment(hostKey, raw))
     const old = (await signed(frame({ seq: 1, captureTime: 1000 })))[0][0]
     node.receive((await signed(frame({ seq: 2, captureTime: 20_000 })))[0][0], 'p')
     await settle()

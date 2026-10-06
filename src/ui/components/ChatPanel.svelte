@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ChatMessage } from '../../mesh/mesh'
+  import { CHAT_MAX_LEN, type ChatMessage } from '../../mesh/mesh'
   import Icon from './Icon.svelte'
 
   let {
@@ -61,7 +61,7 @@
       {/each}
     </div>
     <form class="chat-form" onsubmit={send}>
-      <input data-testid="chat-input" placeholder="Message the lobby" maxlength="500" bind:value={draft} />
+      <input data-testid="chat-input" placeholder="Message the lobby" maxlength={CHAT_MAX_LEN} bind:value={draft} />
       <button type="submit" data-testid="chat-send">Send</button>
     </form>
     {#if limited}<p class="hint">Slow down a little.</p>{/if}
