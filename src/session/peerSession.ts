@@ -23,7 +23,7 @@ import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { UploadProbe } from './uploadProbe'
-import { after, every } from '../net/ticker'
+import { after, every, tabHidden } from '../net/ticker'
 import { tuning } from '../tuning'
 
 export interface PeerSessionOptions {
@@ -583,8 +583,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.updateOffers()
   }
 
-  /** Re-measures upload every 5 minutes while relay load is light. */
+  /**
+   * Re-measures upload every 5 minutes while relay load is light. Not while the tab is hidden:
+   * that is a backgrounded presenter's usual state, where throttling would spoil the probe.
+   */
   private maybeReprobe(): void {
+    if (tabHidden()) return
     const now = performance.now()
     const est = this.capacity.estimateKbps
     if (est === null || now - this.uploadProbe.lastProbeAt < REPROBE_EVERY_MS) return

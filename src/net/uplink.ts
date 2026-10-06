@@ -6,7 +6,7 @@ import { tuning } from '../tuning'
 // base layer.
 const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
 /** Replays and probe data are sent only while the channel's send buffer holds less than this (bytes). */
-const REPLAY_BUFFER_MAX = 64 * 1024
+export const REPLAY_BUFFER_MAX = 64 * 1024
 
 /** Layers beyond the table (none on the wire: the layer is 2 bits) get the last entry's deadline. */
 function maxAgeForLayer(layer: number): number {
@@ -88,8 +88,11 @@ export class Uplink {
     return this.capKbps === null ? Infinity : this.capKbps / 8
   }
 
-  /** Links whose traffic only uses spare upload (e.g. probes): served when no media is waiting. */
-  private background = new Set<MediaLink>()
+  /**
+   * Links whose traffic only uses spare upload (e.g. probes): served when no media is waiting, and
+   * only while their send buffer holds at most the given bytes.
+   */
+  private background = new Map<MediaLink, number>()
   /** Per link: frames that already lost a fragment there (until when to remember them). */
   private deadFrames = new Map<MediaLink, Map<string, number>>()
   /**
@@ -107,8 +110,12 @@ export class Uplink {
     return c
   }
 
-  setBackground(link: MediaLink, on = true): void {
-    if (on) this.background.add(link)
+  /**
+   * Marks a link as background. `bufferMax` bounds its send buffer (default REPLAY_BUFFER_MAX): a
+   * probe raises it on fast links, where 64 KB drains in a few ms and would cap the measurement.
+   */
+  setBackground(link: MediaLink, on = true, bufferMax = REPLAY_BUFFER_MAX): void {
+    if (on) this.background.set(link, bufferMax)
     else this.background.delete(link)
   }
 
@@ -223,7 +230,9 @@ export class Uplink {
           // Catch-up replays and probes only go out while the channel's send buffer is nearly
           // empty: a mesh link's channels share one connection, so a deep backlog of either would
           // hold up live media (audio especially) inside it.
-          if ((it.replay || this.background.has(link)) && link.bufferedAmount > REPLAY_BUFFER_MAX) continue
+          const bgMax = this.background.get(link)
+          if (it.replay && link.bufferedAmount > REPLAY_BUFFER_MAX) continue
+          if (bgMax !== undefined && link.bufferedAmount > bgMax) continue
           // Tokens may go negative (debt), so messages larger than the burst still get through.
           if (this.capKbps !== null && this.tokens <= 0) {
             waitingOnTokens = true

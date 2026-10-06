@@ -3,7 +3,7 @@
 // upload probes. A tree edge is just "forward channel X stripe s over this pair's media channel",
 // so joining or switching parents never needs new ICE or DTLS setup.
 import { wallClock } from '../net/clock'
-import { LINK_BUFFER_LOW, type LinkState, type MediaLink } from '../net/link'
+import { LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from '../net/link'
 import { tuning } from '../tuning'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
@@ -197,32 +197,44 @@ export class MeshConn implements MediaLink, PeerConn {
   }
 
   /** The probe channel as a MediaLink, so probe traffic can share the uplink queue fairly. */
-  get probeLink(): MediaLink {
+  get probeLink(): ProbeLink {
     const bin = this.bin
     const state = () => this.state
-    return (this._probeLink ??= {
-      get isOpen() {
-        return bin.readyState === 'open'
-      },
-      get state() {
-        return state()
-      },
-      get bufferedAmount() {
-        return bin.bufferedAmount
-      },
-      send(data: Uint8Array) {
-        if (bin.readyState !== 'open') return false
-        try {
-          bin.send(data as Uint8Array<ArrayBuffer>)
-          return true
-        } catch {
-          // closed between the check and the send
-          return false
-        }
-      },
-    })
+    if (!this._probeLink) {
+      const link: ProbeLink = {
+        get isOpen() {
+          return bin.readyState === 'open'
+        },
+        get state() {
+          return state()
+        },
+        get bufferedAmount() {
+          return bin.bufferedAmount
+        },
+        onBufferLow: null,
+        get bufferLowThreshold() {
+          return bin.bufferedAmountLowThreshold
+        },
+        set bufferLowThreshold(v: number) {
+          bin.bufferedAmountLowThreshold = v
+        },
+        send(data: Uint8Array) {
+          if (bin.readyState !== 'open') return false
+          try {
+            bin.send(data as Uint8Array<ArrayBuffer>)
+            return true
+          } catch {
+            // closed between the check and the send
+            return false
+          }
+        },
+      }
+      bin.addEventListener('bufferedamountlow', () => link.onBufferLow?.())
+      this._probeLink = link
+    }
+    return this._probeLink
   }
-  private _probeLink: MediaLink | null = null
+  private _probeLink: ProbeLink | null = null
 
   /** Sends on the probe channel, waiting while its buffer is full. */
   async sendBin(data: Uint8Array): Promise<void> {

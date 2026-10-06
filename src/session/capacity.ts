@@ -59,22 +59,51 @@ export function splitBudget(capacityKbps: number | null, own: OwnChannel[], watc
   return { budgetKbps, rootSlots, offers }
 }
 
+/** A probe below this share of the current probe estimate is a large drop, which needs confirming. */
+export const PROBE_DROP_SHARE = 0.5
+/** A large drop is confirmed by a second one (or by uplink drops) within this window. */
+export const PROBE_DROP_CONFIRM_MS = 10 * 60_000
+
 /**
  * Upload estimate: the probe result, capped while the uplink drops packets. Drops above 3% cap
  * the estimate at 90% of the achieved rate; with no drops the cap relaxes by 5% per sample (2 s)
  * back towards the probe value.
+ *
+ * Probes may raise the estimate freely, but one probe can't cut it below half: a single bad probe
+ * (a throttled background tab, a busy main thread) would otherwise shrink every relay offer. A
+ * large drop is applied once a second probe agrees, or once the uplink itself shows drops.
  */
 export class CapacityEstimator {
   probeKbps: number | null = null
   observedCapKbps: number | null = null
+  /** A large drop seen once, waiting for confirmation. */
+  pendingDrop: { kbps: number; at: number } | null = null
 
-  setProbe(kbps: number): void {
+  /** A probe result. Returns whether the estimate changed (false while a large drop is unconfirmed). */
+  setProbe(kbps: number, now = performance.now()): boolean {
+    if (this.probeKbps !== null && kbps < this.probeKbps * PROBE_DROP_SHARE) {
+      const pending = this.pendingDrop
+      if (!pending || now - pending.at > PROBE_DROP_CONFIRM_MS) {
+        this.pendingDrop = { kbps, at: now }
+        return false
+      }
+      // Confirmed: of the two low results, trust the higher one.
+      kbps = Math.max(kbps, pending.kbps)
+    }
+    this.applyProbe(kbps)
+    return true
+  }
+
+  private applyProbe(kbps: number): void {
+    this.pendingDrop = null
     this.probeKbps = kbps
     if (this.observedCapKbps !== null && this.observedCapKbps > kbps) this.observedCapKbps = null
   }
 
   /** One uplink sample (every ~2 s): achieved kbps and the share of items dropped. */
-  observe(uplinkKbps: number, dropRate: number): void {
+  observe(uplinkKbps: number, dropRate: number, now = performance.now()): void {
+    // The uplink is dropping: a large drop a probe saw recently was real after all.
+    if (dropRate > 0.03 && this.pendingDrop && now - this.pendingDrop.at <= PROBE_DROP_CONFIRM_MS) this.applyProbe(this.pendingDrop.kbps)
     if (dropRate > 0.03 && uplinkKbps > 0) {
       const cap = uplinkKbps * 0.9
       this.observedCapKbps = this.observedCapKbps === null ? cap : Math.min(this.observedCapKbps, cap)

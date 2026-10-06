@@ -182,6 +182,24 @@ describe('Uplink scheduling', () => {
     expect(u.stats.queueDelayN).toBe(2)
   })
 
+  it("a background link's send-buffer allowance can be raised (probes on fast links)", () => {
+    const u = new Uplink()
+    const bg = new StubLink('bg')
+    u.setBackground(bg)
+    bg.bufferedAmount = 100 * 1024
+    u.send(bg, msg(1), 0)
+    // The default allowance (64 KB) holds it back.
+    expect(sentBy('bg')).toEqual([])
+    u.setBackground(bg, true, 256 * 1024)
+    u.kick()
+    expect(sentBy('bg')).toEqual([1])
+    // Replays to a media link keep the default allowance.
+    const m = new StubLink('m')
+    m.bufferedAmount = 100 * 1024
+    u.send(m, msg(2), 0, undefined, true)
+    expect(sentBy('m')).toEqual([])
+  })
+
   it('forgets closed links and releases their queued bytes', () => {
     const u = new Uplink()
     const a = new StubLink('a')

@@ -67,6 +67,27 @@ export function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Resolves after `ms`, precisely while the tab is visible (a main-thread timer: the worker only
+ * ticks every 50 ms) and at worst at the worker's resolution while main-thread timers are throttled.
+ */
+export function sleepPrecise(ms: number): Promise<void> {
+  return new Promise((r) => {
+    const done = () => {
+      clearTimeout(t)
+      cancel()
+      r()
+    }
+    const t = setTimeout(done, ms)
+    const cancel = after(ms, done)
+  })
+}
+
+/** Whether this page is hidden, so its main-thread timers may be throttled (false outside a browser). */
+export function tabHidden(): boolean {
+  return typeof document !== 'undefined' && document.visibilityState === 'hidden'
+}
+
+/**
  * Tests only: drops every task and starts again on whatever timers are current, so tests can
  * install fake timers (with a fake `performance.now`) and drive time deterministically.
  */

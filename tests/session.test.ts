@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { liveStreamsOf, planStage, type StageChannel, type ViewQuality } from '../src/session/stage'
-import { shuffle, UploadProbe, type UploadProbeContext } from '../src/session/uploadProbe'
+import { PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeDiscardReason, shuffle, UploadProbe, type UploadProbeContext } from '../src/session/uploadProbe'
 import type { PeerMsg } from '../src/proto/messages'
+import type { LinkState, ProbeLink } from '../src/net/link'
+import { Uplink } from '../src/net/uplink'
+import { resetTicker } from '../src/net/ticker'
 
 const SELF = 'self'
 let nextId = 1
@@ -99,8 +102,8 @@ describe('upload probe (receiving side)', () => {
     const sent: { to: string; msg: PeerMsg }[] = []
     const ctx: UploadProbeContext = {
       targets: () => [],
-      uplink: { stats: { sentBytes: 0 }, setBackground: () => {}, queued: () => 0, send: () => {} },
-      capacity: { probeKbps: null, setProbe: () => {} },
+      uplink: { stats: { sentBytes: 0, droppedBackground: 0 }, setBackground: () => {}, queued: () => 0, send: () => {}, forget: () => {}, kick: () => {} },
+      capacity: { probeKbps: null, setProbe: () => true },
       sendTo: (to, msg) => sent.push({ to, msg }),
       onProbed: () => {},
     }
@@ -140,4 +143,108 @@ describe('upload probe (receiving side)', () => {
     expect(await p.probe()).toBeNull()
     expect(p.lastProbeAt).toBeGreaterThan(-Infinity)
   })
+})
+
+describe('upload probe discard', () => {
+  const ok = { maxGapMs: 50, elapsedMs: PROBE_DURATION_MS + 10 }
+  it('keeps a probe with regular refills', () => {
+    expect(probeDiscardReason(ok)).toBeNull()
+  })
+  it('discards a probe whose sending was starved', () => {
+    expect(probeDiscardReason({ ...ok, maxGapMs: PROBE_MAX_GAP_MS + 1 })).toBe('starved')
+    // The end deadline fired late: the main thread was busy or throttled.
+    expect(probeDiscardReason({ ...ok, elapsedMs: PROBE_DURATION_MS + PROBE_MAX_GAP_MS + 1 })).toBe('starved')
+  })
+})
+
+/** A probe channel whose buffer the test drains, firing buffer-low events like an RTCDataChannel. */
+class StubProbeLink implements ProbeLink {
+  isOpen = true
+  state: LinkState = 'open'
+  bufferedAmount = 0
+  sent = 0
+  onBufferLow: (() => void) | null = null
+  bufferLowThreshold = 0
+  send(data: Uint8Array): boolean {
+    this.bufferedAmount += data.byteLength
+    this.sent += data.byteLength
+    return true
+  }
+  drain(bytes: number): void {
+    const before = this.bufferedAmount
+    this.bufferedAmount = Math.max(0, before - bytes)
+    if (before > this.bufferLowThreshold && this.bufferedAmount <= this.bufferLowThreshold) this.onBufferLow?.()
+  }
+}
+
+describe('upload probe (sending side)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] })
+    resetTicker()
+  })
+  afterEach(() => {
+    resetTicker()
+    vi.useRealTimers()
+  })
+
+  function setup(n: number) {
+    const links = Array.from({ length: n }, () => new StubProbeLink())
+    const uplink = new Uplink()
+    const sent: { to: string; msg: PeerMsg }[] = []
+    const probes: number[] = []
+    let probed = 0
+    const ctx: UploadProbeContext = {
+      targets: () => links.map((l, i) => ({ remoteId: `p${i}`, isOpen: true, probeLink: l })),
+      uplink,
+      capacity: {
+        probeKbps: null,
+        setProbe: (k) => {
+          probes.push(k)
+          return true
+        },
+      },
+      sendTo: (to, msg) => sent.push({ to, msg }),
+      onProbed: () => probed++,
+    }
+    return { p: new UploadProbe(ctx), links, uplink, sent, probes, probed: () => probed }
+  }
+
+  /** Runs a probe whose links each drain `bytesPerMs`; receivers report what they got. */
+  async function run(s: ReturnType<typeof setup>, bytesPerMs: number, during?: (t: number) => void) {
+    const result = s.p.probe()
+    for (let t = 0; t < PROBE_DURATION_MS + 100; t++) {
+      during?.(t)
+      for (const l of s.links) l.drain(bytesPerMs)
+      await vi.advanceTimersByTimeAsync(1)
+    }
+    for (const { to, msg } of s.sent) if (msg.t === 'probe-end') s.p.onResult(to, { bytes: s.links[Number(to.slice(1))].sent, ms: PROBE_DURATION_MS })
+    return result
+  }
+
+  it('keeps fast links busy from buffer-low events (100 Mbps each)', async () => {
+    const s = setup(3)
+    const rate = 12_500 // bytes per ms: 100 Mbps
+    const kbps = await run(s, rate)
+    for (const l of s.links) {
+      // Nearly all of 1.5 s at full rate went out on each link...
+      expect(l.sent).toBeGreaterThan(rate * PROBE_DURATION_MS * 0.9)
+      // The channel's own low mark and handler are restored afterwards.
+      expect(l.bufferLowThreshold).toBe(0)
+      expect(l.onBufferLow).toBeNull()
+    }
+    expect(kbps).toBeGreaterThan(3 * 100_000 * 0.9)
+    expect(s.probes).toHaveLength(1)
+    expect(s.probed()).toBe(1)
+    // Nothing left queued to trail the end marker.
+    for (const l of s.links) expect(s.uplink.queued(l)).toBe(0)
+  })
+
+  it('grows the buffer allowance with the measured rate', async () => {
+    const s = setup(1)
+    let maxThreshold = 0
+    await run(s, 12_500, () => (maxThreshold = Math.max(maxThreshold, s.links[0].bufferLowThreshold)))
+    // About 40 ms of 12.5 KB/ms, halved for the low mark.
+    expect(maxThreshold).toBeGreaterThan(200 * 1024)
+  })
+
 })

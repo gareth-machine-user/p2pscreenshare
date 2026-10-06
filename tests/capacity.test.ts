@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CapacityEstimator, feasibilityRatio, feasibleBitrate, rebalanceWeights, splitBudget, uplinkIsFull } from '../src/session/capacity'
+import { CapacityEstimator, PROBE_DROP_CONFIRM_MS, feasibilityRatio, feasibleBitrate, rebalanceWeights, splitBudget, uplinkIsFull } from '../src/session/capacity'
 
 describe('budget split', () => {
   it('a viewer offers floor(B / stripe kbps) slots', () => {
@@ -57,6 +57,61 @@ describe('capacity estimate', () => {
     for (let i = 0; i < 40; i++) e.observe(1500, 0)
     expect(e.estimateKbps).toBe(5000)
     expect(e.observedCapKbps).toBeNull()
+  })
+
+  it('probes raise the estimate freely and lower it a little at once', () => {
+    const e = new CapacityEstimator()
+    expect(e.setProbe(5000, 0)).toBe(true)
+    expect(e.setProbe(20_000, 1000)).toBe(true)
+    expect(e.estimateKbps).toBe(20_000)
+    // Down to half or more: applied on one probe.
+    expect(e.setProbe(10_000, 2000)).toBe(true)
+    expect(e.estimateKbps).toBe(10_000)
+  })
+
+  it('a single probe cannot cut the estimate below half', () => {
+    const e = new CapacityEstimator()
+    e.setProbe(10_000, 0)
+    expect(e.setProbe(1000, 1000)).toBe(false)
+    expect(e.estimateKbps).toBe(10_000)
+    expect(e.pendingDrop).toEqual({ kbps: 1000, at: 1000 })
+    // A normal probe afterwards clears the suspicion.
+    expect(e.setProbe(9000, 2000)).toBe(true)
+    expect(e.pendingDrop).toBeNull()
+    // So the next low probe needs confirming again.
+    expect(e.setProbe(1000, 3000)).toBe(false)
+    expect(e.estimateKbps).toBe(9000)
+  })
+
+  it('a second low probe within the window confirms the drop (the higher of the two)', () => {
+    const e = new CapacityEstimator()
+    e.setProbe(10_000, 0)
+    e.setProbe(2000, 1000)
+    expect(e.setProbe(3000, 60_000)).toBe(true)
+    expect(e.estimateKbps).toBe(3000)
+    expect(e.pendingDrop).toBeNull()
+  })
+
+  it('a low probe outside the window starts over', () => {
+    const e = new CapacityEstimator()
+    e.setProbe(10_000, 0)
+    e.setProbe(2000, 1000)
+    expect(e.setProbe(2000, 1000 + PROBE_DROP_CONFIRM_MS + 1)).toBe(false)
+    expect(e.estimateKbps).toBe(10_000)
+  })
+
+  it('drops on a full uplink confirm a pending drop', () => {
+    const e = new CapacityEstimator()
+    e.setProbe(10_000, 0)
+    e.setProbe(2000, 1000)
+    // No drops: nothing confirmed.
+    e.observe(1500, 0, 2000)
+    expect(e.estimateKbps).toBe(10_000)
+    e.observe(1500, 0.1, 3000)
+    expect(e.probeKbps).toBe(2000)
+    expect(e.pendingDrop).toBeNull()
+    // And the observed cap applies as usual.
+    expect(e.estimateKbps).toBe(1350)
   })
 })
 

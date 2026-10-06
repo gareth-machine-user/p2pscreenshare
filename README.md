@@ -130,10 +130,13 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    stream, with a random 32-bit id drawn each time it starts. The publisher announces it in its
    record; viewers send `subscribe` directly to the publisher, and relay only in channels they
    watch.
-5. **Capacity** (`src/session/capacity.ts`). At join a peer sends a paced 1.5 s probe to 3 random
-   neighbours at background priority, and adds what its uplink sent meanwhile. While relaying,
+5. **Capacity** (`src/session/capacity.ts`). At join a peer sends a 1.5 s probe to 3 random
+   neighbours at background priority, and adds what its uplink sent meanwhile. Probe sends are
+   driven by the probe channels' buffer-low events, not timers, since a presenter's tab is usually
+   hidden and throttled; a probe whose sending was starved anyway is discarded, and one probe can't cut
+   the estimate below half (a second low probe, or uplink drops, must confirm). While relaying,
    drops above 3% cap the estimate at 90% of the achieved rate; it re-probes every 5 minutes when
-   lightly loaded. 75% of the estimate is split into relay slots per watched channel (a publisher
+   lightly loaded and visible. 75% of the estimate is split into relay slots per watched channel (a publisher
    first reserves its own roots), weighted towards channels whose publisher reports a deficit,
    and gossiped.
 6. **Planning** (`src/session/publisher.ts`, `src/topology/planner.ts`). The publisher replans

@@ -1,4 +1,5 @@
 import { wallClock } from '../net/clock'
+import { sleep, sleepPrecise } from '../net/ticker'
 
 export interface CaptureOptions {
   /** Which picker tab the browser should preselect. */
@@ -97,8 +98,10 @@ export function frameReader(track: MediaStreamTrack, fps = 30): { next: () => Pr
   let stopped = false
   return {
     next: async () => {
-      await new Promise((r) => setTimeout(r, 1000 / fps))
-      while (!stopped && video.readyState < 2) await new Promise((r) => setTimeout(r, 50))
+      // Paced off the worker ticker as well as a main-thread timer: a presenter's tab is usually
+      // hidden, where main-thread timers alone would capture about one frame a second.
+      await sleepPrecise(1000 / fps)
+      while (!stopped && video.readyState < 2) await sleep(50)
       if (stopped) return null
       return new VideoFrame(video, { timestamp: Math.round(performance.now() * 1000) })
     },
