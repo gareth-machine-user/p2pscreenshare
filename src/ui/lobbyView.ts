@@ -1,4 +1,5 @@
 // Pure rules behind the lobby page (Lobby.svelte), kept out of the component so they can be tested.
+import type { TestPatternKind } from '../media/capture'
 import type { ShareOptions } from '../session/publishedStream'
 import { numParam, sizeParam } from './route'
 import { QUALITY_PRESETS, type ShareSettings } from './settings.svelte'
@@ -14,7 +15,7 @@ export interface ResolvedShare {
 /**
  * The stream options for the saved share settings. With `urlOverrides` (tests/debug:
  * `share=1&source=test&k=…`), the URL's `quality`, `k`, `m`, `bitrate`, `audio` and `mic` replace
- * the settings. `res=WxH` sets the test pattern size either way.
+ * the settings. `res=WxH` sets the test pattern size either way, `pattern=busy|bursty` its high-entropy variants.
  */
 export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, urlOverrides: boolean): ResolvedShare {
   const preset = QUALITY_PRESETS[sh.quality]
@@ -33,10 +34,15 @@ export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, 
       audio: pick(() => params.get('audio') === '1', sh.systemAudio),
       mic: pick(() => params.get('mic') === '1', sh.mic),
       testSize: sizeParam(params, 'res'),
+      testPattern: oneOfPattern(params.get('pattern')),
     },
     auto,
     autoParity: auto && !urlOverrides,
   }
+}
+
+function oneOfPattern(p: string | null): TestPatternKind | undefined {
+  return p === 'busy' || p === 'bursty' ? p : undefined
 }
 
 /** The part of the session that auto quality drives. */

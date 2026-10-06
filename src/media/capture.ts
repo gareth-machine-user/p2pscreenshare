@@ -1,5 +1,5 @@
 import { wallClock } from '../net/clock'
-import { sleep, sleepPrecise } from '../net/ticker'
+import { every, sleep, sleepPrecise } from '../net/ticker'
 
 export interface CaptureOptions {
   /** Which picker tab the browser should preselect. */
@@ -25,19 +25,41 @@ export async function captureScreen(o: CaptureOptions): Promise<MediaStream> {
 
 /**
  * Synthetic source for testing: an animated canvas that prints the host wall clock, so latency is
- * visible by eye when the host and a viewer are side by side.
+ * visible by eye when the host and a viewer are side by side. Variants: `busy`, a rotating, zooming
+ * noise background that motion search can't predict, so the encoder runs at its full target
+ * bitrate (like a video playing on a shared screen) instead of the ~2 Mbps the plain bars need;
+ * `bursty`, that background still except for half a second every four (like a screen that is
+ * mostly static, with the odd scroll or window switch).
  */
-export function testPattern(width = 1280, height = 720, fps = 30, withAudio = false): { stream: MediaStream; stop: () => void } {
+export type TestPatternKind = 'bars' | 'busy' | 'bursty'
+
+export function testPattern(width = 1280, height = 720, fps = 30, withAudio = false, kind: TestPatternKind = 'bars'): { stream: MediaStream; stop: () => void } {
   const canvas = document.createElement('canvas')
   canvas.width = width
   canvas.height = height
   const ctx = canvas.getContext('2d')!
+  const noise = kind !== 'bars' ? noiseTile(256) : null
   let frame = 0
+  /** The background's animation step: every frame when busy, in bursts when bursty. */
+  let step = 0
   const draw = () => {
     frame++
     const t = wallClock()
-    ctx.fillStyle = '#101418'
-    ctx.fillRect(0, 0, width, height)
+    if (kind === 'busy' || (kind === 'bursty' && frame % (4 * fps) < fps / 2)) step++
+    if (noise) {
+      ctx.save()
+      ctx.translate(width / 2, height / 2)
+      ctx.rotate(step * 0.05)
+      const zoom = 1 + 0.3 * Math.sin(step * 0.11)
+      ctx.scale(zoom, zoom)
+      ctx.fillStyle = ctx.createPattern(noise, 'repeat')!
+      const r = Math.hypot(width, height)
+      ctx.fillRect(-r, -r, 2 * r, 2 * r)
+      ctx.restore()
+    } else {
+      ctx.fillStyle = '#101418'
+      ctx.fillRect(0, 0, width, height)
+    }
     // Moving bars make dropped/late frames obvious.
     for (let i = 0; i < 8; i++) {
       ctx.fillStyle = `hsl(${(i * 45 + frame) % 360} 70% 55%)`
@@ -53,7 +75,18 @@ export function testPattern(width = 1280, height = 720, fps = 30, withAudio = fa
     ctx.fillText(`frame ${frame}`, 40, height - 60)
   }
   draw()
-  const timer = setInterval(draw, 1000 / fps)
+  // A main-thread timer paces it while the tab is visible; the worker ticker (50 ms) keeps it
+  // drawing in a hidden tab, where main-thread timers run once a second (a real screen capture
+  // isn't throttled either).
+  let lastDraw = performance.now()
+  const tick = () => {
+    const now = performance.now()
+    if (now - lastDraw < 1000 / fps - 4) return
+    lastDraw = now
+    draw()
+  }
+  const timer = setInterval(tick, 1000 / fps)
+  const stopTicker = every(50, tick)
   const stream = canvas.captureStream(fps)
   // A quiet tone, so audio paths can be tested without a real capture.
   let audioCtx: AudioContext | null = null
@@ -71,10 +104,29 @@ export function testPattern(width = 1280, height = 720, fps = 30, withAudio = fa
     stream,
     stop: () => {
       clearInterval(timer)
+      stopTicker()
       stream.getTracks().forEach((t) => t.stop())
       void audioCtx?.close()
     },
   }
+}
+
+/** A square canvas of random grey-ish pixels. */
+function noiseTile(size: number): HTMLCanvasElement {
+  const c = document.createElement('canvas')
+  c.width = c.height = size
+  const g = c.getContext('2d')!
+  const img = g.createImageData(size, size)
+  const rnd = crypto.getRandomValues(new Uint8Array(size * size))
+  for (let i = 0; i < rnd.length; i++) {
+    const v = rnd[i]
+    img.data[4 * i] = v
+    img.data[4 * i + 1] = (v * 7) & 255
+    img.data[4 * i + 2] = 255 - v
+    img.data[4 * i + 3] = 255
+  }
+  g.putImageData(img, 0, 0)
+  return c
 }
 
 /** Yields VideoFrames from a track (MediaStreamTrackProcessor, or a <video>+canvas fallback). */

@@ -2,7 +2,7 @@
 // downscaler, and quality/bitrate changes. Each encoded channel is handed to a ChannelPublisher
 // (channelPublisher.ts), which plans its trees.
 import { AudioPipeline } from '../media/audio'
-import { captureScreen, testPattern } from '../media/capture'
+import { captureScreen, testPattern, type TestPatternKind } from '../media/capture'
 import { AudioMixer, captureMic } from '../media/mixer'
 import { VideoPipeline } from '../media/encoder'
 import type { EncoderRates } from '../proto/messages'
@@ -24,6 +24,8 @@ export interface ShareOptions {
   mic?: boolean
   /** Test pattern size, e.g. [1280, 720]. */
   testSize?: [number, number]
+  /** Test pattern variant (media/capture.ts testPattern). */
+  testPattern?: TestPatternKind
 }
 
 /** Capture and encoding frame rate of the full channel. */
@@ -86,7 +88,7 @@ export class PublishedStream {
     let stream: MediaStream
     if (o.source === 'test') {
       const [w, h] = o.testSize ?? DEFAULT_TEST_SIZE
-      const tp = testPattern(w, h, CAPTURE_FPS, o.audio)
+      const tp = testPattern(w, h, CAPTURE_FPS, o.audio, o.testPattern)
       stream = tp.stream
       this.stopSource = tp.stop
     } else {

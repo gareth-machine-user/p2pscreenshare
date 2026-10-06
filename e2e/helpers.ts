@@ -25,12 +25,15 @@ export interface HostOpts {
   k: number
   m: number
   bitrate?: number
-  up?: number
+  /** Upload cap (kbps; default 4000). Null: no cap. */
+  up?: number | null
   res?: string
   /** Test-pattern tone. */
   audio?: boolean
   /** Mix in the (fake) microphone. */
   mic?: boolean
+  /** Test pattern variant (media/capture.ts testPattern). */
+  pattern?: 'busy' | 'bursty'
   /** Auto quality: restart at a bitrate the audience can carry. */
   autoQuality?: boolean
 }
@@ -61,6 +64,8 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
     ice: 'none',
     name: 'owner',
   })
+  if (o.up === null) q.delete('up')
+  if (o.pattern) q.set('pattern', o.pattern)
   await page.goto(`/#/host?${q}`)
   await page.waitForFunction(() => {
     return !!window.__p2p?.codec
