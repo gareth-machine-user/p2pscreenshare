@@ -22,8 +22,14 @@ test('audio plays continuously: under 300 ms of silence, while viewers join and 
   // Wait for the worklet's next stats report.
   await new Promise((r) => setTimeout(r, 1000))
 
-  const r = await v.evaluate(() => ({ mode: (window as Any).__p2p.player.audio.mode, stats: { ...(window as Any).__p2p.player.audio.stats } }))
+  const r = await v.evaluate(() => {
+    const s = (window as Any).__p2p
+    const p = s.player
+    // stageLog says why the stage has no player (none, preview, a re-subscribe) if that happens.
+    return { mode: p?.audio.mode ?? null, stats: p ? { ...p.audio.stats } : null, stage: s.stageView().source, stageLog: s.stageLog, subs: [...s.subs.values()].map((x: Any) => `${x.ann.kind}:${x.ann.id}`) }
+  })
   console.log('audio', JSON.stringify({ before, ...r }))
+  expect(r.stats, `no stage player at the end: ${JSON.stringify(r.stageLog)}`).not.toBeNull()
   // Played as one continuous stream by the worklet (the fallback path can click).
   expect(r.mode).toBe('worklet')
   // ~16 s of 40 ms frames.
