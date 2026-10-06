@@ -28,7 +28,7 @@ jobs:
       - run: npm test
       - run: npm run build
         env:
-          # Optional: set a repo variable VITE_TRACKERS (comma-separated wss:// URLs) to override Trystero's default trackers.
+          # Optional: set a repo variable VITE_TRACKERS (comma-separated wss:// URLs) to override the default public trackers.
           VITE_TRACKERS: ${{ vars.VITE_TRACKERS }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

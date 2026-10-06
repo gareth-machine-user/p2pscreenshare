@@ -32,7 +32,7 @@ export function lobbyUrl(joinCode: string, params: URLSearchParams): string {
   return `${base}#/lobby/${joinCode}${shared.size ? `?${shared}` : ''}`
 }
 
-/** Tracker URLs: ?tracker=ws://a,wss://b (page query or hash query) or VITE_TRACKERS; else Trystero defaults. */
+/** Tracker URLs: ?tracker=ws://a,wss://b (page query or hash query) or VITE_TRACKERS; else the default public trackers. */
 export function trackersFrom(params: URLSearchParams): string[] | undefined {
   const raw =
     params.get('tracker') ??

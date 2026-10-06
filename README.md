@@ -35,31 +35,59 @@ npm run dev                 # http://localhost:5173
 ```
 
 Open the app, enter your name and click **Create lobby**. Copy the lobby link and send it to
-others, then click **Share screen**. Your name and sharing choices are remembered in
-`localStorage`, and so is each lobby's owner seed, so reloading a lobby you created keeps you its
-owner. Public WebTorrent trackers are used by default.
-
-For local development, run your own tracker:
+others, then click **Share screen**. Public WebTorrent trackers are used by default; for local
+development run your own:
 
 ```sh
 npm run tracker             # ws://localhost:8000
 # then open  http://localhost:5173/?tracker=ws://localhost:8000
 ```
 
+## Using a lobby
+
+- **Owner.** Whoever clicks **Create lobby** owns it. The owner's private seed stays in that
+  browser's `localStorage`, so reloading the lobby there keeps you its owner; the link you share
+  only carries the join code. The lobby keeps working while the owner is away (an "Owner away"
+  badge shows), except that new requests to share wait for the owner.
+- **Sharing.** The owner can always share. Everyone else clicks **Ask to share**; the owner gets a
+  toast with **Allow**, **Allow all**, **Deny** and **Deny all**, and the requester sees "Waiting
+  for the owner…" (or "Owner is away"). The lobby settings (gear in the top bar, owner only) set
+  who may share: ask each time, anyone, or only the owner. The share dialog picks the source
+  (screen, window or tab), system audio and microphone, a quality preset, and under **Advanced**
+  the stripe layout and a test pattern. All of it is remembered.
+- **Presenting.** A presenter bar mutes the mic or the stream audio, switches the source, changes
+  the quality and stops. With the **Auto** preset the stream drops its bitrate if the audience
+  can't upload enough to carry it ("Audience upload is limited" shows either way).
+- **Watching.** With two or more streams live, a tile rail shows live previews; click one to put it
+  on the stage. Hover the player for mute (every stream starts muted), quality (Auto, Full or
+  Preview), fullscreen, and a gear with **Stats**, **Peers** (who is connected, upload, RTT,
+  "limited connectivity") and **Topology** (the stream's relay trees, fetched from its presenter).
+- **Moderation.** The owner can stop anyone's stream from its tile menu (which revokes their right
+  to share) and kick members from the Peers panel.
+- **Chat.** Signed, rate limited, collapsible; a joiner receives the last 50 messages.
+
 Useful URL parameters (put them in the page query or the hash query):
 
-| Param | Where | Meaning |
-|---|---|---|
-| `tracker=ws://a,wss://b` | any | Tracker URLs to use instead of the public defaults |
-| `ice=none` / `ice=stun:…,turn:…` | any | ICE servers (`none` for LAN or tests) |
-| `name=…` | any | Display name for this page only |
-| `share=1` | owner | Start sharing right away, applying the overrides below (used by the e2e tests) |
-| `k`, `m`, `bitrate`, `up` | owner | With `share=1`: data and parity stripes, video kbps, upload budget in kbps |
-| `source=test&res=640x360&audio=1` | owner | With `share=1`: animated test pattern (prints the clock) and a test tone |
-| `up=800` | viewer | Debug upload cap in kbps (token-bucket shaper), to emulate a weak peer |
+| Param | Meaning |
+|---|---|
+| `tracker=ws://a,wss://b` | Tracker URLs to use instead of the public defaults |
+| `ice=none` / `ice=stun:…,turn:…` | ICE servers (`none` for LAN or tests; add TURN for hostile NATs) |
+| `name=…` | Display name for this page only |
+| `up=800` | Debug upload cap in kbps (token-bucket shaper) to emulate a weak peer; applies to presenters too |
+| `share=1` | Share right away (asking the owner first if needed) with the overrides below; used by the e2e tests |
+| `k`, `m`, `bitrate`, `quality=auto` | With `share=1`: data and parity stripes, video kbps, Auto quality |
+| `source=test&res=640x360&audio=1&mic=1` | With `share=1`: animated test pattern (prints the clock), a test tone, the microphone |
+| `block=name1,name2` | Debug: refuse mesh links with these members, as if ICE failed |
 
-`#/host?stream=<seed>` (the old owner link) still works: it stores the seed and redirects to the
-lobby page.
+`#/host?stream=<seed>` (an owner link from older versions) still works: it stores the seed and
+redirects to the lobby page.
+
+## Deploying
+
+The app is static files. `npm run build` writes `dist/` with relative asset paths, so it works
+from any subpath. `.github/workflows/deploy.yml` type-checks, tests, builds and publishes to
+GitHub Pages on every push to `main`. To use your own trackers in the build, set a repository
+variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
 
 ## How it works
 
@@ -143,8 +171,8 @@ is away. A member who may not publish asks the owner, who answers with **Allow**
 **Tamper-proofing.** Every media fragment is signed by its channel's publisher
 (`src/proto/signing.ts`), and the signature covers the channel id. Relays look up the publisher's
 key from the channel announcement and check that the publisher may publish (the owner, a granted
-key, or anyone under an open policy, unless revoked)
-before forwarding or playing a fragment, and fail closed. Forged fragments are dropped without
+key, or anyone under an open policy, unless revoked) before forwarding or playing a fragment,
+and fail closed. Forged fragments are dropped without
 marking their id as seen, so they can't shadow the genuine fragment, and signed fragments older
 than the 5 s de-dup window are dropped as replays. Tree commands for a channel are only accepted
 from its publisher.
@@ -179,7 +207,7 @@ membership layer handles everything else.
 | Upload estimates go stale | Every 5 min while relaying lightly, or when a publisher whose channel is overcommitted asks | Re-probe | — |
 
 Measured in the e2e tests on one machine:
-- **With parity (`m ≥ 1`):** a relay leaving is invisible (minimum 19–24 fps during failover).
+- **With parity (`m ≥ 1`):** a relay leaving is invisible (minimum 31–34 fps during failover).
 - **Without parity:** orphans resume after about **1–2.5 s**, including orphans two levels below the
   failed relay (it was about 4 s when tree links were set up on demand).
 - **Pruning:** a departed child is removed from its parent's forwarding set at once.
@@ -203,8 +231,22 @@ residential uplinks: 25% at 0.5 Mbps, 35% at 2 Mbps, 25% at 8 Mbps and 15% at 30
 stay a mean of 240 s, and the stream is 2.5 Mbps. Peers offer slots from a noisy upload estimate,
 re-measured every 10 s, and the publisher sees offers and joins `--gossip` ms late (default 500).
 When a peer leaves, its subtree loses that stripe for `--repair` ms (default 2500, matching the
-mesh e2e measurement above). A viewer stalls while more than `m` of its stripes are missing. (The
-parity tables below were measured before the mesh, with 3500 ms repairs.)
+mesh e2e measurement above). A viewer stalls while more than `m` of its stripes are missing.
+
+```
+k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent changes/min
+-----+--------+--------+-----------+---------+-----------+------------+-------------------
+1  0 |    323 |    396 |         5 |   2.167 |     30.62 |       0.00 |                331
+2  0 |    307 |    372 |         4 |   2.761 |     39.89 |       0.00 |                515
+4  0 |    343 |    401 |         4 |   6.882 |     98.61 |       0.00 |                960
+4  1 |    319 |    380 |         4 |   0.499 |     11.16 |       0.00 |               1432
+4  2 |    323 |    377 |         4 |   0.084 |      1.40 |       0.05 |               2104
+8  2 |    345 |    411 |         4 |   0.377 |      6.16 |       1.52 |               3404
+```
+
+"Degraded" means some viewer's k-th best stripe passes through a parent whose children need more
+than its true upload. Other options: `--lifetime`, `--repair`, `--gossip`, `--fanout`,
+`--only 4:1,8:2`, and the sweeps below.
 
 Two scenarios exercise the hardening:
 
@@ -223,21 +265,6 @@ rebalancing | overcommitted A | overcommitted B | degraded % A | degraded % B
         yes |             4.6 |            38.5 |         0.00 |         0.00
 ```
 
-```
-k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent changes/min
------+--------+--------+-----------+---------+-----------+------------+-------------------
-1  0 |    321 |    406 |         4 |   2.293 |     23.84 |       0.00 |                139
-2  0 |    344 |    391 |         3 |   4.334 |     44.57 |       0.00 |                293
-4  0 |    359 |    431 |         4 |   8.552 |     85.92 |       0.00 |                590
-4  1 |    347 |    402 |         4 |   0.794 |     12.10 |       0.00 |                779
-4  2 |    330 |    386 |         4 |   0.071 |      0.91 |       0.02 |               1284
-8  2 |    364 |    427 |         4 |   0.263 |      4.13 |       0.96 |               2142
-```
-
-"Degraded" means some viewer's k-th best stripe passes through a parent whose children need more
-than its true upload. Other options: `--lifetime`, `--repair`, `--fanout`, `--only 4:1,8:2`, and
-`--sweep parity`.
-
 ## Tuning
 
 ### How much does parity buy?
@@ -248,55 +275,51 @@ events per viewer-hour in parentheses:
 ```
 k  m | overhead |         life 60s |        life 240s |        life 900s | degraded % (240s)
 -----+----------+------------------+------------------+------------------+------------------
-1  0 |       0% |   10.129 (102.4) |     3.014 (31.3) |      0.904 (9.3) |              0.00
-2  0 |       0% |   16.663 (164.7) |     5.940 (58.9) |     1.453 (14.8) |              0.00
-2  1 |      50% |     3.501 (63.3) |      0.226 (5.0) |      0.016 (0.6) |              0.00
-2  2 |     100% |     0.633 (15.9) |      0.011 (0.5) |      0.000 (0.0) |              0.05
-4  0 |       0% |   34.638 (298.5) |   10.569 (104.6) |     2.572 (26.0) |              0.00
-4  1 |      25% |    8.001 (144.1) |      0.997 (19.1) |      0.083 (1.9) |              0.00
-4  2 |      50% |     2.138 (54.5) |      0.067 (1.7) |      0.000 (0.0) |              0.22
-4  3 |      75% |     0.548 (12.0) |      0.001 (0.1) |      0.000 (0.0) |             11.22
-8  0 |       0% |   58.245 (391.3) |   19.983 (186.7) |     4.743 (48.1) |              0.85
-8  2 |      25% |    7.226 (171.8) |      0.268 (7.7) |      0.004 (0.1) |              1.51
-8  4 |      50% |     0.687 (19.5) |      0.006 (0.1) |      0.000 (0.0) |             61.74
+1  0 |       0% |    8.960 (128.5) |     2.311 (32.5) |     0.757 (10.9) |              0.00
+2  0 |       0% |   12.275 (171.1) |     2.908 (41.4) |     0.967 (13.9) |              0.00
+2  1 |      50% |     2.088 (52.8) |      0.113 (4.9) |      0.006 (0.5) |              0.00
+2  2 |     100% |     0.403 (10.8) |      0.001 (0.0) |      0.000 (0.0) |              2.37
+4  0 |       0% |   25.872 (327.1) |    7.579 (107.3) |     2.387 (34.3) |              0.00
+4  1 |      25% |    5.264 (128.8) |     0.397 (10.3) |      0.039 (1.1) |              0.09
+4  2 |      50% |     1.428 (41.8) |      0.045 (0.8) |      0.000 (0.0) |              0.17
+4  3 |      75% |      0.278 (6.8) |      0.011 (0.2) |      0.000 (0.0) |              3.12
+8  0 |       0% |   45.684 (502.6) |   14.583 (196.8) |     3.707 (52.9) |              5.13
+8  2 |      25% |    3.294 (111.1) |      0.204 (3.7) |      0.000 (0.0) |              2.34
+8  4 |      50% |      0.339 (8.6) |      0.036 (0.5) |      0.000 (0.0) |             25.01
 ```
 
 Takeaways:
 
 - **Striping without parity makes things worse.** A viewer depends on `k` parents instead of one,
-  and losing any of them stalls it. At 240 s lifetimes, stall time is 3.0% for k=1, 5.9% for k=2,
-  10.6% for k=4 and 20% for k=8.
+  and losing any of them stalls it. At 240 s lifetimes, stall time is 2.3% for k=1, 2.9% for k=2,
+  7.6% for k=4 and 14.6% for k=8.
 - **The first parity stripe is the big win.** It turns a single failure from a stall into nothing.
-  k=4/m=1 (25% overhead) stalls about 3× less than a single tree. k=2/m=1 stalls about 13× less.
-- **Each further parity stripe cuts stalls by roughly 10–15×** at moderate churn. That's because a
-  stall now needs `m+1` overlapping failures within one repair window. At 240 s lifetimes, k=4
-  goes 0.997% → 0.067% → 0.001% as m goes 1 → 3.
+  k=4/m=1 (25% overhead) stalls about 6× less than a single tree, and k=2/m=1 about 20× less.
+- **Each further parity stripe still helps, by less.** A stall now needs `m+1` overlapping failures
+  within one repair window: at 240 s lifetimes, k=4 goes 0.397% → 0.045% → 0.011% as m goes 1 → 3.
 - **For the same overhead, more stripes are more resilient.** At 50% overhead, stall time is
-  0.226% for 2+1, 0.067% for 4+2 and 0.006% for 8+4. Bigger `k` tolerates more simultaneous
-  losses. The costs are more connections per viewer (`k+m` parents), more planner and link churn
-  (parent changes per minute rise roughly with `k+m`), and more relays needed before every stripe
-  has one.
-- **Churn sets the baseline; repair time scales it.** With 60 s lifetimes, even 4+2 stalls 2% of
-  the time. Halving repair time (`--repair 1750`) cuts stall time 2× with m=0 (stalls get shorter)
-  and about 3.6× with m≥1 (overlapping failures must land in a shorter window). For 4+1 that's
-  0.997% → 0.277%. Useful, but an extra parity stripe is worth about 15×.
+  0.113% for 2+1, 0.045% for 4+2 and 0.036% for 8+4. The costs are more parents per viewer
+  (`k+m`), more planner churn (parent changes per minute rise roughly with `k+m`), and more relays
+  needed before every stripe has one.
+- **Churn sets the baseline; repair time scales it.** With 60 s lifetimes, even 4+2 stalls 1.4% of
+  the time. Halving repair time (`--repair 1250`) cuts stall time 1.9× with m=0 (stalls get shorter)
+  and 3× with m=1 (overlapping failures must land in a shorter window): 0.397% → 0.132% for 4+1.
 - **Parity isn't free.** Every viewer downloads `(k+m)/k` × the bitrate, and relays upload the same
   overhead. When the audience's total upload is tight, more parity means more overloaded relays.
   That shows up as "degraded": dropped enhancement frames, lower fps.
 
-**About the "degraded" column.** Its high values for 4+3 and 8+4 come mostly from the 16-child
+**About the "degraded" column.** Its high values for 8+4 come mostly from the 16-child
 `maxFanout` cap. With small stripes, strong peers hit the cap long before their upload limit, so
 their spare capacity goes unused. With `--fanout 48` the column is 0 for all of these. Bigger
-subtrees have a cost, though: each departure now affects more viewers. For example, 4+2 stall time
-goes from 0.071% to 0.184%.
+subtrees have a cost, though: each departure affects more viewers (4+2 and 4+3 stall more).
 
 ```
                 fanout 16                     fanout 48
 k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
-4  2 |   0.071 |       0.02 |    330      0.184 |       0.00 |    321
-4  3 |   0.000 |      19.56 |    343      0.049 |       0.00 |    317
-8  2 |   0.263 |       0.96 |    364      0.349 |       0.00 |    319
-8  4 |   0.012 |      44.16 |    358      0.038 |       0.00 |    317
+4  2 |   0.084 |       0.05 |    323      0.103 |       0.00 |    315
+4  3 |   0.021 |       0.27 |    321      0.208 |       0.00 |    308
+8  2 |   0.377 |       1.52 |    345      0.163 |       0.00 |    302
+8  4 |   0.072 |      19.28 |    331      0.021 |       0.00 |    313
 ```
 
 ### Recommendations
@@ -304,8 +327,8 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Situation | Setting | Why |
 |---|---|---|
 | Small audience (fewer than about 6 capable relays) | `k=2, m=1` | Only 3 stripes need relays; one failure is invisible |
-| General use | `k=4, m=1` | 25% overhead, about 3× fewer stalls than a single tree, ~350 ms latency |
-| High churn, or viewers with spare upload | `k=4, m=2` | Stalls become rare (≈1–2 per viewer-hour at 240 s lifetimes) |
+| General use | `k=4, m=1` | 25% overhead, about 6× fewer stalls than a single tree, ~320 ms latency |
+| High churn, or viewers with spare upload | `k=4, m=2` | Stalls become rare (≈1 per viewer-hour at 240 s lifetimes); Auto quality picks it when relays allow |
 | Upload-starved audience | `k=1, m=0` or `k=4, m=1` with a lower bitrate | Parity overhead competes with capacity you don't have |
 | Large audience with strong uplinks | `k=8, m=2..4` with a higher `maxFanout` | Most resilient per byte of overhead; needs many relays |
 
@@ -314,7 +337,7 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Knob | Where | Default | Effect |
 |---|---|---|---|
 | `k`, `m` | Share dialog (Advanced) | 4, 1 | See above |
-| Quality preset | Share dialog | Auto (2.5 Mbps) | Lower bitrate → more relay slots per peer → shallower, more robust trees |
+| Quality preset | Share dialog | Auto (2.5 Mbps, adapts) | Lower bitrate → more relay slots per peer → shallower, more robust trees |
 | `HEADROOM` | `session/capacity.ts` | 0.75 | Share of measured upload a peer offers. Lower is safer against bad estimates and leaves room for keyframe bursts. |
 | `MAX_FANOUT` | `session/capacity.ts` | 16 | Children per relay. Higher uses strong peers fully but enlarges each failure's blast radius. |
 | `minUptimeMsForRelay` | `ChannelPublisher.plannerConfig` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |
@@ -366,7 +389,7 @@ CHROMIUM_LD_PRELOAD=$PWD/tools/nosme/nosme.so npm run e2e
 
 ## Limitations / next steps
 
-- **Trust.** Anyone with the viewer link can watch, and the join code can't be revoked per viewer.
+- **Trust.** Anyone with the lobby link can join and watch, and the join code can't be revoked.
   Relays can't forge or alter the stream (see [Security](#security)), but they can still drop it.
 - **Lobby size.** The full mesh is designed for about 50 peers (each holds a connection to every
   other one). Phones holding 49 connections may struggle.
@@ -378,9 +401,9 @@ CHROMIUM_LD_PRELOAD=$PWD/tools/nosme/nosme.so npm run e2e
   stripes it can reach. Pass TURN servers with `ice=`.
 - **Small audiences.** With fewer capable relays than stripes, the publisher carries uncovered
   stripes itself (reported as "overcommitted"), unless parity already covers them.
-- **Encoding and playback.** There's a single encoding, so viewers with weak downlinks are helped
-  only by relays dropping temporal layers; simulcast would be the next step. Capture relies on
-  `MediaStreamTrackProcessor` (Chromium); other browsers fall back to sampling a `<video>` element.
-  Audio playback scheduling is basic.
+- **Encoding and playback.** Each stream has a full encoding and a small preview; viewers on weak
+  downlinks can switch to the preview, and overloaded relays drop temporal layers. Capture relies
+  on `MediaStreamTrackProcessor` (Chromium); other browsers fall back to sampling a `<video>`
+  element. Audio playback scheduling is basic. Testing so far is mostly headless Chromium.
 - **Tracker reliability.** Public trackers are flaky. Self-host one with `npm run tracker` (it's
   `bittorrent-tracker`) behind TLS for real use.
