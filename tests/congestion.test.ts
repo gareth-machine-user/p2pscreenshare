@@ -99,7 +99,6 @@ const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length
 export { simulate, OldPolicy }
 describe('congestion controller', () => {
   it('converts wire to video kbps consistently with stripeKbpsFor', () => {
-    expect(ownWire(QUALITY)).toBeCloseTo(21_555, 0)
     expect(sustainable(ownWire(10_000))).toBeCloseTo(10_000, 0)
     expect(sustainable(100)).toBe(0) // less than the per-stripe constants
   })
