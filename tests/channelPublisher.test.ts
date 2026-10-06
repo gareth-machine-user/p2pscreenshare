@@ -439,8 +439,7 @@ describe('ChannelPublisher: reattach batching', () => {
     expect(parentOf('d', 0)).not.toBe('c')
   })
 
-  // Bug: fixed in the next commit.
-  it.fails('a departing relay’s subtree is not blamed for going silent', async () => {
+  it('a departing relay’s subtree is not blamed for going silent', async () => {
     await chain()
     h.cp.removeSubscriber('b')
     await advance(100)

@@ -21,6 +21,7 @@ import {
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
   LateParentTracker,
+  PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
   shouldBlameParent,
   type LatenessSample,
@@ -106,7 +107,9 @@ export class ChannelPublisher {
   private disruptedUntil = new Map<string, number>()
   /** Frames are signed in order, so fragments leave in capture order. */
   private signing: Promise<void> = Promise.resolve()
-  private reattachQueue: { child: string; stripe: number; linkOpen: boolean }[] = []
+  private reattachQueue: { child: string; stripe: number; linkOpen: boolean; at: number }[] = []
+  /** `${peer}:${stripe}` -> when that peer's parent there last changed. */
+  private parentChangedAt = new Map<string, number>()
   private reattachTimer: (() => void) | null = null
   private topoWatchers = new Set<string>()
   private stopped = false
@@ -278,6 +281,7 @@ export class ChannelPublisher {
     if (!sub) return
     this.deactivate(sub)
     this.subscribers.delete(id)
+    for (let s = 0; s < this.stripes; s++) this.parentChangedAt.delete(`${id}:${s}`)
     this.keyGate.forget(id)
     this.complaints.forget(id)
     this.topoWatchers.delete(id)
@@ -338,7 +342,7 @@ export class ChannelPublisher {
   // --- failure handling --------------------------------------------------------------------------
 
   private queueReattach(child: string, stripe: number, linkOpen: boolean): void {
-    this.reattachQueue.push({ child, stripe, linkOpen })
+    this.reattachQueue.push({ child, stripe, linkOpen, at: performance.now() })
     if (this.reattachTimer === null) {
       this.reattachTimer = after(REATTACH_BATCH_MS, () => this.processReattaches())
     }
@@ -353,9 +357,11 @@ export class ChannelPublisher {
     let changed = false
     /** linkOpen complaints about relays, judged once the whole batch is known. */
     const accused: { child: string; parent: string; stripe: number; now: number }[] = []
-    for (const { child, stripe, linkOpen } of batch) {
+    for (const { child, stripe, linkOpen, at } of batch) {
       const sub = this.subscribers.get(child)
       if (!sub?.active) continue
+      // Sent before the child heard of its new parent: it is about the old one, and handled.
+      if (at - (this.parentChangedAt.get(`${child}:${stripe}`) ?? -Infinity) < PARENT_GRACE_MS) continue
       const parent = this.topology.parents[child]?.[stripe]
       // The parent is itself starved by an upstream failure that is already being handled:
       // keep this child where it is (the parent's feed will resume).
@@ -574,6 +580,7 @@ export class ChannelPublisher {
 
   private apply(c: ParentChange): void {
     const key = `${c.peer}:${c.stripe}`
+    this.parentChangedAt.set(key, performance.now())
     if (c.to !== null) this.addEdge(c.to, c.peer, c.stripe)
     this.send(c.peer, { t: 'set-parent', ch: this.id, stripe: c.stripe, parent: c.to })
 

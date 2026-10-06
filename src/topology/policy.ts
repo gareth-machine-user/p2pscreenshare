@@ -30,6 +30,13 @@ export function defaultPlannerConfig(
  */
 export const REATTACH_BATCH_MS = 400
 
+/**
+ * A subscriber gives a new parent this long (from its set-parent) before asking to reattach. So a
+ * reattach request the publisher gets sooner than this after changing that parent is about the
+ * previous one: the child has been moved already.
+ */
+export const PARENT_GRACE_MS = 3000
+
 /** A parent whose children's pieces arrive this much later than its own (ms)... */
 export const LATE_PARENT_MS = 150
 /** ...for this long (ms)... */
