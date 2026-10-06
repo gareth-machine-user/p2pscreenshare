@@ -79,7 +79,8 @@ function simulate(policy: Policy, ceiling: (t: number) => number, seconds: numbe
       const dropsPerS = win.drops / 2
       const queueMs = win.qSum / win.n
       const congested = dropsPerS > 2 || queueMs > 800
-      const full = !!uplinkIsFull([{ congested }], sentKbps, c, 0.5, 0.7)
+      // The ceiling is the path bottleneck (the uplink itself): its queue shows as path RTT inflation.
+      const full = !!uplinkIsFull([{ congested, drops: dropsPerS, pathQueued: queueMs > 40 }])
       const d = policy.sample({ now: t * 1000, full, sentKbps, currentKbps: v, maxKbps: QUALITY, dropsPerS, queueMs, ownWireKbpsAt: ownWire })
       if (d) {
         const next = applyRate(d.kbps, QUALITY)

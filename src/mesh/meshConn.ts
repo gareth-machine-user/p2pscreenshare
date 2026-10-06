@@ -4,6 +4,7 @@
 // so joining or switching parents never needs new ICE or DTLS setup.
 import { wallClock } from '../net/clock'
 import { LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from '../net/link'
+import { parseLinkStats, type StatsLike } from '../net/linkStats'
 import { tuning } from '../tuning'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
@@ -41,6 +42,8 @@ export interface PeerConn extends MediaLink {
   statsRttMs(): Promise<number | null>
   /** Whether the selected candidate pair goes through a TURN relay (null: unknown). */
   usesRelay(): Promise<boolean | null>
+  /** The connection's getStats() report (absent in tests' fakes; null when closed). */
+  stats?(): Promise<StatsLike | null>
   /** The `bin` channel as a probe link (see uploadProbe.ts). */
   readonly probeLink: ProbeLink
   close(): void
@@ -62,33 +65,22 @@ export async function gatherComplete(pc: RTCPeerConnection): Promise<string> {
   return pc.localDescription!.sdp
 }
 
+/** A connection's getStats() report, or null when stats are unavailable (closed). */
+export async function connStats(pc: RTCPeerConnection): Promise<StatsLike | null> {
+  try {
+    return (await pc.getStats()) as unknown as StatsLike
+  } catch {
+    return null
+  }
+}
+
 /**
  * Whether a connection's selected candidate pair is relayed through TURN (either end a `relay`
  * candidate). Null when stats don't say (closed, not yet selected).
  */
 export async function selectedPairRelayed(pc: RTCPeerConnection): Promise<boolean | null> {
-  try {
-    const stats = await pc.getStats()
-    let pairId: string | undefined
-    stats.forEach((r) => {
-      if (r.type === 'transport' && typeof r.selectedCandidatePairId === 'string') pairId = r.selectedCandidatePairId
-    })
-    let pair: { localCandidateId?: string; remoteCandidateId?: string } | undefined
-    stats.forEach((r) => {
-      if (r.type !== 'candidate-pair') return
-      // Chrome names the pair from the transport; Firefox flags it `selected`.
-      if (pairId ? r.id === pairId : r.selected === true || (r.nominated && r.state === 'succeeded')) pair ??= r
-    })
-    if (!pair) return null
-    const type = (id?: string) => (id ? (stats.get(id) as { candidateType?: string } | undefined)?.candidateType : undefined)
-    const local = type(pair.localCandidateId)
-    const remote = type(pair.remoteCandidateId)
-    if (local === undefined && remote === undefined) return null
-    return local === 'relay' || remote === 'relay'
-  } catch {
-    // stats unavailable (connection closed)
-    return null
-  }
+  const report = await connStats(pc)
+  return (report && parseLinkStats(report)?.relayed) ?? null
 }
 
 /** A reliable `bin` channel as a ProbeLink (buffer-low events drive the probe's refills). */
@@ -325,19 +317,12 @@ export class MeshConn implements MediaLink, PeerConn {
 
   /** Round-trip time of the selected candidate pair, if known. */
   async statsRttMs(): Promise<number | null> {
-    try {
-      const stats = await this.pc.getStats()
-      let rtt: number | null = null
-      stats.forEach((r) => {
-        if (r.type === 'candidate-pair' && r.nominated && typeof r.currentRoundTripTime === 'number') {
-          rtt = r.currentRoundTripTime * 1000
-        }
-      })
-      return rtt
-    } catch {
-      // stats unavailable (connection closed)
-      return null
-    }
+    const report = await connStats(this.pc)
+    return (report && parseLinkStats(report)?.currentRttMs) ?? null
+  }
+
+  stats(): Promise<StatsLike | null> {
+    return connStats(this.pc)
   }
 
   close(): void {

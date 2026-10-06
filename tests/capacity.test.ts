@@ -155,22 +155,44 @@ describe('feasibility and auto quality', () => {
 })
 
 describe('is the uplink full?', () => {
-  const c = (congested: boolean) => ({ congested })
-  it('one slow receiver among several is not a full uplink', () => {
-    expect(uplinkIsFull([c(true), c(false), c(false)], 3000, 10_000)).toBeNull()
-    expect(uplinkIsFull([c(true), c(false)], 3000, 10_000)).toBeNull() // one of two viewers
+  /** A peer: congested?, its path RTT inflated? (null: no RTT signal), drops/s. */
+  const p = (congested: boolean, pathQueued: boolean | null, drops = congested ? 3 : 0) => ({ congested, pathQueued, drops })
+
+  it('congested with inflated RTTs is full', () => {
+    expect(uplinkIsFull([p(true, true), p(true, true), p(false, false)])).toEqual({ congested: 2, active: 3, signal: 'rtt' })
+    expect(uplinkIsFull([p(true, true), p(true, true)])).toEqual({ congested: 2, active: 2, signal: 'rtt' })
   })
-  it('most links congested together is', () => {
-    expect(uplinkIsFull([c(true), c(true), c(false)], 3000, 10_000)).toEqual({ congested: 2, active: 3 })
-    expect(uplinkIsFull([c(true), c(true)], 3000, 10_000)).toEqual({ congested: 2, active: 2 })
+  it('congested with flat RTTs is the connections’ own ceiling, not a full uplink', () => {
+    expect(uplinkIsFull([p(true, false), p(true, false), p(true, false)])).toBeNull()
+    // Only one of the congested peers shows queueing: not most of them.
+    expect(uplinkIsFull([p(true, true), p(true, false), p(true, false)])).toBeNull()
   })
-  it('a single congested link counts only when it carries most of the measured upload', () => {
-    expect(uplinkIsFull([c(true)], 2000, 10_000)).toBeNull() // that receiver is slow
-    expect(uplinkIsFull([c(true)], 8000, 10_000)).toEqual({ congested: 1, active: 1 })
-    expect(uplinkIsFull([c(true)], 2000, null)).toEqual({ congested: 1, active: 1 }) // can't tell: assume full
+  it('no RTT signal: congestion alone decides (the majority rule)', () => {
+    expect(uplinkIsFull([p(true, null), p(true, null), p(false, null)])).toEqual({ congested: 2, active: 3, signal: 'fallback' })
+    expect(uplinkIsFull([p(true, null), p(false, null), p(false, null)])).toBeNull()
+    // Mixed: a congested peer without RTT counts, one with a flat RTT doesn't.
+    expect(uplinkIsFull([p(true, null), p(true, true), p(true, false)])).toEqual({ congested: 2, active: 3, signal: 'fallback' })
   })
-  it('nothing congested, or no links, is not full', () => {
-    expect(uplinkIsFull([c(false), c(false)], 9000, 10_000)).toBeNull()
-    expect(uplinkIsFull([], 0, null)).toBeNull()
+  it('heavy drops to most peers are full even with flat RTTs (fq_codel / SQM routers)', () => {
+    expect(uplinkIsFull([p(true, false, 15), p(true, false, 12), p(false, false, 0)])).toEqual({ congested: 2, active: 3, signal: 'loss' })
+    // Light drops with a flat RTT are still the connections' own ceiling.
+    expect(uplinkIsFull([p(true, false, 4), p(true, false, 4)])).toBeNull()
+    // One lossy peer of two is that receiver.
+    expect(uplinkIsFull([p(true, false, 30), p(false, false, 0)])).toBeNull()
+  })
+  it('one slow receiver among several is not a full uplink, whatever its path shows', () => {
+    expect(uplinkIsFull([p(true, true), p(false, false), p(false, false)])).toBeNull()
+    expect(uplinkIsFull([p(true, true, 40), p(false, false)])).toBeNull()
+  })
+  it('a single peer: a path bottleneck anywhere counts, its own ceiling does not', () => {
+    expect(uplinkIsFull([p(true, true)])).toEqual({ congested: 1, active: 1, signal: 'rtt' })
+    expect(uplinkIsFull([p(true, false)])).toBeNull()
+    expect(uplinkIsFull([p(true, false, 20)])).toEqual({ congested: 1, active: 1, signal: 'loss' })
+    expect(uplinkIsFull([p(true, null)])).toEqual({ congested: 1, active: 1, signal: 'fallback' })
+    expect(uplinkIsFull([p(false, true)])).toBeNull() // queueing on the path, but our link keeps up
+  })
+  it('nothing congested, or no peers, is not full', () => {
+    expect(uplinkIsFull([p(false, true), p(false, null)])).toBeNull()
+    expect(uplinkIsFull([])).toBeNull()
   })
 })

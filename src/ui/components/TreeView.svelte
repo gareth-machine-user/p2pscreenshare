@@ -6,12 +6,21 @@
     hostId,
     stripes,
     names,
-  }: { topology: Topology; hostId: string; stripes: number; names: Map<string, string> } = $props()
+    labels = new Map(),
+  }: {
+    topology: Topology
+    hostId: string
+    stripes: number
+    names: Map<string, string>
+    /** Short label drawn on each node ("P", "1", "2", …), matching the table below the trees. */
+    labels?: Map<string, string>
+  } = $props()
 
   const COLORS = ['#4fa3ff', '#ff8a4c', '#3fcf8e', '#d07bff', '#f2c94c', '#ff5d8f', '#50e3c2', '#a0a0ff']
-  const DX = 18
+  // Room for a two-digit label in each node.
+  const DX = 24
   const DY = 46
-  const R = 6
+  const R = 9
 
   interface Node {
     id: string
@@ -68,18 +77,36 @@
         {/each}
         {#each l.nodes as n}
           {@const home = n.id === hostId ? null : topology.home[n.id]}
-          <circle
-            cx={DX + n.x * DX}
-            cy={14 + n.y * DY}
-            r={n.id === hostId ? R + 3 : R}
-            fill={n.id === hostId ? '#ffffff' : home == null ? 'var(--muted)' : COLORS[home % COLORS.length]}
-            class:relay={home === s}
-          >
-            <title>{n.id === hostId ? 'host' : `${names.get(n.id) ?? n.id} (home ${home ?? '—'})`}</title>
-          </circle>
+          {@const label = labels.get(n.id) ?? (n.id === hostId ? 'P' : '')}
+          <g data-testid="tree-node" data-peer={n.id}>
+            <title>{n.id === hostId ? `publisher: ${names.get(n.id) ?? n.id}` : `${label ? `#${label} ` : ''}${names.get(n.id) ?? n.id} (home ${home ?? '—'})`}</title>
+            <circle
+              cx={DX + n.x * DX}
+              cy={14 + n.y * DY}
+              r={n.id === hostId ? R + 2 : R}
+              fill={n.id === hostId ? '#ffffff' : home == null ? 'var(--muted)' : COLORS[home % COLORS.length]}
+              class:relay={home === s}
+            />
+            {#if label}
+              <text class="node-label" data-testid="tree-label" x={DX + n.x * DX} y={14 + n.y * DY} font-size={label.length > 2 ? 7 : 9}>{label}</text>
+            {/if}
+          </g>
         {/each}
       </svg>
     </div>
   {/each}
 </div>
-<p class="hint">Node color = the stripe that peer relays in (grey = leaf everywhere). White = host.</p>
+<p class="hint">
+  Each node shows the peer's number from the table below (P = the publisher). Color = the stripe that peer relays in (grey = leaf
+  everywhere); a ring marks a relay in its own stripe.
+</p>
+
+<style>
+  .node-label {
+    fill: #0d1117;
+    font-weight: 700;
+    text-anchor: middle;
+    dominant-baseline: central;
+    pointer-events: none;
+  }
+</style>

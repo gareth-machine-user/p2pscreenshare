@@ -7,6 +7,7 @@
     audio,
     limited = null,
     clamp = null,
+    uploading = null,
     auto = false,
     quality,
     onmic,
@@ -20,6 +21,8 @@
     limited?: { feasibleKbps: number } | null
     /** Why the bitrate is below the chosen quality, if it is (overrides `limited`). */
     clamp?: string | null
+    /** Live upload figure (ui/liveRates.ts uploadBadge). */
+    uploading?: { text: string; warn: boolean; title: string } | null
     /** Auto quality will lower the bitrate by itself. */
     auto?: boolean
     quality: QualityPreset
@@ -49,6 +52,9 @@
   <select data-testid="presenter-quality" value={quality} onchange={(e) => onquality((e.currentTarget as HTMLSelectElement).value as QualityPreset)} aria-label="Quality">
     {#each Object.entries(QUALITY_PRESETS) as [value, p]}<option {value}>{p.label}</option>{/each}
   </select>
+  {#if uploading}
+    <span class="badge live-upload" class:warn={uploading.warn} data-testid="live-upload" title={uploading.title}>{uploading.text}</span>
+  {/if}
   <span class="spacer"></span>
   {#if clamp}
     <span class="badge warn clamp" data-testid="bitrate-clamp">{clamp}</span>

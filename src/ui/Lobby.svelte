@@ -19,6 +19,8 @@
   import NameDialog from './components/NameDialog.svelte'
   import FrameStats from './components/FrameStats.svelte'
   import { clampText } from './clamp'
+  import { fmtMbps, sessionPeers, uploadBadge } from './liveRates'
+  import PeerRates from './components/PeerRates.svelte'
   import Icon from './components/Icon.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
@@ -214,6 +216,7 @@
     if (!session) return null
     const mesh = session.mesh
     const owner = mesh.member(mesh.ownerId)
+    const c = session.bitrateClamp()
     return {
       name: owner?.name ? `${owner.name}'s lobby` : isOwner ? 'Your lobby' : 'Lobby',
       members: mesh.memberCount,
@@ -230,11 +233,11 @@
       revoked: session.revokedNotice,
       presenterAudio: session.publishing?.audio ?? null,
       limited: session.publishing?.full?.limited ?? null,
-      clamp: (() => {
-        const c = session.bitrateClamp()
-        return c ? clampText(c) : null
-      })(),
+      clamp: c ? clampText(c) : null,
       kicked: session.kicked,
+      uploading: session.publishing
+        ? uploadBadge({ sendKbps: session.liveRates().sendKbps, full: !!session.uplinkFull, clamp: c ? clampText(c) : null, ccReason: session.ccReason })
+        : null,
     }
   })
 
@@ -300,6 +303,8 @@
       playerStats: p,
       hasAudio: !!sub?.ann.stream?.audio,
       capacity: s.capacity.estimateKbps,
+      live: s.liveRates(),
+      peers: gearTab === 'stats' ? sessionPeers(s) : [],
       loss: sub?.loss ?? null,
       uplinkRates: s.uplinkStatsNow,
       encoderRates: s.encoderStatsNow,
@@ -419,19 +424,21 @@
                 <button class:active={gearTab === 'topology'} data-testid="tab-topology" onclick={() => (gearTab = 'topology')}>Topology</button>
               </div>
               {#if gearTab === 'peers' && session}
-                <PeersPanel mesh={session.mesh} {badges} {tick} onkick={isOwner ? (id) => void session?.kick(id) : null} />
+                <PeersPanel {session} {badges} {tick} onkick={isOwner ? (id) => void session?.kick(id) : null} />
               {:else if gearTab === 'topology'}
-                <TopologyPanel report={view.report} {nameOf} />
+                <TopologyPanel report={view.report} {nameOf} joinedAt={(id) => session?.mesh.member(id)?.joinedAt} />
               {:else if view.presenting && view.pub}
                 <div class="stats-grid" data-testid="publisher-stats">
                   <div><span>Viewers</span><b data-testid="viewer-count">{view.pub.subscribers}</b></div>
                   <div><span>Codec</span><b>{view.pub.codec ?? '—'}</b></div>
                   <div><span>Stripes</span><b>{view.pub.k} + {view.pub.m}</b></div>
-                  <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
+                  <div><span>Uploading now</span><b data-testid="live-send-total" title="Live, all connections, last 2 s">{fmtMbps(view.live.sendKbps)}</b></div>
+                  <div><span>Est. upload</span><b title="Measured upload capacity from the last probe; not current use">{fmtKbps(view.capacity)}</b></div>
                   <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
                   <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
                 </div>
                 <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.ccReason} clamp={lobby?.clamp ?? null} />
+                <PeerRates rows={view.peers} />
               {:else}
                 <div class="stats-grid" data-testid="viewer-stats">
                   <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
@@ -441,10 +448,13 @@
                   <div><span>FPS</span><b>{view.playerStats?.fps ?? '—'}</b></div>
                   <div><span>Resolution</span><b>{view.playerStats?.width ?? 0}×{view.playerStats?.height ?? 0}</b></div>
                   <div><span>Decoded / dropped</span><b>{view.playerStats?.decodedFrames ?? 0} / {view.playerStats?.droppedFrames ?? 0}</b></div>
-                  <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
+                  <div><span>Receiving now</span><b data-testid="live-recv-total" title="Live, all connections, last 2 s">{fmtMbps(view.live.recvKbps)}</b></div>
+                  <div><span>Uploading now</span><b title="Live, all connections, last 2 s (relaying and probes)">{fmtMbps(view.live.sendKbps)}</b></div>
+                  <div><span>Est. upload</span><b title="Measured upload capacity from the last probe; not current use">{fmtKbps(view.capacity)}</b></div>
                   <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
                 </div>
                 <FrameStats loss={view.loss} renderedFps={view.playerStats?.fps ?? null} uplink={view.uplinkRates} />
+                <PeerRates rows={view.peers} />
                 {#if view.stats}
                   <table class="stripes">
                     <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th><th>Late</th></tr></thead>
@@ -481,6 +491,7 @@
             audio={lobby.presenterAudio}
             limited={lobby.limited}
             clamp={lobby.clamp}
+            uploading={lobby.uploading}
             auto={session?.autoBitrate ?? false}
             quality={settings.share.quality}
             onmic={(m) => {
