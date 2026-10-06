@@ -1,5 +1,7 @@
-// Control-plane messages, exchanged as JSON between each viewer and the host.
-import type { LinkSignal } from '../net/link'
+// Control-plane messages, exchanged as JSON over mesh links (`ctl` channel) between subscribers and
+// the publisher of the channel they watch, plus the upload probe between neighbours. Tree commands
+// for a channel are only accepted from that channel's publisher.
+import type { Topology } from '../topology/model'
 
 export interface StreamInfo {
   epoch: number
@@ -11,24 +13,20 @@ export interface StreamInfo {
   audio?: { codec: string; sampleRate: number; numberOfChannels: number }
 }
 
-export interface StreamConfig {
-  k: number
-  m: number
-  bitrateKbps: number
-}
-
 export interface StripeStat {
   parent: string | null
   /** ms since the last fragment on this stripe (null if never). */
   lastRecvAgoMs: number | null
   rttMs: number | null
+  /** How much later than the earliest stripe this stripe's pieces arrive, smoothed (ms). */
+  lateMs: number
 }
 
-export interface ViewerStats {
-  /** Measured upload capacity from the probe (kbps), null until measured. */
-  probeKbps: number | null
+/** A subscriber's report to the channel's publisher, every 2 s. */
+export interface SubscriberStats {
   /** Debug upload cap, if any. */
   capKbps: number | null
+  capacityKbps: number | null
   uplinkKbps: number
   uplinkDropRate: number
   stripes: StripeStat[]
@@ -41,29 +39,47 @@ export interface ViewerStats {
   waitingForKeyframe: boolean
 }
 
-export type ViewerToHost =
-  | { t: 'hello'; name: string; capKbps: number | null }
-  | { t: 'stats'; stats: ViewerStats }
-  | { t: 'signal'; to: string; signal: LinkSignal }
-  | { t: 'stripe-ok'; stripe: number; parent: string }
-  | { t: 'link-failed'; remote: string }
-  /** linkOpen: whether the link to the current parent is up (if so, the parent is failing to forward). */
-  | { t: 'reattach'; stripe: number; linkOpen: boolean }
-  | { t: 'need-key' }
-  | { t: 'probe-start'; bytes: number }
+/** What a publisher knows about one channel's trees (Topology panel). */
+export interface TopologyReport {
+  channel: number
+  publisher: string
+  k: number
+  m: number
+  topology: Topology
+  depth: Record<string, number[]>
+  slots: Record<string, number>
+  rootSlots: number
+  overcommitted: number
+  changes: number
+  peers: { id: string; failures: number; avoid: string[]; stats: SubscriberStats | null }[]
+}
 
-export type HostToViewer =
-  /** `session` changes when the host restarts (viewers then drop their old tree state). */
-  | { t: 'welcome'; config: StreamConfig; stream: StreamInfo | null; session: string }
-  /** The host stopped (it may restart with new settings). */
-  | { t: 'bye' }
-  | { t: 'stream'; stream: StreamInfo }
-  | { t: 'set-parent'; stripe: number; parent: string | null }
-  | { t: 'add-child'; stripe: number; child: string }
-  | { t: 'remove-child'; stripe: number; child: string }
-  | { t: 'signal'; from: string; signal: LinkSignal }
-  | { t: 'probe-result'; kbps: number }
-  | { t: 'position'; home: number | null; depth: number[] }
+export type SubscriberMsg =
+  | { t: 'subscribe'; ch: number }
+  | { t: 'unsubscribe'; ch: number }
+  | { t: 'stripe-ok'; ch: number; stripe: number; parent: string }
+  /** linkOpen: whether the link to the current parent is up (if so, the parent is failing to forward). */
+  | { t: 'reattach'; ch: number; stripe: number; linkOpen: boolean }
+  | { t: 'need-key'; ch: number }
+  | { t: 'stats'; ch: number; stats: SubscriberStats }
+  /** Ask for (or stop) topology reports while the panel is open. */
+  | { t: 'topo-req'; ch: number; on: boolean }
+
+export type PublisherMsg =
+  | { t: 'set-parent'; ch: number; stripe: number; parent: string | null }
+  | { t: 'add-child'; ch: number; stripe: number; child: string }
+  | { t: 'remove-child'; ch: number; stripe: number; child: string }
+  | { t: 'position'; ch: number; home: number | null; depth: number[] }
+  /** Gzipped TopologyReport (base64url), at most every 3 s while requested. */
+  | { t: 'topo'; ch: number; z: string }
+
+export type PeerMsg =
+  | SubscriberMsg
+  | PublisherMsg
+  /** End of an upload probe (sent on the reliable channel, outside the uplink queue). */
+  | { t: 'probe-end'; id: number }
+  /** A neighbour's report of a probe it received from us: bytes, over its arrival window. */
+  | { t: 'probe-result'; bytes: number; ms: number }
 
 export function toBase64(bytes: Uint8Array): string {
   let s = ''

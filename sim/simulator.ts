@@ -1,15 +1,19 @@
 // Discrete-time simulation of the striped-tree planner under churn.
-// Run: npm run sim [-- --peers 200 --seconds 300 --lifetime 240 --repair 3500]
+// Run: npm run sim [-- --peers 200 --seconds 300 --lifetime 240 --repair 2500 --gossip 500]
 //      npm run sim -- --sweep parity     (stall vs parity across churn levels)
 //
-// Model (deliberately simple):
-// - Each peer has a true upload capacity and an access latency; the planner sees a noisy estimate.
+// Model (deliberately simple), one publisher planning one channel in a full-mesh lobby:
+// - Each peer has a true upload capacity and an access latency. It offers relay slots from a noisy
+//   estimate of its upload, re-measured every 10 s. The publisher sees those offers (and new
+//   subscribers) only through gossip, `--gossip` ms late, so it plans on slightly stale inputs.
+// - The planner breaks ties by RTT (2 × (access(a) + access(b) + 10 ms)).
 // - One-way hop latency = access(a) + access(b) + 10ms; serialization = piece bits / per-child rate.
 // - A frame is decodable once any k of k+m stripes arrive -> latency = k-th fastest stripe path.
 // - When a peer leaves, its descendants lose that stripe for REPAIR_MS (detect + replan + link setup).
 //   A viewer stalls while it is missing more than m stripes.
 // - Overloaded parents (children * stripe rate > true capacity) degrade their subtree.
 
+import { HEADROOM } from '../src/session/capacity'
 import type { PlannerConfig, PlannerPeer, Topology } from '../src/topology/model'
 import { emptyTopology } from '../src/topology/model'
 import { plan } from '../src/topology/planner'
@@ -20,9 +24,12 @@ for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].replac
 const PEERS = Number(args.get('peers') ?? 200)
 const SECONDS = Number(args.get('seconds') ?? 300)
 const MEAN_LIFETIME_S = Number(args.get('lifetime') ?? 240)
-// Time from a parent vanishing to its subtree receiving again: 2s silence detection + 0.4s batching
-// + liveness ping + link setup + keyframe replay. ~3.5s matches what the e2e failover tests measure.
-const REPAIR_MS = Number(args.get('repair') ?? 3500)
+// Time from a parent vanishing to its subtree receiving again: 2 s silence detection + 0.4 s
+// batching + replan + keyframe replay. Reattaching reuses an existing mesh link (no ICE/DTLS setup),
+// so this is about 1 s less than with on-demand tree links.
+const REPAIR_MS = Number(args.get('repair') ?? 2500)
+const GOSSIP_DELAY_MS = Number(args.get('gossip') ?? 500)
+const REESTIMATE_MS = 10_000
 const BITRATE_KBPS = 2500
 const FPS = 30
 const HOST_UPLOAD_KBPS = Number(args.get('host') ?? 10000)
@@ -85,20 +92,33 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
   seed = Number(args.get('seed') ?? 42)
   const S = k + m
   const stripeKbps = (BITRATE_KBPS / k) * 1.03
+  const access = new Map<string, number>([[HOST, 10]])
   const cfg: PlannerConfig = {
     hostId: HOST,
     k,
     m,
-    stripeKbps,
-    hostUploadKbps: HOST_UPLOAD_KBPS,
-    headroom: 0.8,
+    rootSlots: Math.floor((HOST_UPLOAD_KBPS * HEADROOM) / stripeKbps),
     maxFanout: MAX_FANOUT,
-    minUptimeMsForRelay: 5000,
+    minUptimeMsForRelay: 4000,
     switchGain: 1,
+    rttSwitchMs: 40,
+    rtt: (a, b) => 2 * ((access.get(a) ?? 10) + (access.get(b) ?? 10) + 10),
   }
-  const access = new Map<string, number>([[HOST, 10]])
   const trueCap = new Map<string, number>([[HOST, HOST_UPLOAD_KBPS]])
-  const estimate = new Map<string, number>()
+  /** Offered slots over time per peer: [time it was gossiped, slots], newest last. */
+  const offerHistory = new Map<string, [number, number][]>()
+  const offerFor = (id: string, now: number): number => {
+    let slots = 0
+    for (const [at, n] of offerHistory.get(id) ?? []) if (at + GOSSIP_DELAY_MS <= now) slots = n
+    return slots
+  }
+  const reestimate = (id: string, at: number) => {
+    const est = trueCap.get(id)! * (0.8 + rnd() * 0.3)
+    const h = offerHistory.get(id) ?? []
+    h.push([at, Math.floor((est * HEADROOM) / stripeKbps)])
+    if (h.length > 4) h.shift()
+    offerHistory.set(id, h)
+  }
 
   let nextId = 0
   const live = new Map<string, SimPeer>()
@@ -107,7 +127,7 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
     live.set(p.id, p)
     access.set(p.id, p.accessMs)
     trueCap.set(p.id, p.trueKbps)
-    estimate.set(p.id, p.trueKbps * (0.8 + rnd() * 0.3))
+    reestimate(p.id, now + 1500) // the probe takes ~1.5 s
   }
   for (let i = 0; i < PEERS; i++) add(-60_000 * rnd()) // staggered existing audience
 
@@ -125,13 +145,10 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
   let viewerTicks = 0
 
   const replan = (now: number) => {
-    const peers: PlannerPeer[] = [...live.values()].map((p) => ({
-      id: p.id,
-      capacityKbps: now - p.joinedAt > 1500 ? estimate.get(p.id)! : null, // probe takes ~1.5s
-      joinedAt: p.joinedAt,
-      failures: 0,
-      avoid: [],
-    }))
+    // Departures are seen at once (the publisher's own mesh links); joins and offers through gossip.
+    const peers: PlannerPeer[] = [...live.values()]
+      .filter((p) => now - p.joinedAt >= GOSSIP_DELAY_MS)
+      .map((p) => ({ id: p.id, slots: offerFor(p.id, now), joinedAt: p.joinedAt, failures: 0, avoid: [] }))
     const r = plan(peers, topo, cfg, now)
     changes += r.changes.length
     topo = r.topology
@@ -169,11 +186,13 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
       }
       live.delete(p.id)
       outage.delete(p.id)
+      offerHistory.delete(p.id)
       stalled.delete(p.id)
       departed = true
     }
     // Arrivals keep the audience roughly stable.
     while (live.size < PEERS) add(now)
+    if (now % REESTIMATE_MS === 0) for (const p of live.values()) if (now - p.joinedAt > 1500) reestimate(p.id, now)
     if (departed || now - lastPlan >= REPLAN_EVERY_MS) replan(now)
 
     // Load per parent per stripe.
@@ -184,7 +203,7 @@ function run(k: number, m: number, lifetimeS = MEAN_LIFETIME_S, repairMs = REPAI
 
     const sampleLatency = now % 1000 === 0
     for (const p of live.values()) {
-      if (now - p.joinedAt < 3000) continue // still joining
+      if (now - p.joinedAt < 3000 + GOSSIP_DELAY_MS) continue // still joining
       viewerTicks++
       const o = outage.get(p.id)
       const missing = o ? o.filter((t) => t > now).length : 0
@@ -264,7 +283,7 @@ if (args.get('sweep') === 'parity') {
     [8, 2],
     [8, 4],
   ]
-  console.log(`peers=${PEERS} seconds=${SECONDS} repair=${REPAIR_MS}ms bitrate=${BITRATE_KBPS}kbps hostUpload=${HOST_UPLOAD_KBPS}kbps`)
+  console.log(`peers=${PEERS} seconds=${SECONDS} repair=${REPAIR_MS}ms gossip=${GOSSIP_DELAY_MS}ms bitrate=${BITRATE_KBPS}kbps hostUpload=${HOST_UPLOAD_KBPS}kbps`)
   console.log('stall % of viewing time (stalls per viewer-hour) by mean viewer lifetime\n')
   console.log(`k  m | overhead | ${lifetimes.map((l) => `life ${l}s`.padStart(16)).join(' | ')} | degraded % (240s)`)
   console.log(`-----+----------+-${lifetimes.map(() => '-'.repeat(16)).join('-+-')}-+------------------`)
@@ -290,7 +309,7 @@ if (args.get('sweep') === 'parity') {
     [8, 2],
   ]
   console.log(
-    `peers=${PEERS} seconds=${SECONDS} meanLifetime=${MEAN_LIFETIME_S}s repair=${REPAIR_MS}ms fanout=${MAX_FANOUT} bitrate=${BITRATE_KBPS}kbps hostUpload=${HOST_UPLOAD_KBPS}kbps\n`,
+    `peers=${PEERS} seconds=${SECONDS} meanLifetime=${MEAN_LIFETIME_S}s repair=${REPAIR_MS}ms gossip=${GOSSIP_DELAY_MS}ms fanout=${MAX_FANOUT} bitrate=${BITRATE_KBPS}kbps hostUpload=${HOST_UPLOAD_KBPS}kbps\n`,
   )
   console.log('k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent changes/min')
   console.log('-----+--------+--------+-----------+---------+-----------+------------+-------------------')

@@ -7,6 +7,8 @@ const MAX_AGE_MS_BY_LAYER = [900, 350, 180, 180]
 interface Item {
   data: Uint8Array
   layer: number
+  /** GOP-cache replay for a newly attached child: queued behind live fragments. */
+  replay: boolean
   enqueuedAt: number
   maxAge: number
 }
@@ -29,6 +31,8 @@ export class Uplink {
   private lastRefill = performance.now()
   private timer: ReturnType<typeof setTimeout> | null = null
   private draining = false
+  /** Where the next drain pass starts (round-robin across drains). */
+  private cursor = 0
   stats: UplinkStats = { sentBytes: 0, droppedItems: 0, sentItems: 0, queuedBytes: 0 }
 
   constructor(public capKbps: number | null = null) {}
@@ -38,21 +42,42 @@ export class Uplink {
     return this.capKbps === null ? Infinity : (this.capKbps * 1000) / 8 / 1000
   }
 
-  send(link: MediaLink, data: Uint8Array, layer: number, maxAgeMs?: number): void {
+  /** Links whose traffic only uses spare upload (e.g. probes): served when no media is waiting. */
+  private background = new Set<MediaLink>()
+
+  setBackground(link: MediaLink, on = true): void {
+    if (on) this.background.add(link)
+    else this.background.delete(link)
+  }
+
+  /**
+   * Queues one message for a link. Replayed (GOP cache) fragments wait behind live ones: a new
+   * child's live frames then arrive on time and its jitter buffer isn't inflated by the backlog.
+   */
+  send(link: MediaLink, data: Uint8Array, layer: number, maxAgeMs?: number, replay = false): void {
     let q = this.queues.get(link)
     if (!q) {
       q = []
       this.queues.set(link, q)
     }
-    q.push({ data, layer, enqueuedAt: performance.now(), maxAge: maxAgeMs ?? MAX_AGE_MS_BY_LAYER[layer] ?? 900 })
+    const item = { data, layer, replay, enqueuedAt: performance.now(), maxAge: maxAgeMs ?? MAX_AGE_MS_BY_LAYER[layer] ?? 900 }
+    const firstReplay = replay ? -1 : q.findIndex((it) => it.replay)
+    if (firstReplay >= 0) q.splice(firstReplay, 0, item)
+    else q.push(item)
     this.stats.queuedBytes += data.byteLength
     this.drain()
+  }
+
+  /** Items waiting for one link. */
+  queued(link: MediaLink): number {
+    return this.queues.get(link)?.length ?? 0
   }
 
   forget(link: MediaLink): void {
     const q = this.queues.get(link)
     if (q) for (const it of q) this.stats.queuedBytes -= it.data.byteLength
     this.queues.delete(link)
+    this.background.delete(link)
   }
 
   /** Called when a link's send buffer drains. */
@@ -75,21 +100,32 @@ export class Uplink {
       this.refill(now)
       let progress = true
       let waitingOnTokens = false
-      // Round-robin one item per link per pass so children share the uplink fairly.
+      // Round-robin one item per link per pass so children share the uplink fairly. Each drain
+      // resumes after the last link served: when tokens are scarce, a fixed starting point would
+      // let the first links take everything.
       while (progress) {
         progress = false
-        for (const [link, q] of this.queues) {
+        // Background links only get a turn when no media link has anything it could send.
+        const mediaWaiting = [...this.queues].some(
+          ([l, q]) => q.length > 0 && !this.background.has(l) && l.isOpen && l.bufferedAmount <= LINK_BUFFER_HIGH,
+        )
+        const links = [...this.queues.keys()].filter((l) => !mediaWaiting || !this.background.has(l))
+        const n = links.length
+        for (let i = 0; i < n; i++) {
+          const idx = (this.cursor + i) % n
+          const link = links[idx]
+          const q = this.queues.get(link)!
           if (!link.isOpen) {
             if (link.state === 'closed' || link.state === 'failed') this.forget(link)
             continue
           }
-          while (q.length && now - q[0].enqueuedAt > q[0].maxAge) this.drop(q.shift()!)
+          for (let j = q.length - 1; j >= 0; j--) if (now - q[j].enqueuedAt > q[j].maxAge) this.drop(q.splice(j, 1)[0])
           if (!q.length || link.bufferedAmount > LINK_BUFFER_HIGH) continue
           const it = q[0]
           // Tokens may go negative (debt), so messages larger than the burst still get through.
           if (this.capKbps !== null && this.tokens <= 0) {
             waitingOnTokens = true
-            continue
+            break
           }
           q.shift()
           this.stats.queuedBytes -= it.data.byteLength
@@ -100,8 +136,10 @@ export class Uplink {
           } else {
             this.stats.droppedItems++
           }
+          this.cursor = idx + 1
           progress = true
         }
+        if (waitingOnTokens) break
       }
       if (waitingOnTokens && this.timer === null) {
         this.timer = setTimeout(() => {

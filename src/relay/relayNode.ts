@@ -6,6 +6,11 @@ const SEEN_RETAIN_MS = 5000
 const MAX_CACHE_BYTES = 6 * 1024 * 1024
 /** Replayed GOP fragments may wait longer in the queue than live ones. */
 const REPLAY_MAX_AGE_MS = 2500
+/**
+ * Keyframe fragments may wait longer than other base-layer fragments: a late keyframe still unlocks
+ * every frame after it, while dropping one leaves an overloaded child unable to decode at all.
+ */
+const KEY_MAX_AGE_MS = 2000
 
 interface StripeCache {
   gopId: number
@@ -14,87 +19,101 @@ interface StripeCache {
   bytes: number
 }
 
-const fragId = (h: FragmentHeader) => `${h.audio ? 'a' : 'v'}${h.stripe}:${h.epoch}:${h.frameSeq}:${h.pieceIdx}:${h.fragIdx}`
+/** A (channel, stripe) pair: one tree. */
+export const treeKey = (channel: number, stripe: number) => `${channel >>> 0}:${stripe}`
+
+const fragId = (h: FragmentHeader) =>
+  `${h.channel >>> 0}:${h.audio ? 'a' : 'v'}${h.stripe}:${h.epoch}:${h.frameSeq}:${h.pieceIdx}:${h.fragIdx}`
 
 /**
- * Forwards fragments verbatim to children (cut-through, per stripe), de-duplicates (e.g. while two
- * parents overlap during make-before-break), and keeps a per-stripe cache of the current GOP so a
- * newly attached child can start decoding immediately. Received fragments are only forwarded or
- * played once their host signature verifies.
+ * Forwards fragments verbatim to children (cut-through, per channel and stripe), de-duplicates
+ * (e.g. while two parents overlap during make-before-break), and keeps a cache of the current GOP
+ * per (channel, stripe) so a newly attached child can start decoding immediately. Received
+ * fragments are only forwarded or played once the channel publisher's signature verifies.
  */
 export class RelayNode {
-  private children = new Map<number, Set<string>>()
+  private children = new Map<string, Set<string>>()
   private seen = new Map<string, number>()
   private lastSeenPrune = 0
-  private caches = new Map<number, StripeCache>()
-  /** Local time of the last fragment received per stripe. */
-  readonly lastRecv = new Map<number, number>()
-  /** Who delivered the last fragment per stripe. */
-  readonly lastFrom = new Map<number, string>()
+  private caches = new Map<string, StripeCache>()
+  /** Local time of the last fragment received per tree. */
+  readonly lastRecv = new Map<string, number>()
+  /** Who delivered the last fragment per tree. */
+  readonly lastFrom = new Map<string, string>()
 
   /** Called for every new (non-duplicate) fragment, for local playback. */
   onFragment: (frag: Fragment, from: string) => void = () => {}
-  /** Checks a received fragment's host signature. Unset: nothing received is accepted. */
-  verifier: ((raw: Uint8Array) => Promise<boolean>) | null = null
-  /** Received fragments dropped for a bad signature or for being stale. */
+  /**
+   * Checks a received fragment against its channel publisher's signature (and that the publisher
+   * may publish). Unset: nothing received is accepted.
+   */
+  verifier: ((raw: Uint8Array, channel: number) => Promise<boolean>) | null = null
+  /** Received fragments dropped for a bad signature, an unknown channel, or being stale. */
   rejected = 0
-  /** Newest capture time among verified fragments. */
-  private newestCapture = 0
+  /** Newest capture time among verified fragments, per channel. */
+  private newestCapture = new Map<number, number>()
 
   constructor(
     private uplink: Uplink,
     private linkFor: (peerId: string) => MediaLink | undefined,
   ) {}
 
-  childrenOf(stripe: number): string[] {
-    return [...(this.children.get(stripe) ?? [])]
+  childrenOf(channel: number, stripe: number): string[] {
+    return [...(this.children.get(treeKey(channel, stripe)) ?? [])]
   }
 
-  allChildren(): Set<string> {
+  /** Every child in every tree (or in one channel's trees). */
+  allChildren(channel?: number): Set<string> {
     const out = new Set<string>()
-    for (const set of this.children.values()) for (const c of set) out.add(c)
+    const prefix = channel === undefined ? null : `${channel >>> 0}:`
+    for (const [key, set] of this.children) if (prefix === null || key.startsWith(prefix)) for (const c of set) out.add(c)
     return out
   }
 
-  addChild(stripe: number, child: string): void {
-    let set = this.children.get(stripe)
+  addChild(channel: number, stripe: number, child: string): void {
+    const key = treeKey(channel, stripe)
+    let set = this.children.get(key)
     if (!set) {
       set = new Set()
-      this.children.set(stripe, set)
+      this.children.set(key, set)
     }
     if (set.has(child)) return
     set.add(child)
-    this.replayTo(stripe, child)
+    this.replayTo(key, child)
   }
 
-  removeChild(stripe: number, child: string): void {
-    this.children.get(stripe)?.delete(child)
-  }
-
-  /** Drops every child (e.g. when the tree is rebuilt from scratch). */
-  clear(): void {
-    this.children.clear()
+  removeChild(channel: number, stripe: number, child: string): void {
+    this.children.get(treeKey(channel, stripe))?.delete(child)
   }
 
   removePeer(peer: string): void {
     for (const set of this.children.values()) set.delete(peer)
   }
 
+  /** Forgets everything about a channel (it ended, or this peer unsubscribed or was revoked). */
+  dropChannel(channel: number): void {
+    const prefix = `${channel >>> 0}:`
+    for (const map of [this.children, this.caches, this.lastRecv, this.lastFrom] as Map<string, unknown>[]) {
+      for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key)
+    }
+    this.newestCapture.delete(channel >>> 0)
+  }
+
   /** Replays the cached GOP once the link to `child` is open. */
-  private replayTo(stripe: number, child: string, attempt = 0): void {
+  private replayTo(key: string, child: string, attempt = 0): void {
     const link = this.linkFor(child)
     if (!link || !link.isOpen) {
-      if (attempt < 60 && this.children.get(stripe)?.has(child)) {
-        setTimeout(() => this.replayTo(stripe, child, attempt + 1), 200)
+      if (attempt < 60 && this.children.get(key)?.has(child)) {
+        setTimeout(() => this.replayTo(key, child, attempt + 1), 200)
       }
       return
     }
-    const cache = this.caches.get(stripe)
+    const cache = this.caches.get(key)
     if (!cache) return
-    for (const raw of cache.frags) this.uplink.send(link, withReplayFlag(raw), 0, REPLAY_MAX_AGE_MS)
+    for (const raw of cache.frags) this.uplink.send(link, withReplayFlag(raw), 0, REPLAY_MAX_AGE_MS, true)
   }
 
-  /** Fragment produced locally (host). */
+  /** Fragment produced locally (publisher). */
   inject(raw: Uint8Array): void {
     const frag = decodeFragment(raw)
     if (frag) this.handle(frag, 'self')
@@ -107,13 +126,15 @@ export class RelayNode {
     // Skip verifying duplicates. Only verified fragments are marked seen, so a forgery can't
     // shadow the genuine fragment with the same id.
     if (!frag || !verifier || this.seen.has(fragId(frag.header))) return
-    void verifier(raw).then((ok) => {
+    const ch = frag.header.channel >>> 0
+    void verifier(raw, ch).then((ok) => {
       // Signed fragments older than the de-dup window can't be told apart from a replay.
-      if (!ok || frag.header.captureTime < this.newestCapture - SEEN_RETAIN_MS) {
+      const newest = this.newestCapture.get(ch) ?? 0
+      if (!ok || frag.header.captureTime < newest - SEEN_RETAIN_MS) {
         this.rejected++
         return
       }
-      this.newestCapture = Math.max(this.newestCapture, frag.header.captureTime)
+      this.newestCapture.set(ch, Math.max(newest, frag.header.captureTime))
       this.handle(frag, from)
     })
   }
@@ -129,31 +150,32 @@ export class RelayNode {
       for (const [k, t] of this.seen) if (now - t > SEEN_RETAIN_MS) this.seen.delete(k)
     }
 
-    this.lastRecv.set(h.stripe, now)
-    this.lastFrom.set(h.stripe, from)
+    const key = treeKey(h.channel, h.stripe)
+    this.lastRecv.set(key, now)
+    this.lastFrom.set(key, from)
 
-    // Forward the original bytes (replay flag stripped by sending `raw` only for live fragments).
-    const kids = this.children.get(h.stripe)
+    const kids = this.children.get(key)
     if (kids?.size) {
       const layer = peekLayer(frag.raw)
+      const maxAge = h.key ? KEY_MAX_AGE_MS : undefined
       for (const child of kids) {
         if (child === from) continue
         const link = this.linkFor(child)
-        if (link) this.uplink.send(link, frag.raw, layer)
+        if (link) this.uplink.send(link, frag.raw, layer, maxAge)
       }
     }
 
-    if (!h.audio) this.cache(h.stripe, h.epoch, h.gopId, frag.raw)
+    if (!h.audio) this.cache(key, h.epoch, h.gopId, frag.raw)
     this.onFragment(frag, from)
   }
 
-  private cache(stripe: number, epoch: number, gopId: number, raw: Uint8Array): void {
-    let c = this.caches.get(stripe)
+  private cache(key: string, epoch: number, gopId: number, raw: Uint8Array): void {
+    let c = this.caches.get(key)
     const startsGop = peekIsKey(raw)
     if (!c || (startsGop && (gopId !== c.gopId || epoch !== c.epoch))) {
       if (!startsGop && !c) return // wait for a keyframe to start caching
       c = { gopId, epoch, frags: [], bytes: 0 }
-      this.caches.set(stripe, c)
+      this.caches.set(key, c)
     }
     if (gopId !== c.gopId || epoch !== c.epoch) return // stale fragment from an older GOP
     if (c.bytes + raw.byteLength > MAX_CACHE_BYTES) return

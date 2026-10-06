@@ -1,19 +1,16 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte'
-  import { Mesh } from '../mesh/mesh'
-  import { loadIdentity, ownerIdentity, ownerIdFromCode, type PeerIdentity } from '../mesh/identity'
+  import { loadIdentity, ownerIdentity, ownerIdFromCode } from '../mesh/identity'
   import { DEFAULT_ICE } from '../net/bootstrap'
-  import { meshControl } from '../session/control'
-  import { HostSession, type HostOptions } from '../session/hostSession'
-  import { ViewerSession } from '../session/viewerSession'
-  import type { HostToViewer, ViewerToHost } from '../proto/messages'
+  import { PeerSession } from '../session/peerSession'
+  import type { ShareOptions } from '../session/publisher'
   import { fmtKbps, fmtMs, iceFrom, lobbyUrl, numParam, randomId, trackersFrom } from './route'
   import { ownerSeed, QUALITY_PRESETS, saveSettings, settings } from './settings.svelte'
   import Stage from './components/Stage.svelte'
   import ShareDialog from './components/ShareDialog.svelte'
-  import TreeView from './components/TreeView.svelte'
   import ChatPanel from './components/ChatPanel.svelte'
   import PeersPanel from './components/PeersPanel.svelte'
+  import TopologyPanel from './components/TopologyPanel.svelte'
   import Icon from './components/Icon.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
@@ -25,6 +22,8 @@
   const name = params.get('name') ?? (settings.name || `guest-${randomId(4)}`)
   const link = lobbyUrl(joinCode, params)
   const iceServers = iceFrom(params) ?? DEFAULT_ICE
+  /** Test/debug overrides from the URL (`share=1&source=test&k=…`); not persisted. */
+  const urlOverrides = params.get('share') === '1'
 
   let tick = $state(0)
   let pending = false
@@ -38,33 +37,59 @@
   }
   const refresh = setInterval(() => tick++, 500)
 
-  let mesh = $state<Mesh | null>(null)
+  let session = $state<PeerSession | null>(null)
   let invalid = $state(false)
-  let identity: PeerIdentity | null = null
   let ownerId: string | null = null
   let destroyed = false
 
-  // --- owner: today's host session on the mesh, restarted whenever sharing starts, stops or changes
+  async function init(): Promise<void> {
+    ownerId = await ownerIdFromCode(joinCode)
+    if (!ownerId) {
+      invalid = true
+      return
+    }
+    const identity = seed ? await ownerIdentity(seed) : await loadIdentity(joinCode)
+    if (destroyed) return
+    const capParam = params.get('up')
+    const s = new PeerSession({
+      joinCode,
+      identity,
+      ownerId,
+      name,
+      trackers: trackersFrom(params),
+      iceServers,
+      capKbps: capParam ? Number(capParam) : null,
+      block: params.get('block')?.split(',').filter(Boolean),
+    })
+    s.onChange = onChange
+    window.__p2p = s
+    window.__mesh = s.mesh
+    session = s
+    await s.start()
+    if (destroyed) return void s.leave()
+    if (urlOverrides && s.canShare) void startSharing()
+  }
+  void init()
 
-  let host = $state<HostSession | null>(null)
-  let sharing = $state(false)
+  onDestroy(() => {
+    destroyed = true
+    clearInterval(refresh)
+    void session?.leave()
+  })
+
+  // --- sharing -----------------------------------------------------------------------------------
+
   let shareError = $state<string | null>(null)
   let dialogOpen = $state(false)
-  /** Test/debug overrides from the URL (`share=1&source=test&k=…`); not persisted. */
-  const urlOverrides = params.get('share') === '1'
 
-  function hostOptions(m: Mesh): HostOptions {
+  function shareOptions(): ShareOptions {
     const sh = settings.share
     const preset = QUALITY_PRESETS[sh.quality]
     const test = sh.source === 'test' || (urlOverrides && params.get('source') === 'test')
     return {
-      ctl: meshControl<ViewerToHost, HostToViewer>(m),
-      signingKey: identity!.privateKey,
-      iceServers,
       k: Math.max(1, urlOverrides ? numParam(params, 'k', sh.k) : sh.k),
       m: Math.max(0, urlOverrides ? numParam(params, 'm', sh.m) : sh.m),
       bitrateKbps: urlOverrides ? numParam(params, 'bitrate', preset.kbps) : preset.kbps,
-      hostUploadKbps: numParam(params, 'up', 10000),
       source: test ? 'test' : 'screen',
       surface: sh.source === 'window' ? 'window' : sh.source === 'tab' ? 'browser' : 'monitor',
       maxSize: [preset.maxWidth, preset.maxHeight],
@@ -73,75 +98,22 @@
     }
   }
 
-  async function restartHost(capture: boolean): Promise<void> {
-    const old = host
-    host = null
-    sharing = false
-    await old?.stop()
-    if (!mesh || destroyed) return
-    const s = new HostSession(hostOptions(mesh))
-    s.onChange = onChange
-    window.__p2p = s
-    host = s
-    if (!capture) return
+  /** Starts (or restarts, with the current settings) this peer's stream. */
+  async function startSharing(): Promise<void> {
+    if (!session) return
     shareError = null
     try {
-      await s.start()
-      sharing = true
+      await session.share(shareOptions())
     } catch (e) {
       shareError = e instanceof Error ? e.message : String(e)
-      await restartHost(false)
     }
+    onChange()
   }
 
-  // --- member: today's viewer session on the mesh -------------------------------------------------
-
-  let viewer = $state<ViewerSession | null>(null)
-
-  async function init(): Promise<void> {
-    ownerId = await ownerIdFromCode(joinCode)
-    if (!ownerId) {
-      invalid = true
-      return
-    }
-    identity = seed ? await ownerIdentity(seed) : await loadIdentity(joinCode)
-    if (destroyed) return
-    const m = new Mesh({
-      joinCode,
-      identity,
-      ownerId,
-      name,
-      trackers: trackersFrom(params),
-      iceServers,
-      block: params.get('block')?.split(',').filter(Boolean),
-    })
-    m.onChange = onChange
-    window.__mesh = m
-    mesh = m
-    await m.start()
-    if (destroyed) return void m.leave()
-    if (isOwner) {
-      await restartHost(urlOverrides)
-    } else {
-      const capParam = params.get('up')
-      const v = new ViewerSession(
-        { streamId: joinCode, name, ctl: meshControl(m), ownerId, iceServers, capKbps: capParam ? Number(capParam) : null },
-        null,
-      )
-      v.onChange = onChange
-      window.__p2p = v
-      viewer = v
-    }
+  function stopSharing() {
+    session?.stopSharing()
+    onChange()
   }
-  void init()
-
-  onDestroy(() => {
-    destroyed = true
-    clearInterval(refresh)
-    void host?.stop()
-    void viewer?.leave()
-    void mesh?.leave()
-  })
 
   // --- view state --------------------------------------------------------------------------------
 
@@ -160,16 +132,21 @@
     setTimeout(() => (copied = false), 1500)
   }
 
+  function nameOf(id: string): string {
+    return session?.mesh.member(id)?.name || id.slice(0, 6)
+  }
+
   function badges(id: string): string[] {
     const out: string[] = []
     if (id === ownerId) out.push('owner')
-    if (id === ownerId && ((host && sharing) || viewer?.stream)) out.push('presenting')
+    if (session?.liveStreams().some((s) => s.publisher === id)) out.push('presenting')
     return out
   }
 
   const lobby = $derived.by(() => {
     void tick
-    if (!mesh) return null
+    if (!session) return null
+    const mesh = session.mesh
     const owner = mesh.member(mesh.ownerId)
     return {
       name: owner?.name ? `${owner.name}'s lobby` : isOwner ? 'Your lobby' : 'Lobby',
@@ -178,63 +155,67 @@
       joined: mesh.joined,
       trackers: mesh.trackersConnected,
       chat: mesh.chat,
+      canShare: session.canShare,
+      sharing: !!session.publishing,
     }
   })
 
   const view = $derived.by(() => {
     void tick
-    if (host) {
-      const peers = [...host.peers.values()].map((p) => ({
-        p,
-        name: mesh?.member(p.id)?.name || p.id.slice(0, 6),
-        home: host!.topology.home[p.id] ?? null,
-        depth: host!.lastPlan?.depth[p.id] ?? [],
-        slots: host!.lastPlan?.slots[p.id] ?? 0,
-        cap: host!.capacityOf(p),
-      }))
-      peers.sort((a, b) => a.p.joinedAt - b.p.joinedAt)
-      const lat = peers.map((x) => x.p.stats?.latencyMs).filter((x): x is number => x != null).sort((a, b) => a - b)
-      return {
-        kind: 'host' as const,
-        peers,
-        codec: host.codec,
-        p50: lat.length ? lat[Math.floor(lat.length / 2)] : null,
-        maxDepth: Math.max(0, ...peers.flatMap((x) => x.depth)),
-        overcommitted: host.lastPlan?.overcommitted ?? 0,
-        hostChildren: host.relay.allChildren().size,
-        changes: host.totalChanges,
-        topology: host.topology,
-      }
+    const s = session
+    if (!s) return null
+    const presenting = !!s.publishing && s.selected === s.selfId
+    const sub = s.stageSub
+    const p = sub?.player.stats ?? null
+    const stage = s.liveStreams().find((x) => x.publisher === s.selected) ?? null
+    const message = !lobby?.joined
+      ? `Looking for the lobby… (${lobby?.trackers ?? 0} trackers connected)`
+      : presenting
+        ? null
+        : !stage
+          ? shareError
+            ? `Couldn't start sharing: ${shareError}`
+            : s.canShare
+              ? 'Click Share screen to present to the lobby.'
+              : lobby?.ownerAway
+                ? 'The owner is away. Nobody is sharing.'
+                : 'Nobody is sharing yet.'
+          : !p || p.decodedFrames === 0
+            ? `Connecting to ${nameOf(stage.publisher)}'s stream…`
+            : null
+    const pub = s.publishing?.full ?? null
+    return {
+      presenting,
+      localStream: presenting ? (s.publishing?.localStream ?? null) : null,
+      message,
+      sub,
+      player: p,
+      stats: sub?.lastStats ?? null,
+      hasAudio: !!sub?.ann.stream?.audio,
+      capacity: s.capacity.estimateKbps,
+      channel: presenting ? (pub?.id ?? null) : (sub?.channel ?? null),
+      pub: pub
+        ? {
+            codec: s.codec,
+            subscribers: [...pub.subscribers.values()].filter((x) => x.active).length,
+            children: s.relay.allChildren(pub.id).size,
+            rootSlots: s.rootSlots(pub.id),
+            overcommitted: pub.lastPlan?.overcommitted ?? 0,
+            k: pub.k,
+            m: pub.m,
+          }
+        : null,
+      report: presenting && pub ? pub.report() : sub ? (s.topologyReports.get(sub.channel) ?? null) : null,
     }
-    if (viewer) {
-      const st = viewer.state
-      const p = viewer.player.stats
-      const message = !lobby?.joined
-        ? `Looking for the lobby… (${lobby?.trackers ?? 0} trackers connected)`
-        : st === 'invalid-link'
-          ? 'This link is incomplete. Ask for the full lobby link.'
-          : !viewer.stream
-            ? lobby?.ownerAway
-              ? 'The owner is away. Nobody is sharing.'
-              : 'Nobody is sharing yet.'
-            : p.decodedFrames === 0
-              ? 'Connected. Waiting for the first keyframe…'
-              : null
-      return {
-        kind: 'viewer' as const,
-        state: st,
-        message,
-        player: p,
-        stats: viewer.stats,
-        rtts: viewer.lastStats?.stripes.map((s) => s.rttMs) ?? [],
-        home: viewer.home,
-        depth: viewer.depth,
-        hostId: viewer.hostId,
-        hasAudio: !!viewer.stream?.audio,
-        probeKbps: viewer.probeKbps,
-      }
-    }
-    return null
+  })
+
+  // Topology reports are fetched from the publisher only while the panel is open.
+  $effect(() => {
+    const s = session
+    const ch = view?.channel ?? null
+    if (!s || ch === null || gearTab !== 'topology' || view?.presenting) return
+    untrack(() => s.watchTopology(ch, true))
+    return () => s.watchTopology(ch, false)
   })
 </script>
 
@@ -247,11 +228,11 @@
     <code class="lobby-link" data-testid="lobby-link">{link}</code>
     <span class="spacer"></span>
     {#if lobby}<span class="members" data-testid="member-count" title="Members"><Icon name="users" /> {lobby.members}</span>{/if}
-    {#if isOwner}
-      {#if sharing}
-        <button data-testid="stop-share" onclick={() => restartHost(false)}><Icon name="stop" />Stop sharing</button>
+    {#if lobby?.canShare}
+      {#if lobby.sharing}
+        <button data-testid="stop-share" onclick={stopSharing}><Icon name="stop" />Stop sharing</button>
       {:else}
-        <button class="primary" data-testid="share-screen" disabled={!host} onclick={() => (dialogOpen = true)}><Icon name="screen" />Share screen</button>
+        <button class="primary" data-testid="share-screen" onclick={() => (dialogOpen = true)}><Icon name="screen" />Share screen</button>
       {/if}
     {/if}
   </header>
@@ -260,111 +241,77 @@
     <div class="stage-col">
       {#if invalid}
         <Stage message="This link is incomplete. Ask for the full lobby link." />
-      {:else if view?.kind === 'host'}
+      {:else if view}
         <Stage
-          localStream={sharing ? (host?.localStream ?? null) : null}
-          message={sharing ? null : shareError ? `Couldn't start sharing: ${shareError}` : 'Click Share screen to present to the lobby.'}
+          player={view.presenting ? null : (view.sub?.player ?? null)}
+          localStream={view.localStream}
+          message={view.message}
+          hasAudio={view.hasAudio}
+          bind:muted
         >
           {#snippet panel()}
             <div class="tabs">
               <button class:active={gearTab === 'stats'} onclick={() => (gearTab = 'stats')}>Stats</button>
               <button class:active={gearTab === 'peers'} data-testid="tab-peers" onclick={() => (gearTab = 'peers')}>Peers</button>
-              <button class:active={gearTab === 'topology'} onclick={() => (gearTab = 'topology')}>Topology</button>
+              <button class:active={gearTab === 'topology'} data-testid="tab-topology" onclick={() => (gearTab = 'topology')}>Topology</button>
             </div>
-            {#if gearTab === 'stats'}
-              <div class="stats-grid">
-                <div><span>Viewers</span><b data-testid="viewer-count">{view.peers.length}</b></div>
-                <div><span>Codec</span><b>{view.codec ?? '—'}</b></div>
-                <div><span>Stripes</span><b>{host?.config.k} + {host?.config.m}</b></div>
-                <div><span>Your children</span><b>{view.hostChildren}</b></div>
-                <div><span>Max depth</span><b>{view.maxDepth}</b></div>
-                <div><span>Latency p50</span><b>{fmtMs(view.p50)}</b></div>
-                <div><span>Overcommitted</span><b>{view.overcommitted}</b></div>
-                <div><span>Parent changes</span><b>{view.changes}</b></div>
+            {#if gearTab === 'peers' && session}
+              <PeersPanel mesh={session.mesh} {badges} {tick} />
+            {:else if gearTab === 'topology'}
+              <TopologyPanel report={view.report} {nameOf} />
+            {:else if view.presenting && view.pub}
+              <div class="stats-grid" data-testid="publisher-stats">
+                <div><span>Viewers</span><b data-testid="viewer-count">{view.pub.subscribers}</b></div>
+                <div><span>Codec</span><b>{view.pub.codec ?? '—'}</b></div>
+                <div><span>Stripes</span><b>{view.pub.k} + {view.pub.m}</b></div>
+                <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
+                <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
+                <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
               </div>
-              <div class="table-wrap">
-                <table>
-                  <thead>
-                    <tr><th>Peer</th><th>Capacity</th><th>Home</th><th>Slots</th><th>Children</th><th>Depth</th><th>Latency</th><th>FPS</th></tr>
-                  </thead>
+            {:else}
+              <div class="stats-grid" data-testid="viewer-stats">
+                <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
+                <div><span>Glass-to-glass</span><b data-testid="latency">{fmtMs(view.player?.latencyMs)}</b></div>
+                <div><span>Jitter buffer</span><b>{fmtMs(view.player?.bufferMs)}</b></div>
+                <div><span>FPS</span><b>{view.player?.fps ?? '—'}</b></div>
+                <div><span>Resolution</span><b>{view.player?.width ?? 0}×{view.player?.height ?? 0}</b></div>
+                <div><span>Decoded / dropped</span><b>{view.player?.decodedFrames ?? 0} / {view.player?.droppedFrames ?? 0}</b></div>
+                <div><span>Your upload</span><b>{fmtKbps(view.capacity)}</b></div>
+                <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
+                <div><span>Uplink</span><b>{fmtKbps(view.stats?.uplinkKbps)}</b></div>
+              </div>
+              {#if view.stats}
+                <table class="stripes">
+                  <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th><th>Late</th></tr></thead>
                   <tbody>
-                    {#each view.peers as x (x.p.id)}
-                      <tr>
-                        <td title={x.p.id}>{x.name}</td>
-                        <td>{fmtKbps(x.cap)}</td>
-                        <td>{x.home ?? '—'}</td>
-                        <td>{x.slots}</td>
-                        <td>{x.p.stats?.children ?? 0}</td>
-                        <td>{x.depth.join(' ')}</td>
-                        <td>{fmtMs(x.p.stats?.latencyMs)}</td>
-                        <td>{x.p.stats?.fps ?? '—'}</td>
+                    {#each view.stats.stripes as st, i}
+                      <tr class:stale={st.lastRecvAgoMs === null || st.lastRecvAgoMs > 1000}>
+                        <td>{i}</td>
+                        <td>{st.parent === view.sub?.publisher ? 'publisher' : st.parent ? nameOf(st.parent) : '—'}</td>
+                        <td>{view.sub?.depth[i] ?? '—'}</td>
+                        <td>{st.lastRecvAgoMs === null ? 'never' : fmtMs(st.lastRecvAgoMs) + ' ago'}</td>
+                        <td>{fmtMs(st.rttMs)}</td>
+                        <td>{fmtMs(st.lateMs)}</td>
                       </tr>
                     {/each}
                   </tbody>
                 </table>
-              </div>
-            {:else if gearTab === 'peers' && mesh}
-              <PeersPanel {mesh} {badges} {tick} />
-            {:else}
-              <TreeView
-                topology={view.topology}
-                hostId={host?.selfId ?? ''}
-                stripes={host?.stripes ?? 1}
-                names={new Map(view.peers.map((x) => [x.p.id, x.name]))}
-              />
-            {/if}
-          {/snippet}
-        </Stage>
-      {:else if view?.kind === 'viewer'}
-        <Stage player={viewer?.player ?? null} message={view.message} hasAudio={view.hasAudio} bind:muted>
-          {#snippet panel()}
-            <div class="tabs">
-              <button class:active={gearTab === 'stats'} onclick={() => (gearTab = 'stats')}>Stats</button>
-              <button class:active={gearTab === 'peers'} data-testid="tab-peers" onclick={() => (gearTab = 'peers')}>Peers</button>
-            </div>
-            {#if gearTab === 'peers' && mesh}
-              <PeersPanel {mesh} {badges} {tick} />
-            {:else}
-              <div class="stats-grid" data-testid="viewer-stats">
-                <div><span>State</span><b data-testid="state">{view.state}</b></div>
-                <div><span>Glass-to-glass</span><b data-testid="latency">{fmtMs(view.player.latencyMs)}</b></div>
-                <div><span>Jitter buffer</span><b>{fmtMs(view.player.bufferMs)}</b></div>
-                <div><span>FPS</span><b>{view.player.fps}</b></div>
-                <div><span>Resolution</span><b>{view.player.width}×{view.player.height}</b></div>
-                <div><span>Decoded / dropped</span><b>{view.player.decodedFrames} / {view.player.droppedFrames}</b></div>
-                <div><span>Upload probe</span><b>{fmtKbps(view.probeKbps)}</b></div>
-                <div><span>Relaying</span><b>{view.home === null ? 'no (leaf)' : `stripe ${view.home} → ${view.stats.children} children`}</b></div>
-                <div><span>Uplink</span><b>{fmtKbps(view.stats.uplinkKbps)}</b></div>
-              </div>
-              <table class="stripes">
-                <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th></tr></thead>
-                <tbody>
-                  {#each view.stats.stripes as st, s}
-                    <tr class:stale={st.lastRecvAgoMs === null || st.lastRecvAgoMs > 1000}>
-                      <td>{s}</td>
-                      <td>{st.parent === view.hostId ? 'publisher' : (st.parent?.slice(0, 6) ?? '—')}</td>
-                      <td>{view.depth[s] ?? '—'}</td>
-                      <td>{st.lastRecvAgoMs === null ? 'never' : fmtMs(st.lastRecvAgoMs) + ' ago'}</td>
-                      <td>{fmtMs(view.rtts[s])}</td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
+              {/if}
             {/if}
           {/snippet}
         </Stage>
       {:else}
-        <Stage message={lobby && !lobby.joined ? `Looking for the lobby… (${lobby.trackers} trackers connected)` : 'Starting…'} />
+        <Stage message="Starting…" />
       {/if}
     </div>
 
-    {#if mesh}
+    {#if session}
       <ChatPanel
         messages={lobby?.chat ?? []}
-        selfId={mesh.selfId}
+        selfId={session.selfId}
         {badges}
         bind:open={settings.view.chatOpen}
-        onsend={(text) => mesh?.sendChat(text) ?? false}
+        onsend={(text) => session?.mesh.sendChat(text) ?? false}
       />
     {/if}
   </div>
@@ -374,10 +321,10 @@
   <ShareDialog
     onstart={() => {
       dialogOpen = false
-      void restartHost(true)
+      void startSharing()
     }}
     oncancel={() => (dialogOpen = false)}
   />
 {/if}
 
-<svelte:window onpagehide={() => void mesh?.leave()} />
+<svelte:window onpagehide={() => void session?.leave()} />

@@ -213,6 +213,24 @@ export class Mesh {
     return 'none'
   }
 
+  private openLinkIds(): string[] {
+    return [...this.conns.values()].filter((c) => c.state === 'open').map((c) => c.remoteId)
+  }
+
+  /**
+   * Whether two peers have an open mesh link, as far as gossip tells (unknown counts as linked,
+   * since the mesh is full unless a pair failed).
+   */
+  linked(a: string, b: string): boolean {
+    if (a === this.selfId) return !!this.linkFor(b)
+    if (b === this.selfId) return !!this.linkFor(a)
+    const la = this.member(a)?.links
+    const lb = this.member(b)?.links
+    if (la && !la.includes(b)) return false
+    if (lb && !lb.includes(a)) return false
+    return true
+  }
+
   /** The open link to a peer, if any. */
   linkFor(id: string): MeshConn | undefined {
     const c = this.conns.get(id)
@@ -291,6 +309,7 @@ export class Mesh {
       const now = Date.now()
       this.self.version = Math.max(this.self.version + 1, now)
       this.self.heartbeat = now
+      this.self.links = this.openLinkIds()
       this.selfEnv = await seal(this.opts.identity, this.self)
       for (const c of this.conns.values()) if (c.isOpen) c.sendCtl({ t: 'rec', env: this.selfEnv })
     })
@@ -331,7 +350,8 @@ export class Mesh {
     this.joined = true
     this.retry.delete(id)
     this.detector.heard(id, performance.now())
-    if (this.self.unreachable.includes(id)) this.updateRecord({ unreachable: this.self.unreachable.filter((x) => x !== id) })
+    if (this.self.unreachable.includes(id)) this.self.unreachable = this.self.unreachable.filter((x) => x !== id)
+    this.updateRecord({ links: this.openLinkIds() })
     if (this.selfEnv) conn.sendCtl({ t: 'rec', env: this.selfEnv })
     if (viaTracker) {
       // Door link: hand over everything we know, so the joiner can mesh in.
@@ -352,6 +372,7 @@ export class Mesh {
     this.conns.delete(id)
     this.pendingOffers.delete(id)
     if (conn.wasOpen) {
+      this.updateRecord({ links: this.openLinkIds() })
       this.onLinkClose(id)
       if (this.store.has(id)) this.retry.set(id, { attempts: 0, at: performance.now() + RELINK_MS })
     } else if (this.store.has(id)) {
@@ -478,16 +499,21 @@ export class Mesh {
     }
     const relays = [...this.conns.values()]
       .filter((c) => c.isOpen && c.remoteId !== to && !this.unreachablePair(c.remoteId, to))
-      .sort((a, b) => this.relayRank(a.remoteId) - this.relayRank(b.remoteId))
+      .sort((a, b) => this.relayRank(a.remoteId, to) - this.relayRank(b.remoteId, to))
       .slice(0, 2)
     for (const r of relays) r.sendCtl({ t: 'sig', to, env })
   }
 
-  /** Doors know everyone; otherwise prefer older members, which are more likely linked to all. */
-  private relayRank(id: string): number {
-    if (id === this.ownerId) return -2
-    const rec = this.store.get(id)?.rec
-    return rec ? rec.joinedAt - Date.now() : 0
+  /**
+   * How good a neighbour is as a relay towards `to` (lower is better): first those gossip says are
+   * linked to it, then the owner (a door, linked to everyone it admitted), then older members.
+   */
+  private relayRank(id: string, to: string): number {
+    const target = this.store.get(to)?.rec
+    const relay = this.store.get(id)?.rec
+    if (target?.links?.includes(id) || relay?.links?.includes(to)) return 0
+    if (id === this.ownerId) return 1
+    return 2 + (relay ? 1 - 1 / (1 + Math.max(0, Date.now() - relay.joinedAt)) : 1)
   }
 
   private async onSig(env: Envelope, to: string, from: string): Promise<void> {

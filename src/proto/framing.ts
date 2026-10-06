@@ -3,11 +3,12 @@
 // A frame is erasure-coded into k data + m parity pieces; stripe i carries piece i of every frame.
 // Pieces larger than MAX_FRAGMENT_PAYLOAD are split into fragments.
 //
-// Every fragment ends with the host's Ed25519 signature (see signedRegion), so relays can drop
-// anything the host didn't produce before forwarding it.
+// A channel is one encoding of one publisher's stream; its id is part of every fragment. Every
+// fragment ends with the publisher's Ed25519 signature (see signedRegion), which covers the
+// channel id, so relays can drop anything the channel's publisher didn't produce before forwarding.
 
-export const WIRE_VERSION = 2
-export const HEADER_SIZE = 36
+export const WIRE_VERSION = 3
+export const HEADER_SIZE = 40
 export const SIG_SIZE = 64
 // Keep messages comfortably under the 16KiB cross-browser SCTP message limit.
 export const MAX_FRAGMENT_PAYLOAD = 16 * 1024 - HEADER_SIZE - SIG_SIZE
@@ -20,6 +21,8 @@ const LAYER_SHIFT = 3
 const LAYER_MASK = 0b11 << LAYER_SHIFT
 
 export interface FragmentHeader {
+  /** Random u32 drawn when the channel starts. */
+  channel: number
   key: boolean
   audio: boolean
   /** Set by relays when re-sending from their GOP cache (excluded from latency stats). */
@@ -71,6 +74,7 @@ export function encodeFragment(h: FragmentHeader, payload: Uint8Array): Uint8Arr
   v.setUint32(28, h.frameLen, true)
   v.setUint16(32, h.fragIdx, true)
   v.setUint16(34, h.fragCount, true)
+  v.setUint32(36, h.channel >>> 0, true)
   buf.set(payload, HEADER_SIZE)
   return buf // signature left zeroed: see signedRegion
 }
@@ -81,6 +85,7 @@ export function decodeFragment(raw: Uint8Array): Fragment | null {
   if (v.getUint8(0) !== WIRE_VERSION) return null
   const flags = v.getUint8(1)
   const header: FragmentHeader = {
+    channel: v.getUint32(36, true),
     key: (flags & FLAG_KEY) !== 0,
     audio: (flags & FLAG_AUDIO) !== 0,
     replay: (flags & FLAG_REPLAY) !== 0,
@@ -113,7 +118,7 @@ export function withReplayFlag(raw: Uint8Array): Uint8Array {
 }
 
 /**
- * The bytes the host signs: header and payload, with the two bytes relays may legitimately vary
+ * The bytes the publisher signs: header and payload, with the two bytes relays may legitimately vary
  * zeroed — the replay flag (set when serving from a GOP cache) and the stripe (audio frames go out
  * identically on every stripe, so one signature covers every copy).
  */
@@ -131,6 +136,9 @@ export function signatureOf(raw: Uint8Array): Uint8Array {
 /** Fast header peeks for the relay hot path (no full decode). */
 export function peekStripe(raw: Uint8Array): number {
   return raw[27]
+}
+export function peekChannel(raw: Uint8Array): number {
+  return raw.byteLength < HEADER_SIZE ? -1 : new DataView(raw.buffer, raw.byteOffset + 36, 4).getUint32(0, true)
 }
 export function peekLayer(raw: Uint8Array): number {
   return (raw[1] & LAYER_MASK) >> LAYER_SHIFT

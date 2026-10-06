@@ -26,7 +26,7 @@ function frame(over: Partial<EncodedFrame> = {}): EncodedFrame {
 }
 
 async function signed(f = frame(), key = host.signingKey): Promise<Uint8Array[][]> {
-  const stripes = packetize(f, 2, 1)
+  const stripes = packetize(f, 2, 1, 77)
   await signFrame(key, stripes, f.audio)
   return stripes
 }
@@ -48,9 +48,10 @@ describe('fragment signatures', () => {
 
   it('rejects unsigned, impostor-signed, and tampered fragments', async () => {
     const raw = (await signed())[0][0]
-    expect(await verifyFragment(hostKey, packetize(frame(), 2, 1)[0][0])).toBe(false)
+    expect(await verifyFragment(hostKey, packetize(frame(), 2, 1, 77)[0][0])).toBe(false)
     expect(await verifyFragment(hostKey, (await signed(frame(), impostor.signingKey))[0][0])).toBe(false)
-    for (const offset of [4, 16, 26, 40, raw.length - 70, raw.length - 1]) {
+    // 37: the channel id is signed too.
+    for (const offset of [4, 16, 26, 37, 44, raw.length - 70, raw.length - 1]) {
       const bad = raw.slice()
       bad[offset] ^= 1
       expect(await verifyFragment(hostKey, bad), `byte ${offset}`).toBe(false)

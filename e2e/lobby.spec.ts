@@ -77,4 +77,9 @@ test('player overlay: starts muted, mute toggles, fullscreen targets the stage, 
   await viewer.getByTestId('gear').click()
   await expect(viewer.getByTestId('gear-panel')).toBeVisible()
   await expect(viewer.getByTestId('state')).toHaveText('connected')
+
+  // The Topology tab fetches a (gzipped) report from the channel's publisher while it is open.
+  await viewer.getByTestId('tab-topology').click()
+  await expect(viewer.getByTestId('topology-panel')).toBeVisible({ timeout: 10_000 })
+  await expect(viewer.getByTestId('topology-panel')).toContainText('Subscribers1')
 })

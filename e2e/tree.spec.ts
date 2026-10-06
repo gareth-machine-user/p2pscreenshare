@@ -3,7 +3,9 @@ import { hostSnapshot, median, openHost, openViewer, viewerSnapshot, waitFor, ty
 
 // Heterogeneous audience: a few strong uplinks, several weak ones. Upload caps are enforced by
 // each viewer's token-bucket shaper, so the probe and relaying behave like constrained peers.
-const CAPS = [12000, 12000, 6000, 800, 800, 800, 600, 600]
+// One relay per stripe: 9 Mbps is the least that serves all 8 peers on a ~0.8 Mbps stripe at 75%
+// headroom, so the plan is feasible without overloading the publisher.
+const CAPS = [12000, 12000, 9000, 800, 800, 800, 600, 600]
 
 async function all(pages: Page[]): Promise<ViewerSnapshot[]> {
   return Promise.all(pages.map(viewerSnapshot))
@@ -12,8 +14,10 @@ async function all(pages: Page[]): Promise<ViewerSnapshot[]> {
 test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async ({ browser }) => {
   test.setTimeout(240_000)
   const streamId = `e2e-tree-${Date.now()}`
-  // Host can afford ~1 child per stripe: everyone else must be served by relays.
-  const host = await openHost(browser, streamId, { k: 2, m: 1, bitrate: 1200, up: 2600 })
+  // The publisher plans ~1 child per stripe (3 root slots), so everyone else must be served by
+  // relays. `up` shapes its real uplink too, so leave room for the one child it overcommits when
+  // the stripe with the weakest relay runs short.
+  const host = await openHost(browser, streamId, { k: 2, m: 1, bitrate: 1200, up: 3400 })
   const viewers: Page[] = []
   for (const [i, cap] of CAPS.entries()) viewers.push(await openViewer(browser, streamId, `v${i}`, cap))
 
@@ -34,7 +38,7 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
   for (const s of snaps) {
     expect(s.state).toBe('connected')
     expect(s.fps).toBeGreaterThan(15)
-    expect(s.parents.every((p) => p !== null)).toBe(true)
+    expect(s.parents.filter((p) => p !== null).length).toBeGreaterThanOrEqual(2) // any k of k+m
   }
   const lat = snaps.map((s) => s.latencyMs!).filter((x) => x !== null)
   expect(median(lat)).toBeLessThan(1500)
@@ -66,10 +70,11 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
     expect(minFps[i]).toBeGreaterThan(10)
   })
 
-  // The tree heals: every stripe gets a live parent again.
+  // The tree heals: nobody is left on the departed relay, and everyone has at least k live parents
+  // (a stripe whose only relay left may stay unserved rather than overload the publisher).
   await waitFor(
     () => all(rest),
-    (ss) => ss.every((s) => s.parents.every((p) => p !== null && p !== snaps[victimIdx].id)),
+    (ss) => ss.every((s) => !s.parents.includes(snaps[victimIdx].id) && s.parents.filter((p) => p !== null).length >= 2),
     20_000,
     'reattach',
   )

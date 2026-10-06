@@ -1,26 +1,30 @@
 export interface PlannerConfig {
+  /** The tree root: the channel's publisher. */
   hostId: string
   /** Data stripes. */
   k: number
   /** Parity stripes. */
   m: number
-  /** Bitrate of one stripe (≈ stream bitrate / k, plus framing overhead). */
-  stripeKbps: number
-  hostUploadKbps: number
-  /** Fraction of measured upload capacity the planner is willing to use. */
-  headroom: number
+  /** The publisher's child slots for this channel (its budget / stripe bitrate); at least one per stripe. */
+  rootSlots: number
   /** Upper bound on children per peer, regardless of capacity. */
   maxFanout: number
-  /** Peers must be connected this long before they are trusted as relays. */
+  /** Peers must have subscribed this long before they are trusted as relays. */
   minUptimeMsForRelay: number
-  /** Keep the current parent unless a parent this many levels shallower is available. */
+  /** Keep the current parent unless a parent this many levels shallower is available... */
   switchGain: number
+  /** ...or one at most as deep that is this much closer (RTT plus lateness penalty, ms). */
+  rttSwitchMs?: number
+  /** Round-trip time between two peers (ms), when known. Ties between equally deep parents go to the closest. */
+  rtt?: (a: string, b: string) => number | null
+  /** How late a parent's deliveries arrive on a stripe (ms), added to its RTT as a penalty. */
+  lateness?: (parent: string, stripe: number) => number
 }
 
 export interface PlannerPeer {
   id: string
-  /** Measured usable upload, null until measured. */
-  capacityKbps: number | null
+  /** Child slots this peer offers for this channel (from its gossip record). */
+  slots: number
   joinedAt: number
   /** Recent failures while acting as a parent (lowers rank). */
   failures: number

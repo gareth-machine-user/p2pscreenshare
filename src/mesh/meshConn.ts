@@ -148,6 +148,34 @@ export class MeshConn implements MediaLink {
     }
   }
 
+  /** The probe channel as a MediaLink, so probe traffic can share the uplink queue fairly. */
+  get probeLink(): MediaLink {
+    const bin = this.bin
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const conn = this
+    return (this._probeLink ??= {
+      get isOpen() {
+        return bin.readyState === 'open'
+      },
+      get state() {
+        return conn.state
+      },
+      get bufferedAmount() {
+        return bin.bufferedAmount
+      },
+      send(data: Uint8Array) {
+        if (bin.readyState !== 'open') return false
+        try {
+          bin.send(data as Uint8Array<ArrayBuffer>)
+          return true
+        } catch {
+          return false
+        }
+      },
+    })
+  }
+  private _probeLink: MediaLink | null = null
+
   /** Sends on the probe channel, waiting while its buffer is full. */
   async sendBin(data: Uint8Array): Promise<void> {
     if (this.bin.readyState !== 'open') throw new Error('not connected')

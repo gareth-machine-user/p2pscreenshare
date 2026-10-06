@@ -73,26 +73,8 @@ export interface ViewerSnapshot {
 }
 
 export function viewerSnapshot(page: Page): Promise<ViewerSnapshot> {
-  return page.evaluate(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const s = window.__p2p as any
-    const p = s.player.stats
-    return {
-      id: s.selfId,
-      state: s.state,
-      decoded: p.decodedFrames,
-      dropped: p.droppedFrames,
-      fps: p.fps,
-      latencyMs: p.latencyMs,
-      bufferMs: p.bufferMs,
-      home: s.home,
-      parents: [...s.parents],
-      children: s.relay.allChildren().size,
-      childIds: [...s.relay.allChildren()],
-      probeKbps: s.probeKbps,
-      waitingForKeyframe: p.waitingForKeyframe,
-    }
-  })
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return page.evaluate(() => (window.__p2p as any).debugViewer())
 }
 
 export interface HostSnapshot {
@@ -107,22 +89,8 @@ export interface HostSnapshot {
 }
 
 export function hostSnapshot(page: Page): Promise<HostSnapshot> {
-  return page.evaluate(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const s = window.__p2p as any
-    return {
-      id: s.selfId,
-      peers: s.peers.size,
-      hostChildren: s.relay.allChildren().size,
-      overcommitted: s.lastPlan?.overcommitted ?? 0,
-      changes: s.totalChanges,
-      health: Object.fromEntries(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        [...s.peers.values()].map((p: any) => [p.id, { failures: p.failures, avoid: [...p.avoid.keys()] }]),
-      ),
-      topology: JSON.parse(JSON.stringify(s.topology)),
-    }
-  })
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return page.evaluate(() => (window.__p2p as any).debugPublisher())
 }
 
 export async function waitFor<T>(fn: () => Promise<T>, ok: (v: T) => boolean, timeoutMs: number, label: string): Promise<T> {

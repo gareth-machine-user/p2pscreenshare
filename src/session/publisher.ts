@@ -1,0 +1,640 @@
+// The publisher side of a peer: capture and encoding (PublishedStream), and for each channel the
+// tree planner and its commands (ChannelPublisher). Each publisher plans its own channels' trees,
+// so the planner fails together with the tree's source: no leader election, no handover.
+import { AudioPipeline } from '../media/audio'
+import { captureScreen, testPattern } from '../media/capture'
+import { VideoPipeline } from '../media/encoder'
+import { packetize, type EncodedFrame } from '../media/packetizer'
+import type { Mesh } from '../mesh/mesh'
+import type { ChannelAnnouncement } from '../mesh/records'
+import { gzip } from '../mesh/envelope'
+import { toBase64Url } from '../net/lobby'
+import { signFrame } from '../proto/signing'
+import type { PublisherMsg, StreamInfo, SubscriberMsg, SubscriberStats, TopologyReport } from '../proto/messages'
+import type { RelayNode } from '../relay/relayNode'
+import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
+import { plan } from '../topology/planner'
+import { MAX_FANOUT, stripeKbpsFor } from './capacity'
+
+export interface ShareOptions {
+  k: number
+  m: number
+  bitrateKbps: number
+  source: 'screen' | 'test'
+  /** Picker hint for screen capture. */
+  surface?: 'monitor' | 'window' | 'browser'
+  maxSize?: [number, number]
+  /** Capture system/tab audio (or the test tone). */
+  audio: boolean
+  /** Test pattern size, e.g. [1280, 720]. */
+  testSize?: [number, number]
+}
+
+/** What a publisher needs from the session it belongs to. */
+export interface PublisherContext {
+  readonly selfId: string
+  readonly mesh: Mesh
+  readonly relay: RelayNode
+  readonly signingKey: CryptoKey
+  /** Root child slots for one of this peer's channels (from its budget split). */
+  rootSlots(channel: number): number
+  /** A channel's announcement changed (codec config, deficit): re-gossip the record. */
+  announce(): void
+  onChange(): void
+}
+
+const REPLAN_INTERVAL_MS = 2000
+const REMOVAL_TIMEOUT_MS = 4000
+const LINK_FAILED_AVOID_MS = 60_000
+const SILENT_PARENT_AVOID_MS = 15_000
+/**
+ * After a relay fails, its whole subtree goes silent on that stripe. Descendants' reattach requests
+ * within this window blame the upstream failure, not their (healthy) parent.
+ */
+export const UPSTREAM_DISRUPTION_MS = 6000
+/**
+ * When a relay dies its whole subtree notices at about the same time. Reattach requests are
+ * collected for this long and handled shallowest-first, so only the topmost complaint blames a
+ * parent and the rest are recognized as collateral.
+ */
+export const REATTACH_BATCH_MS = 400
+/** A parent that children report as silent must answer a ping within this time. */
+const LIVENESS_TIMEOUT_MS = 1200
+/** A peer that failed a liveness ping stays out of the plan this long (or until it answers again). */
+const SUSPECT_HOLD_MS = 3000
+const TOPOLOGY_REPORT_MS = 3000
+
+export interface ChannelSubscriber {
+  id: string
+  /** When it subscribed (newcomers stay leaves for a few seconds). */
+  joinedAt: number
+  stats: SubscriberStats | null
+  /** Recent failures while acting as a parent (lowers rank), decaying. */
+  failures: number
+  /** Peers this subscriber should not be linked to on this channel, with expiry time. */
+  avoid: Map<string, number>
+  /** In the current plan (subscribed, linked and answering). */
+  active: boolean
+  /** Out of the plan until then, after failing a liveness ping. */
+  suspectUntil: number
+}
+
+export class ChannelPublisher {
+  readonly startedAt = Date.now()
+  readonly subscribers = new Map<string, ChannelSubscriber>()
+  topology: Topology = emptyTopology()
+  lastPlan: PlanResult | null = null
+  totalChanges = 0
+  stream: StreamInfo | null = null
+
+  private pendingRemovals = new Map<string, { oldParent: string; timer: ReturnType<typeof setTimeout> }>()
+  private replanTimer: ReturnType<typeof setTimeout> | null = null
+  private timers: ReturnType<typeof setInterval>[] = []
+  private lastKeyRequest = 0
+  private lastPositions = new Map<string, string>()
+  /** `${peer}:${stripe}` -> until when that peer's feed is known to be broken upstream. */
+  private disruptedUntil = new Map<string, number>()
+  /** Frames are signed in order, so fragments leave in capture order. */
+  private signing: Promise<void> = Promise.resolve()
+  private reattachQueue: { child: string; stripe: number; linkOpen: boolean }[] = []
+  private reattachTimer: ReturnType<typeof setTimeout> | null = null
+  private topoWatchers = new Set<string>()
+  private stopped = false
+  /** Bytes emitted per stripe since the last measurement, and the smoothed result (kbps). */
+  private stripeBytes: number[] = []
+  private measuredStripeKbps = 0
+  private announcedStripeKbps = 0
+  private lastMeasureAt = performance.now()
+
+  constructor(
+    readonly id: number,
+    readonly kind: 'full' | 'preview',
+    readonly k: number,
+    readonly m: number,
+    readonly kbps: number,
+    readonly withAudio: boolean,
+    private ctx: PublisherContext,
+    private requestKeyframe: () => void,
+  ) {
+    this.timers.push(setInterval(() => this.replan(), REPLAN_INTERVAL_MS))
+    this.timers.push(setInterval(() => this.checkLiveness(), 250))
+    this.timers.push(setInterval(() => void this.sendTopology(), TOPOLOGY_REPORT_MS))
+    this.timers.push(setInterval(() => this.measureStripes(), 2000))
+  }
+
+  /**
+   * Encoders overshoot their target (keyframes, variable bitrate), so the stripe bitrate that
+   * relays plan their slots with is the larger of the nominal one and what is actually sent.
+   */
+  private measureStripes(): void {
+    const now = performance.now()
+    const dt = now - this.lastMeasureAt
+    this.lastMeasureAt = now
+    if (dt <= 0) return
+    const peak = (Math.max(0, ...this.stripeBytes) * 8) / dt
+    this.stripeBytes = []
+    this.measuredStripeKbps = this.measuredStripeKbps === 0 ? peak : this.measuredStripeKbps * 0.7 + peak * 0.3
+    const kbps = this.stripeKbps
+    if (Math.abs(kbps - this.announcedStripeKbps) > this.announcedStripeKbps * 0.1) {
+      this.announcedStripeKbps = kbps
+      this.ctx.announce()
+    }
+  }
+
+  get stripes(): number {
+    return this.k + this.m
+  }
+
+  get stripeKbps(): number {
+    return Math.max(stripeKbpsFor(this.kbps, this.k, this.withAudio), Math.round(this.measuredStripeKbps))
+  }
+
+  announcement(): ChannelAnnouncement {
+    return {
+      id: this.id,
+      kind: this.kind,
+      k: this.k,
+      m: this.m,
+      kbps: this.kbps,
+      stripeKbps: this.stripeKbps,
+      stream: this.stream,
+      deficit: this.lastPlan?.overcommitted ?? 0,
+      startedAt: this.startedAt,
+    }
+  }
+
+  setStream(info: StreamInfo): void {
+    this.stream = info
+    this.ctx.announce()
+  }
+
+  emit(frame: EncodedFrame): void {
+    if (this.stopped) return
+    const stripes = packetize(frame, this.k, this.m, this.id)
+    stripes.forEach((frags, i) => {
+      for (const raw of frags) this.stripeBytes[i] = (this.stripeBytes[i] ?? 0) + raw.byteLength
+    })
+    this.signing = this.signing
+      .then(async () => {
+        await signFrame(this.ctx.signingKey, stripes, frame.audio)
+        if (this.stopped) return
+        for (const frags of stripes) for (const raw of frags) this.ctx.relay.inject(raw)
+      })
+      .catch((e) => console.warn('signing failed', e))
+  }
+
+  private send(to: string, msg: PublisherMsg): void {
+    this.ctx.mesh.sendApp(to, msg)
+  }
+
+  // --- subscribers -------------------------------------------------------------------------------
+
+  handle(msg: SubscriberMsg, from: string): void {
+    if (this.stopped) return
+    if (msg.t === 'subscribe') {
+      if (!this.subscribers.has(from)) {
+        this.subscribers.set(from, {
+          id: from,
+          joinedAt: performance.now(),
+          stats: null,
+          failures: 0,
+          avoid: new Map(),
+          active: false,
+          suspectUntil: 0,
+        })
+        this.lastPositions.delete(from)
+        this.checkLiveness()
+      } else {
+        // A re-subscribe (e.g. after the subscriber lost its state): resend its parents.
+        const parents = this.topology.parents[from]
+        parents?.forEach((parent, stripe) => this.send(from, { t: 'set-parent', ch: this.id, stripe, parent }))
+        this.lastPositions.delete(from)
+      }
+      this.ctx.onChange()
+      return
+    }
+    const sub = this.subscribers.get(from)
+    if (msg.t === 'unsubscribe') {
+      this.removeSubscriber(from)
+      return
+    }
+    if (!sub) return
+    switch (msg.t) {
+      case 'stats':
+        sub.stats = msg.stats
+        break
+      case 'stripe-ok':
+        this.completeRemoval(from, msg.stripe, msg.parent)
+        return
+      case 'reattach':
+        this.queueReattach(from, msg.stripe, msg.linkOpen)
+        return
+      case 'need-key': {
+        const now = performance.now()
+        if (now - this.lastKeyRequest > 300) {
+          this.lastKeyRequest = now
+          this.requestKeyframe()
+        }
+        return
+      }
+      case 'topo-req':
+        if (msg.on) {
+          this.topoWatchers.add(from)
+          void this.sendTopology(from)
+        } else {
+          this.topoWatchers.delete(from)
+        }
+        return
+    }
+    this.ctx.onChange()
+  }
+
+  /** A member left the lobby (or its link to us closed for good). */
+  removeSubscriber(id: string): void {
+    const sub = this.subscribers.get(id)
+    if (!sub) return
+    this.deactivate(sub)
+    this.subscribers.delete(id)
+    this.topoWatchers.delete(id)
+    this.lastPositions.delete(id)
+    this.scheduleReplan(0)
+    this.ctx.onChange()
+  }
+
+  /**
+   * Keeps the plan to subscribers that are linked and answering. The publisher reacts to its own
+   * direct link state immediately, without waiting for gossip; a peer whose link recovers rejoins.
+   */
+  private checkLiveness(): void {
+    const now = performance.now()
+    for (const sub of this.subscribers.values()) {
+      const alive = !!this.ctx.mesh.linkFor(sub.id) && !this.ctx.mesh.isSuspected(sub.id) && now >= sub.suspectUntil
+      if (alive && !sub.active) {
+        sub.active = true
+        this.scheduleReplan()
+      } else if (!alive && sub.active) {
+        this.deactivate(sub)
+        this.scheduleReplan(0)
+      }
+    }
+  }
+
+  /** Takes a subscriber out of the trees: its parents stop feeding it, its subtree isn't blamed. */
+  private deactivate(sub: ChannelSubscriber): void {
+    sub.active = false
+    const id = sub.id
+    this.ctx.relay.removePeer(id)
+    // Stop the departed peer's parents from pushing stripes into a dead link (WebRTC may take
+    // tens of seconds to notice), including parents that were still being phased out.
+    const parents = this.topology.parents[id] ?? []
+    parents.forEach((parent, stripe) => {
+      if (parent) this.removeEdge(parent, id, stripe)
+      // Its subtree is about to go silent; that's not their parents' fault.
+      this.markSubtreeDisrupted(id, stripe)
+    })
+    for (const [key, pr] of this.pendingRemovals) {
+      const [child, stripe] = key.split(':')
+      if (child === id || pr.oldParent === id) {
+        clearTimeout(pr.timer)
+        this.pendingRemovals.delete(key)
+        if (child === id) this.removeEdge(pr.oldParent, id, Number(stripe))
+      }
+    }
+    // Forget its place, so it is replanned from scratch when it comes back.
+    const parentsCopy = { ...this.topology.parents }
+    delete parentsCopy[id]
+    const home = { ...this.topology.home }
+    delete home[id]
+    this.topology = { parents: parentsCopy, home }
+    this.lastPositions.delete(id)
+  }
+
+  // --- failure handling --------------------------------------------------------------------------
+
+  private queueReattach(child: string, stripe: number, linkOpen: boolean): void {
+    this.reattachQueue.push({ child, stripe, linkOpen })
+    if (this.reattachTimer === null) {
+      this.reattachTimer = setTimeout(() => this.processReattaches(), REATTACH_BATCH_MS)
+    }
+  }
+
+  private processReattaches(): void {
+    this.reattachTimer = null
+    const batch = this.reattachQueue.splice(0)
+    const depth = (r: { child: string; stripe: number }) => this.lastPlan?.depth[r.child]?.[r.stripe] ?? 0
+    batch.sort((a, b) => depth(a) - depth(b))
+    const now = performance.now()
+    let changed = false
+    const suspects = new Set<string>()
+    for (const { child, stripe, linkOpen } of batch) {
+      const sub = this.subscribers.get(child)
+      if (!sub?.active) continue
+      const parent = this.topology.parents[child]?.[stripe]
+      // The parent is itself starved by an upstream failure that is already being handled:
+      // keep this child where it is (the parent's feed will resume).
+      if (linkOpen && parent && this.isDisrupted(parent, stripe)) continue
+      // This child's feed is broken, and everything below it is going silent as well.
+      this.markSubtreeDisrupted(child, stripe, true)
+      if (parent && parent !== this.ctx.selfId) {
+        // Link up but nothing forwarded: the parent is unreliable (rank it lower).
+        // Link not up: this pair can't connect (avoid it for longer).
+        // Either way, pick a different parent for this stripe.
+        const pp = this.subscribers.get(parent)
+        if (linkOpen && pp) {
+          pp.failures++
+          suspects.add(parent)
+        }
+        sub.avoid.set(parent, now + (linkOpen ? SILENT_PARENT_AVOID_MS : LINK_FAILED_AVOID_MS))
+      }
+      changed = true
+    }
+    if (changed) this.scheduleReplan(0)
+    for (const p of suspects) void this.checkAlive(p)
+  }
+
+  /**
+   * A vanished peer's link can look open for a while. When children report a silent parent, ping
+   * it; no answer means it's gone, which frees its slots for the replan right away.
+   */
+  private async checkAlive(id: string): Promise<void> {
+    try {
+      const link = this.ctx.mesh.linkFor(id)
+      if (!link) throw new Error('no link')
+      await link.ping(LIVENESS_TIMEOUT_MS)
+    } catch {
+      const sub = this.subscribers.get(id)
+      if (!sub) return
+      sub.suspectUntil = performance.now() + SUSPECT_HOLD_MS
+      if (sub.active) {
+        this.deactivate(sub)
+        this.scheduleReplan(0)
+      }
+    }
+  }
+
+  private markSubtreeDisrupted(root: string, stripe: number, includeRoot = false): void {
+    const kids = new Map<string, string[]>()
+    for (const [peer, ps] of Object.entries(this.topology.parents)) {
+      const par = ps[stripe]
+      if (par) kids.set(par, [...(kids.get(par) ?? []), peer])
+    }
+    const until = performance.now() + UPSTREAM_DISRUPTION_MS
+    const stack = includeRoot ? [root] : [...(kids.get(root) ?? [])]
+    const seen = new Set<string>()
+    while (stack.length) {
+      const n = stack.pop()!
+      if (seen.has(n)) continue
+      seen.add(n)
+      const key = `${n}:${stripe}`
+      this.disruptedUntil.set(key, Math.max(this.disruptedUntil.get(key) ?? 0, until))
+      stack.push(...(kids.get(n) ?? []))
+    }
+  }
+
+  private isDisrupted(peer: string, stripe: number): boolean {
+    const key = `${peer}:${stripe}`
+    const until = this.disruptedUntil.get(key)
+    if (until === undefined) return false
+    if (performance.now() < until) return true
+    this.disruptedUntil.delete(key)
+    return false
+  }
+
+  // --- planning ----------------------------------------------------------------------------------
+
+  private scheduleReplan(delay = 50): void {
+    if (this.replanTimer !== null) {
+      if (delay > 0) return
+      clearTimeout(this.replanTimer)
+    }
+    this.replanTimer = setTimeout(() => {
+      this.replanTimer = null
+      this.replan()
+    }, delay)
+  }
+
+  /** Slots a subscriber offered for this channel in its gossip record. */
+  offeredSlots(id: string): number {
+    return this.ctx.mesh.member(id)?.offers[String(this.id)] ?? 0
+  }
+
+  get plannerConfig(): PlannerConfig {
+    const mesh = this.ctx.mesh
+    return {
+      hostId: this.ctx.selfId,
+      k: this.k,
+      m: this.m,
+      rootSlots: this.ctx.rootSlots(this.id),
+      maxFanout: MAX_FANOUT,
+      minUptimeMsForRelay: 4000,
+      switchGain: 1,
+      rttSwitchMs: 40,
+      rtt: (a, b) => mesh.member(a)?.rtt[b] ?? mesh.member(b)?.rtt[a] ?? null,
+    }
+  }
+
+  replan(): void {
+    if (this.stopped) return
+    const now = performance.now()
+    for (const [key, until] of this.disruptedUntil) if (now > until) this.disruptedUntil.delete(key)
+    const mesh = this.ctx.mesh
+    const peers: PlannerPeer[] = []
+    for (const sub of this.subscribers.values()) {
+      for (const [id, until] of sub.avoid) if (now > until) sub.avoid.delete(id)
+      sub.failures *= 0.95
+      if (!sub.active) continue
+      // Edges only between pairs with an open mesh link: never across a pair that failed, and not
+      // to a joiner that is still meshing in (it would see silence and blame a healthy parent).
+      const unreachable = new Set(mesh.member(sub.id)?.unreachable ?? [])
+      for (const other of this.subscribers.keys()) {
+        if (other !== sub.id && (mesh.member(other)?.unreachable.includes(sub.id) || !mesh.linked(sub.id, other))) unreachable.add(other)
+      }
+      if (mesh.record.unreachable.includes(sub.id)) unreachable.add(this.ctx.selfId)
+      peers.push({
+        id: sub.id,
+        slots: this.offeredSlots(sub.id),
+        joinedAt: sub.joinedAt,
+        failures: sub.failures,
+        avoid: [...sub.avoid.keys(), ...unreachable],
+        starved: [...Array(this.stripes).keys()].filter((st) => this.isDisrupted(sub.id, st)),
+      })
+    }
+    const result = plan(peers, this.topology, this.plannerConfig, now)
+    const deficitChanged = (this.lastPlan?.overcommitted ?? 0) !== result.overcommitted
+    this.lastPlan = result
+    this.topology = result.topology
+    this.totalChanges += result.changes.length
+    for (const c of result.changes) this.apply(c)
+    this.sendPositions(result)
+    if (deficitChanged) this.ctx.announce()
+    this.ctx.onChange()
+  }
+
+  private apply(c: ParentChange): void {
+    const key = `${c.peer}:${c.stripe}`
+    if (c.to !== null) this.addEdge(c.to, c.peer, c.stripe)
+    this.send(c.peer, { t: 'set-parent', ch: this.id, stripe: c.stripe, parent: c.to })
+
+    const prev = this.pendingRemovals.get(key)
+    if (prev) {
+      clearTimeout(prev.timer)
+      this.pendingRemovals.delete(key)
+      // The older pending parent is superseded too.
+      if (prev.oldParent !== c.to) this.removeEdge(prev.oldParent, c.peer, c.stripe)
+    }
+    if (c.from !== null && (c.from === this.ctx.selfId || this.subscribers.has(c.from))) {
+      // Make-before-break: keep the old parent feeding until the new one delivers.
+      const oldParent = c.from
+      const timer = setTimeout(() => this.completeRemoval(c.peer, c.stripe, null), REMOVAL_TIMEOUT_MS)
+      this.pendingRemovals.set(key, { oldParent, timer })
+    }
+  }
+
+  private completeRemoval(peer: string, stripe: number, deliveredBy: string | null): void {
+    const key = `${peer}:${stripe}`
+    const pr = this.pendingRemovals.get(key)
+    if (!pr) return
+    const current = this.topology.parents[peer]?.[stripe]
+    if (deliveredBy !== null && deliveredBy !== current) return
+    clearTimeout(pr.timer)
+    this.pendingRemovals.delete(key)
+    if (pr.oldParent !== current) this.removeEdge(pr.oldParent, peer, stripe)
+  }
+
+  private addEdge(parent: string, child: string, stripe: number): void {
+    if (parent === this.ctx.selfId) this.ctx.relay.addChild(this.id, stripe, child)
+    else this.send(parent, { t: 'add-child', ch: this.id, stripe, child })
+  }
+
+  private removeEdge(parent: string, child: string, stripe: number): void {
+    if (parent === this.ctx.selfId) this.ctx.relay.removeChild(this.id, stripe, child)
+    else if (this.subscribers.has(parent)) this.send(parent, { t: 'remove-child', ch: this.id, stripe, child })
+  }
+
+  private sendPositions(r: PlanResult): void {
+    for (const sub of this.subscribers.values()) {
+      if (!sub.active) continue
+      const home = r.topology.home[sub.id] ?? null
+      const depth = r.depth[sub.id] ?? []
+      const sig = `${home}|${depth.join(',')}`
+      if (this.lastPositions.get(sub.id) === sig) continue
+      this.lastPositions.set(sub.id, sig)
+      this.send(sub.id, { t: 'position', ch: this.id, home, depth })
+    }
+  }
+
+  // --- topology reports --------------------------------------------------------------------------
+
+  report(): TopologyReport {
+    return {
+      channel: this.id,
+      publisher: this.ctx.selfId,
+      k: this.k,
+      m: this.m,
+      topology: this.topology,
+      depth: this.lastPlan?.depth ?? {},
+      slots: this.lastPlan?.slots ?? {},
+      rootSlots: this.ctx.rootSlots(this.id),
+      overcommitted: this.lastPlan?.overcommitted ?? 0,
+      changes: this.totalChanges,
+      peers: [...this.subscribers.values()].map((s) => ({ id: s.id, failures: s.failures, avoid: [...s.avoid.keys()], stats: s.stats })),
+    }
+  }
+
+  /** Sends the gzipped report to whoever has the Topology panel open (at most every 3 s). */
+  private async sendTopology(to?: string): Promise<void> {
+    const targets = to ? [to] : [...this.topoWatchers]
+    if (!targets.length || this.stopped) return
+    const z = toBase64Url(await gzip(JSON.stringify(this.report())))
+    for (const id of targets) this.send(id, { t: 'topo', ch: this.id, z })
+  }
+
+  stop(): void {
+    this.stopped = true
+    this.timers.forEach(clearInterval)
+    if (this.replanTimer) clearTimeout(this.replanTimer)
+    if (this.reattachTimer) clearTimeout(this.reattachTimer)
+    for (const pr of this.pendingRemovals.values()) clearTimeout(pr.timer)
+    this.ctx.relay.dropChannel(this.id)
+  }
+}
+
+/** Draws a random u32 channel id. */
+export function newChannelId(): number {
+  return crypto.getRandomValues(new Uint32Array(1))[0]
+}
+
+/**
+ * A shared screen: one capture, encoded once per channel. Phase 3 publishes the full-resolution
+ * channel; the low-resolution preview channel joins it in phase 4.
+ */
+export class PublishedStream {
+  localStream: MediaStream | null = null
+  readonly channels: ChannelPublisher[] = []
+  private video: VideoPipeline | null = null
+  private audio: AudioPipeline | null = null
+  private stopSource: (() => void) | null = null
+
+  constructor(
+    readonly opts: ShareOptions,
+    private ctx: PublisherContext,
+  ) {}
+
+  get full(): ChannelPublisher | undefined {
+    return this.channels.find((c) => c.kind === 'full')
+  }
+
+  get codec(): string | null {
+    return this.video?.codec ?? null
+  }
+
+  async start(): Promise<void> {
+    const o = this.opts
+    let stream: MediaStream
+    if (o.source === 'test') {
+      const [w, h] = o.testSize ?? [1280, 720]
+      const tp = testPattern(w, h, 30, o.audio)
+      stream = tp.stream
+      this.stopSource = tp.stop
+    } else {
+      stream = await captureScreen({ surface: o.surface, audio: o.audio, maxWidth: o.maxSize?.[0], maxHeight: o.maxSize?.[1] })
+      this.stopSource = () => stream.getTracks().forEach((t) => t.stop())
+    }
+    this.localStream = stream
+
+    const at = stream.getAudioTracks()[0]
+    const withAudio = !!at && o.audio && AudioPipeline.supported()
+    const full = new ChannelPublisher(newChannelId(), 'full', o.k, o.m, o.bitrateKbps, withAudio, this.ctx, () => this.video?.requestKeyframe())
+    this.channels.push(full)
+
+    const vt = stream.getVideoTracks()[0]
+    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: 30, keyframeIntervalMs: 2000 })
+    this.video.onFrame = (f) => full.emit(f)
+    this.video.onStreamInfo = (info) => full.setStream({ ...info, audio: this.audio?.info ?? undefined })
+    void this.video.start()
+
+    if (withAudio) {
+      this.audio = new AudioPipeline(at)
+      this.audio.onFrame = (f) => {
+        // The decoder config learns about audio once the encoder is configured.
+        if (full.stream && !full.stream.audio && this.audio?.info) full.setStream({ ...full.stream, audio: this.audio.info })
+        full.emit(f)
+      }
+      this.audio.start().catch((e) => console.warn('audio disabled', e))
+    }
+    // Ending the capture from the browser's own "Stop sharing" bar ends the stream too.
+    vt.addEventListener('ended', () => this.onEnded())
+    this.ctx.announce()
+  }
+
+  onEnded: () => void = () => {}
+
+  stop(): void {
+    this.video?.stop()
+    this.audio?.stop()
+    this.stopSource?.()
+    for (const c of this.channels) c.stop()
+    this.channels.length = 0
+    this.ctx.announce()
+  }
+}

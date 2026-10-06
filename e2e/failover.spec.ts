@@ -6,10 +6,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 test('deep tree: grandchildren do not blame healthy relays; departed children are pruned', async ({ browser }) => {
   test.setTimeout(180_000)
   const streamId = `e2e-deep-${Date.now()}`
-  // k=1: one 1050 kbps stripe. Host budget = 1 child; 2900 kbps relays get 2 slots each,
-  // so the tree is host -> R -> {R', R''} -> leaves (depth 3).
+  // k=1: one ~1.1-1.3 Mbps stripe (the publisher announces what it really sends). Publisher budget
+  // = 1 child; 3600 kbps relays get 2 slots each, so the tree is host -> R -> {R', R''} -> leaves
+  // (depth 3).
   const host = await openHost(browser, streamId, { k: 1, m: 0, bitrate: 1000, up: 1500 })
-  const caps = [2900, 2900, 2900, 600, 600, 600]
+  const caps = [3600, 3600, 3600, 600, 600, 600]
   const pages: Page[] = []
   for (const [i, cap] of caps.entries()) pages.push(await openViewer(browser, streamId, `d${i}`, cap))
   const ids = await Promise.all(pages.map((p) => waitFor(() => viewerSnapshot(p), (s) => s.state === 'connected', 30_000, 'connected').then((s) => s.id)))

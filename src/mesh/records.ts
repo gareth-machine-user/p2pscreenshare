@@ -39,6 +39,8 @@ export interface MemberRecord extends Typed {
   subs: number[]
   /** Peers whose mesh link to this peer failed. */
   unreachable: string[]
+  /** Peers this peer has an open mesh link to (planners only make edges between linked pairs). */
+  links?: string[]
   /** Mesh round-trip times (ms) to other peers. */
   rtt: Record<string, number>
   /** Channels this peer publishes. */

@@ -41,7 +41,7 @@ export class Reassembler {
 
   push(frag: Fragment, now: number): void {
     const h = frag.header
-    const id = `${h.audio ? 'a' : 'v'}:${h.epoch}:${h.frameSeq}`
+    const id = `${h.channel}:${h.audio ? 'a' : 'v'}:${h.epoch}:${h.frameSeq}`
     let st = this.frames.get(id)
     if (!st) {
       st = {

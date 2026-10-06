@@ -2,11 +2,13 @@ import type { ParentChange, PlannerConfig, PlannerPeer, PlanResult, Topology } f
 import { stripeCount } from './model'
 
 /**
- * Computes a striped multi-tree topology (SplitStream-style).
+ * Computes a striped multi-tree topology (SplitStream-style) for one channel. Its publisher runs it,
+ * with itself as the root and the slots its subscribers offer for this channel as capacity.
  *
  * - Each peer with spare upload relays in exactly one "home" stripe and is a leaf in the others.
  * - Home stripes are balanced by total relay capacity.
- * - Within a stripe, stronger relays sit closer to the host; leaves fill the shallowest free slots.
+ * - Within a stripe, stronger relays sit closer to the root; leaves fill the shallowest free slots.
+ *   Among equally shallow parents, the closest (RTT plus lateness) wins.
  * - Existing parents are kept when they are nearly as good (hysteresis), to limit churn.
  *
  * Pure and deterministic: same inputs -> same output.
@@ -16,12 +18,9 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
   const peers = [...peersIn].sort((a, b) => a.joinedAt - b.joinedAt || cmp(a.id, b.id))
   const byId = new Map(peers.map((p) => [p.id, p]))
 
-  // 1. Relay slots per peer.
+  // 1. Relay slots per peer: what it offered for this channel, capped.
   const slots: Record<string, number> = {}
-  for (const p of peers) {
-    const raw = p.capacityKbps === null ? 0 : Math.floor((p.capacityKbps * cfg.headroom) / cfg.stripeKbps)
-    slots[p.id] = Math.max(0, Math.min(cfg.maxFanout, raw))
-  }
+  for (const p of peers) slots[p.id] = Math.max(0, Math.min(cfg.maxFanout, Math.floor(p.slots) || 0))
   const score = (p: PlannerPeer) => slots[p.id] / (1 + p.failures)
   const wasRelay = (p: PlannerPeer) => current.home[p.id] != null && current.home[p.id]! < S
   const eligible = peers.filter(
@@ -49,8 +48,8 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     supply[s] += slots[p.id]
   }
 
-  // 3. Host slots per stripe (at least one each: the host must emit every stripe).
-  const hostSlots = Math.max(S, Math.floor((cfg.hostUploadKbps * cfg.headroom) / cfg.stripeKbps))
+  // 3. Root slots per stripe (at least one each: the publisher must emit every stripe).
+  const hostSlots = Math.max(S, Math.floor(cfg.rootSlots) || 0)
   // Fixed split (not supply-dependent) so membership changes don't reshuffle host slots.
   const hostPerStripe = [...Array(S).keys()].map((s) => Math.floor(hostSlots / S) + (s < hostSlots % S ? 1 : 0))
 
@@ -62,6 +61,8 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     depth[p.id] = new Array(S).fill(0)
   }
   let overcommitted = 0
+  /** Attachments that overcommit the root (the publisher), by stripe. */
+  const rootOver: { peer: string; stripe: number }[] = []
 
   for (let s = 0; s < S; s++) {
     const remaining = new Map<string, number>([[cfg.hostId, hostPerStripe[s]]])
@@ -93,11 +94,18 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
 
     const starved = (id: string) => byId.get(id)?.starved?.includes(s) ?? false
 
+    /** Distance from a parent to a child: RTT plus the parent's lateness on this stripe. */
+    const cost = (parentId: string, childId: string): number | null => {
+      const rtt = cfg.rtt?.(parentId, childId) ?? null
+      if (rtt === null) return null
+      return rtt + (cfg.lateness?.(parentId, s) ?? 0)
+    }
+
     const bestFree = (p: PlannerPeer): string | null => {
       let best: string | null = null
       for (const id of placedRelays) {
         if ((remaining.get(id) ?? 0) <= 0 || !canLink(p, id) || starved(id)) continue
-        if (best === null || better(id, best)) best = id
+        if (best === null || better(p.id, id, best)) best = id
       }
       return best
     }
@@ -106,7 +114,14 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     const keepable = (p: PlannerPeer, best: string | null): string | null => {
       const cur = current.parents[p.id]?.[s] ?? null
       if (cur === null || !nodeDepth.has(cur) || (remaining.get(cur) ?? 0) <= 0 || !canLink(p, cur)) return null
-      if (best !== null && nodeDepth.get(cur)! > nodeDepth.get(best)! + cfg.switchGain) return null
+      if (best === null || best === cur) return cur
+      const dCur = nodeDepth.get(cur)!
+      const dBest = nodeDepth.get(best)!
+      if (dCur > dBest + cfg.switchGain) return null
+      // A parent no deeper that is much closer is worth a move.
+      const cCur = cost(cur, p.id)
+      const cBest = cost(best, p.id)
+      if (dBest <= dCur && cCur !== null && cBest !== null && cBest + (cfg.rttSwitchMs ?? 40) < cCur) return null
       return cur
     }
 
@@ -155,15 +170,19 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
           }
         }
         if (chosen !== null) overcommitted++
+        if (chosen === cfg.hostId) rootOver.push({ peer: p.id, stripe: s })
       }
       attach(p, chosen)
     }
 
-    // Shallower first, then more spare capacity, then host, then id.
-    const better = (a: string, b: string) => {
+    // For `child`: shallower first, then closer (RTT + lateness), then more spare capacity, then id.
+    const better = (child: string, a: string, b: string) => {
       const da = nodeDepth.get(a)!
       const db = nodeDepth.get(b)!
       if (da !== db) return da < db
+      const ca = cost(a, child)
+      const cb = cost(b, child)
+      if (ca !== null && cb !== null && ca !== cb) return ca < cb
       const ra = remaining.get(a)!
       const rb = remaining.get(b)!
       if (ra !== rb) return ra > rb
@@ -177,7 +196,19 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     leaves.forEach(placeAny)
   }
 
-  // 5. Diff against the current topology.
+  // 5. Shed root overcommit where parity allows. The publisher's uplink carries every stripe, so
+  // overloading it delays all of them for everyone; a peer that still gets k other stripes just
+  // decodes from those. (Newest attachments go first.)
+  for (const { peer, stripe } of rootOver.reverse()) {
+    const attached = parents[peer].filter((x) => x !== null).length
+    if (attached > cfg.k) {
+      parents[peer][stripe] = null
+      depth[peer][stripe] = 0
+      overcommitted--
+    }
+  }
+
+  // 6. Diff against the current topology.
   const changes: ParentChange[] = []
   for (const p of peers) {
     for (let s = 0; s < S; s++) {

@@ -9,9 +9,7 @@ function config(over: Partial<PlannerConfig> = {}): PlannerConfig {
     hostId: HOST,
     k: 4,
     m: 1,
-    stripeKbps: 625,
-    hostUploadKbps: 5000,
-    headroom: 0.8,
+    rootSlots: 6, // 5000 kbps * 0.8 / 625 kbps stripes
     maxFanout: 12,
     minUptimeMsForRelay: 0,
     switchGain: 1,
@@ -25,7 +23,8 @@ function makePeers(n: number, seed = 7): PlannerPeer[] {
   const caps = [300, 1000, 2500, 8000, 30000]
   return Array.from({ length: n }, (_, i) => ({
     id: `p${String(i).padStart(3, '0')}`,
-    capacityKbps: caps[Math.floor(rnd() * caps.length)],
+    // Offered slots: 80% of upload / 625 kbps stripes.
+    slots: Math.floor((caps[Math.floor(rnd() * caps.length)] * 0.8) / 625),
     joinedAt: i,
     failures: 0,
     avoid: [],
@@ -92,8 +91,8 @@ describe('planner', () => {
   })
 
   it('k=1 m=0 is a single tree', () => {
-    const cfg = config({ k: 1, m: 0, stripeKbps: 2500 })
-    const peers = makePeers(50)
+    const cfg = config({ k: 1, m: 0, rootSlots: 1 })
+    const peers = makePeers(50).map((p) => ({ ...p, slots: Math.floor(p.slots / 4) }))
     const r = plan(peers, emptyTopology(), cfg, 1000)
     checkInvariants(r, peers, cfg)
   })
@@ -121,11 +120,11 @@ describe('planner', () => {
   })
 
   it('respects unreachable pairs', () => {
-    const cfg = config({ k: 1, m: 0, stripeKbps: 2500, hostUploadKbps: 2500 })
+    const cfg = config({ k: 1, m: 0, rootSlots: 1 })
     const peers: PlannerPeer[] = [
-      { id: 'a', capacityKbps: 20000, joinedAt: 0, failures: 0, avoid: [] },
-      { id: 'b', capacityKbps: 0, joinedAt: 1, failures: 0, avoid: ['a'] },
-      { id: 'c', capacityKbps: 20000, joinedAt: 2, failures: 0, avoid: [] },
+      { id: 'a', slots: 6, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'b', slots: 0, joinedAt: 1, failures: 0, avoid: ['a'] },
+      { id: 'c', slots: 6, joinedAt: 2, failures: 0, avoid: [] },
     ]
     const r = plan(peers, emptyTopology(), cfg, 1000)
     expect(r.topology.parents.b[0]).not.toBe('a')
@@ -138,5 +137,99 @@ describe('planner', () => {
     const r = plan(peers, emptyTopology(), cfg, 1000)
     expect(Object.values(r.topology.home).every((h) => h === null)).toBe(true)
     expect(r.overcommitted).toBeGreaterThan(0) // host alone cannot serve 10 peers x 5 stripes
+  })
+
+  it('plans within offered slots: a peer offering none never relays', () => {
+    const cfg = config({ k: 2, m: 1, rootSlots: 3, maxFanout: 16 })
+    const peers: PlannerPeer[] = [
+      { id: 'a', slots: 2, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'b', slots: 0, joinedAt: 1, failures: 0, avoid: [] },
+      { id: 'c', slots: 40, joinedAt: 2, failures: 0, avoid: [] },
+      { id: 'd', slots: 40, joinedAt: 2, failures: 0, avoid: [] },
+      { id: 'e', slots: 40, joinedAt: 2, failures: 0, avoid: [] },
+      ...Array.from({ length: 8 }, (_, i) => ({ id: `l${i}`, slots: 0, joinedAt: 3 + i, failures: 0, avoid: [] })),
+    ]
+    const r = plan(peers, emptyTopology(), cfg, 1000)
+    checkInvariants(r, peers, cfg)
+    expect(r.topology.home.b).toBeNull()
+    expect(r.slots.a).toBe(2)
+    expect(r.slots.c).toBe(16) // capped by maxFanout
+    // Feasible, so no relay gets more children than it offered (checked by checkInvariants).
+    expect(r.overcommitted).toBe(0)
+  })
+
+  it('breaks ties between equally deep parents by RTT', () => {
+    const rtt: Record<string, number> = { 'x:near': 10, 'x:far': 90, 'y:near': 80, 'y:far': 15 }
+    const cfg = config({
+      k: 1,
+      m: 0,
+      rootSlots: 2,
+      rtt: (a, b) => rtt[`${b}:${a}`] ?? rtt[`${a}:${b}`] ?? null,
+    })
+    const peers: PlannerPeer[] = [
+      { id: 'far', slots: 4, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'near', slots: 4, joinedAt: 1, failures: 0, avoid: [] },
+      { id: 'x', slots: 0, joinedAt: 2, failures: 0, avoid: [] },
+      { id: 'y', slots: 0, joinedAt: 3, failures: 0, avoid: [] },
+    ]
+    const r = plan(peers, emptyTopology(), cfg, 1000)
+    checkInvariants(r, peers, cfg)
+    // Both relays hang off the root (depth 1); each leaf picks the closer one.
+    expect(r.topology.parents.x[0]).toBe('near')
+    expect(r.topology.parents.y[0]).toBe('far')
+  })
+
+  it('lateness counts against a parent like extra RTT', () => {
+    const cfg = config({
+      k: 1,
+      m: 0,
+      rootSlots: 2,
+      rtt: () => 20,
+      lateness: (parent) => (parent === 'slow' ? 200 : 0),
+    })
+    const peers: PlannerPeer[] = [
+      { id: 'slow', slots: 4, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'fast', slots: 4, joinedAt: 1, failures: 0, avoid: [] },
+      { id: 'leaf', slots: 0, joinedAt: 2, failures: 0, avoid: [] },
+    ]
+    expect(plan(peers, emptyTopology(), cfg, 1000).topology.parents.leaf[0]).toBe('fast')
+  })
+
+  it('moves a peer to a much closer parent at the same depth, but not for a small gain', () => {
+    const base = { k: 1, m: 0, rootSlots: 2 }
+    const peers: PlannerPeer[] = [
+      { id: 'a', slots: 4, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'b', slots: 4, joinedAt: 1, failures: 0, avoid: [] },
+      { id: 'leaf', slots: 0, joinedAt: 2, failures: 0, avoid: [] },
+    ]
+    const current = {
+      parents: { a: ['H'], b: ['H'], leaf: ['a'] },
+      home: { a: 0, b: 0, leaf: null },
+    }
+    const rttTo = (aMs: number, bMs: number) => (x: string, y: string) => {
+      const other = x === 'leaf' ? y : y === 'leaf' ? x : null
+      return other === 'a' ? aMs : other === 'b' ? bMs : 5
+    }
+    // 30 ms closer: within the 40 ms hysteresis, stay.
+    expect(plan(peers, current, config({ ...base, rtt: rttTo(60, 30) }), 1000).topology.parents.leaf[0]).toBe('a')
+    // 100 ms closer: move.
+    expect(plan(peers, current, config({ ...base, rtt: rttTo(130, 30) }), 1000).topology.parents.leaf[0]).toBe('b')
+  })
+
+  it('does not overload the publisher for a stripe that parity covers', () => {
+    // Stripe relays for 0 and 2 only: stripe 1 has nothing but the root's single slot.
+    const cfg = config({ k: 2, m: 1, rootSlots: 3 })
+    const current = { parents: {}, home: { a: 0, c: 2 } as Record<string, number | null> }
+    const peers: PlannerPeer[] = [
+      { id: 'a', slots: 16, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'c', slots: 16, joinedAt: 1, failures: 0, avoid: [] },
+      ...Array.from({ length: 6 }, (_, i) => ({ id: `l${i}`, slots: 0, joinedAt: 2 + i, failures: 0, avoid: [] })),
+    ]
+    const r = plan(peers, current, cfg, 1000)
+    const rootKids = (s: number) => peers.filter((p) => r.topology.parents[p.id][s] === 'H').length
+    // The root stays within its per-stripe share instead of feeding stripe 1 to everyone...
+    expect(rootKids(1)).toBeLessThanOrEqual(1)
+    // ...and everyone still gets at least k stripes.
+    for (const p of peers) expect(r.topology.parents[p.id].filter((x) => x !== null).length).toBeGreaterThanOrEqual(2)
   })
 })

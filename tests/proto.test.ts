@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { decodePieces, encodePieces } from '../src/proto/fec'
-import { decodeFragment, encodeFragment, NO_REF, withReplayFlag, type FragmentHeader } from '../src/proto/framing'
+import { decodeFragment, encodeFragment, HEADER_SIZE, NO_REF, peekChannel, withReplayFlag, type FragmentHeader } from '../src/proto/framing'
 import { packetize, type EncodedFrame } from '../src/media/packetizer'
 import { Reassembler, type AssembledFrame } from '../src/media/reassembler'
 
@@ -26,6 +26,7 @@ function combinations(n: number, r: number): number[][] {
 
 describe('framing', () => {
   const h: FragmentHeader = {
+    channel: 0xdeadbeef,
     key: true,
     audio: false,
     replay: false,
@@ -49,6 +50,14 @@ describe('framing', () => {
     const f = decodeFragment(encodeFragment(h, payload))!
     expect(f.header).toEqual(h)
     expect(f.payload).toEqual(payload)
+  })
+
+  it('carries a u32 channel id in a 40-byte header (wire v3)', () => {
+    const raw = encodeFragment(h, randomBytes(10))
+    expect(HEADER_SIZE).toBe(40)
+    expect(raw[0]).toBe(3)
+    expect(peekChannel(raw)).toBe(0xdeadbeef)
+    expect(peekChannel(raw.subarray(0, 20))).toBe(-1)
   })
 
   it('sets the replay flag without touching the original', () => {
@@ -106,7 +115,7 @@ describe('packetize + reassemble', () => {
     const out: AssembledFrame[] = []
     const r = new Reassembler((f) => out.push(f))
     const f = frame(0, 200_000)
-    const stripes = packetize(f, 4, 1)
+    const stripes = packetize(f, 4, 1, 9)
     const frags = stripes.filter((_, s) => s !== 2).flat()
     frags.sort((a, b) => a[10] - b[10] || a.byteLength - b.byteLength) // arbitrary reorder
     for (const raw of [...frags, ...frags]) r.push(decodeFragment(raw)!, 0) // with duplicates
@@ -118,7 +127,7 @@ describe('packetize + reassemble', () => {
   it('does not emit with too many stripes missing', () => {
     const out: AssembledFrame[] = []
     const r = new Reassembler((f) => out.push(f))
-    const stripes = packetize(frame(1, 5000), 4, 1)
+    const stripes = packetize(frame(1, 5000), 4, 1, 9)
     for (const raw of [...stripes[0], ...stripes[1], ...stripes[2]]) r.push(decodeFragment(raw)!, 0)
     expect(out).toHaveLength(0)
   })
@@ -127,7 +136,7 @@ describe('packetize + reassemble', () => {
     const out: AssembledFrame[] = []
     const r = new Reassembler((f) => out.push(f))
     const a = frame(5, 300, true)
-    const stripes = packetize(a, 3, 1)
+    const stripes = packetize(a, 3, 1, 9)
     expect(stripes.every((s) => s.length === 1)).toBe(true)
     for (const raw of stripes.flat()) r.push(decodeFragment(raw)!, 0)
     expect(out).toHaveLength(1)

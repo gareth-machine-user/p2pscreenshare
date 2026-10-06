@@ -18,9 +18,10 @@ export interface EncodedFrame {
  * Video: erasure coded into k+m pieces, piece i -> stripe i.
  * Audio: tiny, so the whole frame is sent unsplit on every stripe (first arrival wins).
  */
-export function packetize(frame: EncodedFrame, k: number, m: number): Uint8Array[][] {
+export function packetize(frame: EncodedFrame, k: number, m: number, channel: number): Uint8Array[][] {
   const stripes = k + m
   const base = {
+    channel,
     key: frame.key,
     audio: frame.audio,
     replay: false,

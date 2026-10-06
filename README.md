@@ -1,25 +1,28 @@
 # p2pscreenshare
 
-Browser-only screen sharing over WebRTC, where viewers relay the stream to each other through
-bandwidth-aware **striped relay trees**. WebTorrent trackers are used only to introduce viewers
-to the host; no media server is involved.
+Browser-only screen sharing over WebRTC. A lobby is a full mesh of up to about 50 peers, and each
+stream reaches its viewers through bandwidth-aware **striped relay trees** that its publisher plans,
+so viewers seed each other instead of all pulling from the publisher. WebTorrent trackers are used
+only to find the lobby; no media server is involved.
 
-- **Encode once, forward bytes.** The host encodes with WebCodecs (VP9 with temporal SVC `L1T3`
-  when available). Relays forward encoded fragments over RTCDataChannels without decoding them,
-  so every viewer gets identical frames and relaying costs almost no CPU.
+- **Full-mesh lobbies.** Every peer runs the same session and holds one WebRTC connection to every
+  other peer, carrying a reliable `ctl` channel (gossip, chat, tree commands, stats) and an
+  unreliable `media` channel (fragments). A tree edge is just "forward channel X stripe s on this
+  pair's media channel", so joining a tree or switching parents never needs new ICE or DTLS setup.
+- **Encode once, forward bytes.** The publisher encodes with WebCodecs (VP9 with temporal SVC
+  `L1T3` when available). Relays forward encoded fragments without decoding them, so every viewer
+  gets identical frames and relaying costs almost no CPU.
 - **Striped multi-tree + erasure coding (SplitStream-style).** Each frame is split into `k` data
   and `m` parity pieces, and stripe *i* carries piece *i*. A viewer needs any `k` of the `k+m`
   stripes to decode. Each peer relays in at most one "home" stripe and is a leaf in all the
   others. With `k=1, m=0` this is a plain single relay tree.
-- **Host-run control plane.** Viewers measure their upload (a paced probe) and report stats. The
-  host's planner (`src/topology/planner.ts`) ranks peers, balances relay capacity across stripes,
-  and places stronger peers nearer the root. It also handles all signaling for tree links, and
-  switches parents make-before-break.
+- **Each publisher plans its own trees.** Peers measure their upload, split it into relay slots
+  per channel and gossip the offer; the publisher's planner (`src/topology/planner.ts`) places
+  stronger peers nearer the root, prefers closer parents (RTT), and switches parents
+  make-before-break. The planner fails together with the stream it plans, so there is no leader.
 - **Cut-through forwarding and low latency.** Relays forward each fragment as soon as it arrives.
   A jitter buffer that tracks reference dependencies plays out at the 95th percentile of frame
-  arrival times. Measured glass-to-glass latency in local e2e tests is about **50 ms**, and the
-  simulator predicts about **350 ms p50 at depth 4** over realistic links. Both are well under the
-  5 s budget.
+  arrival times. Measured glass-to-glass latency in local e2e tests is about **70 ms**.
 - **Graceful degradation.** Uplink queues drop temporal enhancement layers (T2, then T1) first, so
   an overloaded relay lowers the frame rate instead of stalling. A relay cache of the frames since
   the last keyframe (the GOP) lets new or re-attached children start decoding immediately.
@@ -61,107 +64,125 @@ lobby page.
 ## How it works
 
 ```
-             tracker (signaling only)
-            ╱                      ╲
-   host ── control conns (star) ── viewers        stats, topology commands, signaling relay
-     │
-     ├─ stripe 0 tree ─▶ A ─▶ {B, C, D …}           A relays stripe 0 only
-     ├─ stripe 1 tree ─▶ E ─▶ {A, C, F …}           A is a leaf here
-     └─ stripe 2 tree ─▶ G ─▶ {A, B, E …}           any k of k+m stripes decode
+              tracker (door peers' offer pools)
+                 │
+   ┌──────────── full mesh: one RTCPeerConnection per pair ────────────┐
+   │  owner (gatekeeper)   publisher A (plans A's trees)   B   C   D …  │
+   └────────────────────────────────────────────────────────────────────┘
+   A ── stripe 0 ─▶ B ─▶ {C, D …}        B relays stripe 0 only
+     ── stripe 1 ─▶ C ─▶ {B, D …}        C is a leaf here
+     ── stripe 2 ─▶ D ─▶ {B, C …}        any k of k+m stripes decode
 ```
 
-1. **Bootstrap** (`src/net/tracker.ts`, `src/net/bootstrap.ts`). The host keeps a pool of
-   pre-gathered offers and announces them to the stream's info-hash. The tracker hands each offer
-   to a distinct joining viewer, which answers through the tracker. Once connected, a viewer leaves
-   the swarm. Trackers can't address offers to a specific peer, so this keeps the swarm limited to
-   the host plus viewers that are still joining, and every offer reaches someone who needs one.
-2. **Measurement.** Each viewer streams a probe to the host for about 1.5 s, paced by its debug
-   cap if one is set. It then reports stats every 2 s: uplink throughput and drop rate, per-stripe
-   freshness and RTT, latency, buffer, and fps. Relays that drop packets have their estimated
-   capacity lowered.
-3. **Planning.** `plan()` is pure and deterministic. A peer gets
-   `floor(capacity·headroom / stripeKbps)` child slots. Home stripes are balanced by total capacity.
-   Each tree is built top-down, keeping valid existing parents first (hysteresis) and then placing
-   the rest. New peers stay leaves for 4 s. Pairs whose links failed are avoided.
-4. **Applying changes.** The host tells the new parent `add-child` and the child `set-parent`. Once
-   the child reports `stripe-ok` from the new parent, the old parent gets `remove-child`.
-5. **Failure handling.** See [Failure handling and recovery](#failure-handling-and-recovery).
+1. **Bootstrap** (`src/net/bootstrap.ts`). The owner plus the two oldest present members are
+   *door peers*: each keeps a pool of pre-gathered offers announced to the lobby's info-hash. The
+   tracker hands each offer to a distinct joining peer, which answers through the tracker.
+2. **Meshing in** (`src/mesh/mesh.ts`). Over the door link the joiner receives every member's
+   record and recent chat, then connects to everyone else. Signaling for a pair travels over the
+   `ctl` channel of a peer both are linked to, the lower id offers, and connections open in
+   batches of 8.
+3. **Gossip** (`src/mesh/records.ts`). Each peer owns one signed record (name, upload estimate,
+   relay slots offered per channel, subscriptions, open and failed links, RTTs, announced
+   channels) and sends it to its neighbours every 2 s and on change, gzipped when large. Every
+   2 s it swaps a digest with one random neighbour and pulls whatever is newer. A peer is gone when
+   nothing fresh has been heard about it, from anyone, for 6 s. Pairs whose link fails are listed
+   as unreachable, never become tree edges, and are retried after 60 s with backoff.
+4. **Channels and subscriptions** (`src/session/peerSession.ts`). A channel is one encoding of one
+   stream, with a random 32-bit id drawn each time it starts. The publisher announces it in its
+   record; viewers send `subscribe` directly to the publisher, and relay only in channels they
+   watch.
+5. **Capacity** (`src/session/capacity.ts`). At join a peer sends a paced 1.5 s probe to 3 random
+   neighbours at background priority, and adds what its uplink sent meanwhile. While relaying,
+   drops above 3% cap the estimate at 90% of the achieved rate. 75% of the estimate is split into
+   relay slots per watched channel (a publisher first reserves its own roots) and gossiped.
+6. **Planning** (`src/session/publisher.ts`, `src/topology/planner.ts`). The publisher replans
+   every 2 s and 50 ms after inputs change. `plan()` is pure and deterministic: home stripes are
+   balanced by offered slots, each tree is built top-down keeping valid existing parents
+   (hysteresis: a move needs a parent a level shallower or 40 ms closer), newcomers stay leaves
+   for 4 s, and edges are only made between linked pairs. Encoders overshoot their target, so
+   the publisher announces the stripe bitrate it actually sends. It never overloads its own
+   uplink for a stripe that parity covers: it is the source of every stripe.
+7. **Applying changes.** The publisher tells the new parent `add-child` and the child `set-parent`
+   over their mesh links. Once the child reports `stripe-ok` from the new parent, the old parent
+   gets `remove-child`.
 
 ### Security
 
-The host page's `stream` param is a private **seed**. From it the host derives (HKDF,
-`src/net/lobby.ts`) a 128-bit lobby secret and an Ed25519 signing key. The viewer link carries the
-**join code** `#/watch/<secret>.<host public key>`. Both URLs keep these in the fragment, so they are
-never sent to a server. Share the viewer link, never the host page's URL. From the join code,
-everyone derives:
+The owner's URL never leaves its device: **Create lobby** draws a private seed, keeps it in
+`localStorage`, and shows the lobby link `#/lobby/<secret>.<owner public key>`. From the seed the
+owner derives (HKDF, `src/net/lobby.ts`) the 128-bit lobby secret and its Ed25519 key. Links keep the
+code in the fragment, so it is never sent to a server. From the join code everyone derives:
 
 - **Tracker info_hash.** Trackers and anyone scanning them see only a one-way derivative of the code.
-- **SDP sealing key.** Offers and answers sent through trackers are AES-GCM sealed, bound to their
-  offer id and direction, with the sender's peer id inside. A peer without the code can't read an
-  offer (addresses, fingerprints), and its answers are dropped before the host touches them. The
-  SDPs carry the DTLS fingerprints, so a tracker can't sit in the middle of a control connection.
+- **SDP sealing key.** Door offers and answers sent through trackers are AES-GCM sealed, bound to
+  their offer id and direction. A peer without the code can't read an offer or answer one.
 
-Tree links are signaled over those authenticated control connections, so every hop is a DTLS
-channel to a peer holding the code; media is not encrypted again at the application layer. Anyone
-with the link can watch (the code is reusable and can't be revoked).
+**Identity** (`src/mesh/identity.ts`). Every peer has an Ed25519 key, persisted per lobby, and its
+peer id is a hash of the public key; the owner's key is the one pinned in the join code. Inside
+the seal each side signs its SDP, and mesh signaling relayed by other peers is signed too, so a
+relaying peer can't swap the DTLS fingerprints: every mesh link is authenticated to a peer id, and
+DTLS encrypts every hop. Gossip records, chat messages and channel announcements are signed
+envelopes (`src/mesh/envelope.ts`) that any peer can verify and forward.
 
-**Tamper-proofing.** The stream is signed with the host key pinned in the join code, so viewers
-(who all hold the code) can't impersonate the host or alter what they relay:
-
-- The host signs its offers; viewers only connect to the pinned host, so the control plane (codec
-  config, topology commands) is authentic.
-- The host signs every media fragment (`src/proto/signing.ts`). Relays verify each fragment before
-  forwarding or playing it, and fail closed. Forged fragments are dropped without marking their id
-  as seen, so they can't shadow the genuine fragment. Signed fragments older than the 5 s de-dup
-  window are dropped as replays.
-- Cost: ~26 µs to sign and ~90 µs to verify a fragment (Node, Ed25519), about 0.1 ms per hop, and
-  ~15 kbps (video) plus ~26 kbps (audio) of signatures per stripe.
+**Tamper-proofing.** Every media fragment is signed by its channel's publisher
+(`src/proto/signing.ts`), and the signature covers the channel id. Relays look up the publisher's
+key from the channel announcement and check that the publisher may publish (for now: the owner)
+before forwarding or playing a fragment, and fail closed. Forged fragments are dropped without
+marking their id as seen, so they can't shadow the genuine fragment, and signed fragments older
+than the 5 s de-dup window are dropped as replays. Tree commands for a channel are only accepted
+from its publisher.
 
 A malicious relay can still drop or delay what it forwards. Parity stripes (`m ≥ 1`) and
 re-attachment cover that.
 
 ### Wire format
 
-Each data-channel message is one fragment: a 36-byte header (version, flags with key/audio/replay
-bits and the temporal layer, epoch, frame seq, GOP id, reference seq, capture time, k, m, piece,
-stripe, frame length, fragment index and count) followed by up to about 16 KB of payload and the host's
-64-byte Ed25519 signature (`WIRE_VERSION` 2). See `src/proto/framing.ts`. Audio (Opus) is tiny, so it is sent unsplit on every stripe.
+Each media message is one fragment: a 40-byte header (version, flags with key/audio/replay bits
+and the temporal layer, epoch, frame seq, GOP id, reference seq, capture time, k, m, piece,
+stripe, frame length, fragment index and count, and the u32 channel id) followed by up to about
+16 KB of payload and the publisher's 64-byte Ed25519 signature (`WIRE_VERSION` 3). See
+`src/proto/framing.ts`. Audio (Opus) is tiny, so it is sent unsplit on every stripe of the full
+channel.
 
 ## Failure handling and recovery
 
-When a relay disappears, every viewer below it in that stripe's tree stops receiving that stripe.
+The publisher reacts to its own mesh links at once and to what subscribers report; the
+membership layer handles everything else.
 
-| Step | Mechanism | Time |
-|---|---|---|
-| Detect | A child whose stripe has been silent for 2 s (checked every 250 ms) sends `reattach`. The host re-encodes the last frame while the screen is idle, so a live stripe is never silent that long. | ~2 s |
-| Batch | The host collects reattach requests for 400 ms and handles them shallowest-first (see below). | 0.4 s |
-| Confirm | The host pings the reported parent over its control channel. No pong within 1.2 s means it's gone, and its slots are freed immediately. | ≤1.2 s |
-| Replan | `plan()` runs at once. The dead parent is excluded for that child, and relays that are themselves starved on that stripe are never chosen as a new parent. | ms |
-| Resume | The new parent replays its cached GOP, so the child decodes right away instead of waiting for the next keyframe. | ~1 RTT + link setup |
+| Event | Detection | Response | Time |
+|---|---|---|---|
+| A relay's link drops | The publisher's link to it closes or misses pings for 1.5 s | Replan at once; its parents get `remove-child`; its subtree is marked "disrupted upstream" for 6 s | ms |
+| A stripe goes silent | A child hears nothing on it for 2 s and sends `reattach` | Batched for 400 ms and handled shallowest-first; the reported parent is pinged (1.2 s) and avoided | ~2.5 s |
+| Resume | The new parent replays its cached GOP over an existing mesh link | | ~1 RTT |
+| A pair can't connect | Mesh ICE fails; both list each other as unreachable | Never a tree edge; retried with backoff | — |
+| A peer leaves | Its goodbye record, or 6 s without anything fresh | Removed from every channel it watched | ≤ 6 s |
 
 Measured in the e2e tests on one machine:
-- **With parity (`m ≥ 1`):** none of this is visible. The viewer keeps decoding from the other `k` stripes (minimum 28–30 fps during failover).
-- **Without parity:** the subtree resumes after about **3.5–4 s**. That includes orphans two levels below the failed relay.
-- **Pruning:** a departed child is removed from its parent's forwarding set after about **2 s**.
+- **With parity (`m ≥ 1`):** a relay leaving is invisible (minimum 19–24 fps during failover).
+- **Without parity:** orphans resume after about **1–2.5 s**, including orphans two levels below the
+  failed relay (it was about 4 s when tree links were set up on demand).
+- **Pruning:** a departed child is removed from its parent's forwarding set at once.
 
 Mechanisms that keep one failure from spreading:
 - **No collateral blame.** When a relay dies, its descendants all go silent together and all complain. Handling complaints shallowest-first, and marking each complainer's subtree as "disrupted upstream" for 6 s, means only the topmost complaint counts against a parent. Healthy relays below it keep their children and their rank.
-- **No forwarding into the void.** When a peer leaves, the host tells each of its parents `remove-child`. Otherwise they'd keep pushing stripes into a link that looks open until WebRTC's ICE timeout (tens of seconds).
-- **Liveness.** The host pings any peer it hasn't heard from for 1 s and drops it after 1.5 s of silence. Pongs are answered from a message handler, so background-tab timer throttling doesn't cause false positives.
+- **No forwarding into the void.** When a peer leaves, the publisher tells each of its parents `remove-child`.
+- **Liveness.** The mesh pings every idle link; pongs are answered from a message handler, so background-tab timer throttling doesn't cause false positives.
 - **Planned moves are glitch-free.** The old parent keeps feeding until the child reports `stripe-ok` from the new one (make-before-break).
+- **No startup backlog.** A new child's live fragments are queued ahead of its GOP replay, so its jitter buffer isn't inflated.
 
 Not handled yet:
 - A relay that is alive but consistently *late*: children's jitter buffers grow, but nobody moves them.
 - More than `m` relays failing within one detection window: viewers fed by all of them stall until reattach.
-- The host itself failing.
 
 ## Simulation
 
-`npm run sim -- --peers 200 --seconds 300` runs the planner under churn with a mix of residential
-uplinks: 25% at 0.5 Mbps, 35% at 2 Mbps, 25% at 8 Mbps and 15% at 30 Mbps. Viewers stay a mean of
-240 s, and the stream is 2.5 Mbps. When a peer leaves, its subtree loses that stripe for `--repair`
-ms (default 3500, matching the e2e measurement above). A viewer stalls while more than `m` of its
-stripes are missing.
+`npm run sim -- --peers 200 --seconds 300` runs one publisher's planner under churn with a mix of
+residential uplinks: 25% at 0.5 Mbps, 35% at 2 Mbps, 25% at 8 Mbps and 15% at 30 Mbps. Viewers
+stay a mean of 240 s, and the stream is 2.5 Mbps. Peers offer slots from a noisy upload estimate,
+re-measured every 10 s, and the publisher sees offers and joins `--gossip` ms late (default 500).
+When a peer leaves, its subtree loses that stripe for `--repair` ms (default 2500, matching the
+mesh e2e measurement above). A viewer stalls while more than `m` of its stripes are missing. (The
+tables below were measured before the mesh, with 3500 ms repairs.)
 
 ```
 k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent changes/min
@@ -253,34 +274,40 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 
 | Knob | Where | Default | Effect |
 |---|---|---|---|
-| `k`, `m` | host URL / home page | 4, 1 | See above |
-| `bitrate` | host URL | 2500 kbps | Lower bitrate → more relay slots per peer → shallower, more robust trees |
-| `headroom` | `HostSession.plannerConfig` | 0.75 | Share of measured upload the planner will use. Lower is safer against bad estimates and leaves room for keyframe bursts. |
-| `maxFanout` | `plannerConfig` | 16 | Children per relay. Higher uses strong peers fully but enlarges each failure's blast radius. |
-| `minUptimeMsForRelay` | `plannerConfig` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |
-| `switchGain` | `plannerConfig` | 1 | How many levels shallower a parent must be before a peer is moved. Higher means less churn but deeper trees. |
-| `STRIPE_SILENCE_MS` | `viewerSession.ts` | 2000 | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
-| `REATTACH_BATCH_MS`, `LIVENESS_TIMEOUT_MS` | `hostSession.ts` | 400, 1200 | Collateral-blame window, and the dead-parent confirmation timeout |
-| `HEARTBEAT_IDLE_MS`, `HEARTBEAT_TIMEOUT_MS` | `hostSession.ts` | 1000, 1500 | How fast departed leaves are noticed and pruned |
-| `keyframeIntervalMs` | `HostSession.start` | 2000 | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
+| `k`, `m` | Share dialog (Advanced) | 4, 1 | See above |
+| Quality preset | Share dialog | Auto (2.5 Mbps) | Lower bitrate → more relay slots per peer → shallower, more robust trees |
+| `HEADROOM` | `session/capacity.ts` | 0.75 | Share of measured upload a peer offers. Lower is safer against bad estimates and leaves room for keyframe bursts. |
+| `MAX_FANOUT` | `session/capacity.ts` | 16 | Children per relay. Higher uses strong peers fully but enlarges each failure's blast radius. |
+| `minUptimeMsForRelay` | `ChannelPublisher.plannerConfig` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |
+| `switchGain`, `rttSwitchMs` | `ChannelPublisher.plannerConfig` | 1, 40 | How many levels shallower (or ms closer) a parent must be before a peer is moved. Higher means less churn. |
+| `STRIPE_SILENCE_MS` | `session/subscription.ts` | 2000 | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
+| `REATTACH_BATCH_MS`, `LIVENESS_TIMEOUT_MS` | `session/publisher.ts` | 400, 1200 | Collateral-blame window, and the dead-parent confirmation timeout |
+| `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
+| `keyframeIntervalMs` | `PublishedStream.start` | 2000 | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | Layer deadlines | `uplink.ts` `MAX_AGE_MS_BY_LAYER` | T0 900, T1 350, T2 180 ms | How long an overloaded relay queues each temporal layer before dropping it |
 | Playout quantile / safety | `PlayoutClock` | 0.95 / 40 ms | Latency vs late-frame drops |
 
 ## Tests
 
 ```sh
-npm test                    # unit: framing, FEC, reassembly, jitter buffer, planner invariants
+npm test                    # unit: framing, FEC, reassembly, jitter buffer, planner, gossip, capacity
 npm run check               # svelte-check + tsc
 npm run e2e                 # Playwright: local tracker + dev server + several browser contexts
 ```
 
 The e2e suite covers:
+- the lobby UI: persisted settings, the player overlay, and the Topology panel
+- the mesh: six peers mesh up, one leaves, a blocked pair is gossiped, chat reaches everyone; the
+  lobby carries on without its owner; the mesh link stays up under streaming load
 - star streaming
-- a striped tree with mixed upload caps: weak peers stay leaves, the host feeds only the stripe
-  roots, and killing the busiest relay causes no frame-rate drop
-- a single tree: orphans recover within a few seconds, and a late joiner renders in under about 2 s
+- a striped tree with mixed upload caps: weak peers stay leaves, the publisher feeds only the
+  stripe roots, and killing the busiest relay causes no frame-rate stall
+- a single tree: orphans recover within a few seconds, and a late joiner renders in under about 1 s
 - a depth-3 tree, killing the top relay: everyone resumes, the healthy mid-level relays aren't
-  blamed by their own children, and a departed leaf is pruned from its parent within about 2 s
+  blamed by their own children, and a departed leaf is pruned from its parent at once
+
+`up=<kbps>` shapes a page's real uplink (publisher included), so e2e scenarios must be feasible:
+the publisher only plans its own budget, but an overcommitted plan genuinely queues.
 
 **NixOS / ARM64 VMs.** Playwright's bundled browser needs FHS libraries, so point it at a system
 Chromium. Some ARM64 VMs (Apple Virtualization) advertise SME but trap SME instructions. That
@@ -297,11 +324,13 @@ CHROMIUM_LD_PRELOAD=$PWD/tools/nosme/nosme.so npm run e2e
 
 - **Trust.** Anyone with the viewer link can watch, and the join code can't be revoked per viewer.
   Relays can't forge or alter the stream (see [Security](#security)), but they can still drop it.
-- **Host connection limit.** The host keeps a direct control connection to every viewer, which
-  limits audiences to roughly 200 peers. Routing control messages through the trees would lift
-  this.
-- **Small audiences.** With fewer capable relays than stripes, the host carries the uncovered
-  stripes itself (reported as "overcommitted").
+- **Lobby size.** The full mesh is designed for about 50 peers (each holds a connection to every
+  other one).
+- **NAT pairs without TURN.** Some pairs never connect; planners avoid them, and the Peers panel
+  shows "limited connectivity", but a peer that can't reach most of the lobby only gets the
+  stripes it can reach. Pass TURN servers with `ice=`.
+- **Small audiences.** With fewer capable relays than stripes, the publisher carries uncovered
+  stripes itself (reported as "overcommitted"), unless parity already covers them.
 - **Encoding and playback.** There's a single encoding, so viewers with weak downlinks are helped
   only by relays dropping temporal layers; simulcast would be the next step. Capture relies on
   `MediaStreamTrackProcessor` (Chromium); other browsers fall back to sampling a `<video>` element.
