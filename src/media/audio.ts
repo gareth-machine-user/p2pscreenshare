@@ -3,13 +3,14 @@ import { NO_REF } from '../proto/framing'
 import type { StreamInfo } from '../proto/messages'
 import type { EncodedFrame } from './packetizer'
 import { Playout, type PlayoutStats } from './playout'
+import { AUDIO_FRAME_MS, AUDIO_KBPS } from '../session/capacity'
 
 type AudioInfo = NonNullable<StreamInfo['audio']>
 
 /** Minimum time between AudioDecoder rebuilds after errors. */
 const REBUILD_INTERVAL_MS = 1000
-/** Most encoded audio frames held for decoding (about 5 s of 20 ms frames). */
-const MAX_PENDING = 250
+/** Most encoded audio frames held for decoding (about 5 s). */
+const MAX_PENDING = Math.ceil(5000 / AUDIO_FRAME_MS)
 /** Fallback playback only: drift past which chunks re-sync to their targets, s. */
 const RESYNC_S = 0.12
 
@@ -66,9 +67,14 @@ export class AudioPipeline {
     const settings = this.track.getSettings()
     const sampleRate = settings.sampleRate ?? 48000
     const numberOfChannels = Math.min(2, settings.channelCount ?? 2)
-    const config: AudioEncoderConfig = { codec: 'opus', sampleRate, numberOfChannels, bitrate: 64_000 }
-    const support = await AudioEncoder.isConfigSupported(config)
-    if (!support.supported) throw new Error('Opus encoding not supported')
+    // Tuned for music and game audio rather than speech. `application` and `signal` are newer than
+    // the DOM typings; browsers that don't know them ignore them.
+    const opus = { application: 'audio', signal: 'music', complexity: 10, frameDuration: AUDIO_FRAME_MS * 1000 } as OpusEncoderConfig
+    let config: AudioEncoderConfig = { codec: 'opus', sampleRate, numberOfChannels, bitrate: AUDIO_KBPS * 1000, opus }
+    if (!(await AudioEncoder.isConfigSupported(config)).supported) {
+      config = { codec: 'opus', sampleRate, numberOfChannels, bitrate: AUDIO_KBPS * 1000 }
+      if (!(await AudioEncoder.isConfigSupported(config)).supported) throw new Error('Opus encoding not supported')
+    }
     this.info = { codec: 'opus', sampleRate, numberOfChannels }
     this.encoder = new AudioEncoder({
       output: (chunk) => {
@@ -82,7 +88,7 @@ export class AudioPipeline {
           key: true,
           layer: 0,
           audio: true,
-          // From the audio's own timestamps (regular 20 ms spacing), anchored to the wall clock
+          // From the audio's own timestamps (regular frame spacing), anchored to the wall clock
           // once: the encoder's output timing is bursty.
           captureTime: this.captureTimeOf(chunk.timestamp),
           data,
@@ -283,7 +289,7 @@ export class AudioPlayer {
       // nextSeq is missing: wait unless a later frame is due within a frame's time.
       if (!this.pending.size) return
       const later = Math.min(...this.pending.keys())
-      if (this.pending.get(later)!.renderAt - wallClock() > 20) return
+      if (this.pending.get(later)!.renderAt - wallClock() > AUDIO_FRAME_MS) return
       this.stats.skipped += later - this.nextSeq
       this.nextSeq = later
     }

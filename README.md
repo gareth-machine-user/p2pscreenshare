@@ -25,10 +25,11 @@ only to find the lobby; no media server is involved.
   arrival times. The default profile favours complete frames over delay (see
   [Quality versus latency](#quality-versus-latency)); the low-latency profile measured about
   **70 ms** glass-to-glass in local e2e tests.
-- **Gapless audio.** Opus frames ride on every stripe of the full channel. A small jitter buffer
-  reorders them and decodes in sequence, and chunks are played back to back, re-syncing to the
-  playout clock only when they drift. Catch-up replays and upload probes are paced so live audio
-  never waits behind them.
+- **Gapless audio.** 128 kbps Opus tuned for music, in 40 ms frames that ride on every stripe of
+  the full channel (the first copy to arrive wins). A small jitter buffer reorders frames and
+  decodes them in sequence, and an AudioWorklet plays them as one continuous stream, correcting
+  drift by playing up to 1% fast or slow and fading across real gaps, so there are no clicks.
+  Catch-up replays and upload probes are paced so live audio never waits behind them.
 - **Graceful degradation.** Uplink queues drop temporal enhancement layers (T2, then T1) first, so
   an overloaded relay lowers the frame rate instead of stalling. A relay cache of the frames since
   the last keyframe (the GOP) lets new or re-attached children start decoding immediately.
@@ -242,8 +243,10 @@ Each media message is one fragment: a 40-byte header (version, flags with key/au
 and the temporal layer, epoch, frame seq, GOP id, reference seq, capture time, k, m, piece,
 stripe, frame length, fragment index and count, and the u32 channel id) followed by up to about
 16 KB of payload and the publisher's 64-byte Ed25519 signature (`WIRE_VERSION` 3). See
-`src/proto/framing.ts`. Audio (Opus) is tiny, so it is sent unsplit on every stripe of the full
-channel.
+`src/proto/framing.ts`. Audio (Opus, 40 ms frames) is small, so it is sent unsplit on every stripe
+of the full channel. That costs `k+m` times its bitrate, but whichever copy arrives first wins, so
+audio rides past a stripe that is briefly backed up. Sending fewer copies (or erasure coding audio
+like video) caused audible dropouts while viewers joined in e2e tests.
 
 ## Failure handling and recovery
 

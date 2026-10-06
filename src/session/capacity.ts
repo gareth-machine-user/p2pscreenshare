@@ -119,10 +119,18 @@ export class CapacityEstimator {
   }
 }
 
+/** Opus bitrate: near-transparent stereo for music and game audio (64 kbps sounded compressed). */
+export const AUDIO_KBPS = 128
+/** Opus frame length. 40 ms rather than 20: half as many pieces, so half the per-piece header
+ *  and signature overhead, for 20 ms more delay (small next to the playout delay). */
+export const AUDIO_FRAME_MS = 40
+
 /** Kbps of one stripe: 1/k of the video plus framing, signatures and (duplicated) audio. */
 export function stripeKbpsFor(bitrateKbps: number, k: number, audio: boolean): number {
-  // ~30 video and ~50 audio fragments per second, each with a 64-byte signature.
-  return (bitrateKbps / k) * 1.05 + 15 + (audio ? 70 + 26 : 0)
+  // ~30 video fragments per second. Every stripe carries every audio frame whole, each with a
+  // 40-byte header and a 64-byte signature.
+  const audioKbps = AUDIO_KBPS + ((1000 / AUDIO_FRAME_MS) * (40 + 64) * 8) / 1000
+  return (bitrateKbps / k) * 1.05 + 15 + (audio ? audioKbps : 0)
 }
 
 /**

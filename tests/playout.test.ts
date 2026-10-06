@@ -83,6 +83,22 @@ describe('audio playout', () => {
     expect(maxJump).toBeLessThan(0.08)
   })
 
+  it('after a stall, keeps the audio that arrives late instead of measuring it against the stalled timeline', () => {
+    // Chunks 50-59 are lost; 60-69 arrive together, a little after chunk 60 was due.
+    const target = (k: number) => 0.2 + (k * CHUNK) / SRC
+    const { p, maxJump } = run(3, {
+      skip: (k) => k >= 50 && k < 60,
+      arrive: (k) => (k >= 50 && k < 70 ? target(65) - 0.02 : target(k) - 0.15),
+    })
+    expect(p.stats.underruns).toBe(1)
+    // Only what was already overdue on arrival is dropped (~80 ms), not the length of the stall too.
+    expect(p.stats.droppedSamples / SRC).toBeLessThan(0.11)
+    // Silent from where chunk 50 was due until the late chunks arrived (~300 ms).
+    expect(p.stats.silentMs).toBeGreaterThan(250)
+    expect(p.stats.silentMs).toBeLessThan(340)
+    expect(maxJump).toBeLessThan(0.08)
+  })
+
   it('re-syncs with fades when the timeline jumps', () => {
     // The playout delay jumps 300 ms later at chunk 80.
     const { p, maxJump } = run(5, { target: (k) => 0.2 + (k * CHUNK) / SRC + (k >= 80 ? 0.3 : 0), arrive: (k) => 0.05 + (k * CHUNK) / SRC })

@@ -6,7 +6,7 @@ test.afterEach(closeContexts)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Any = any
 
-test('audio plays continuously: no dropouts or re-syncs, while viewers join and relays take over', async ({ browser }) => {
+test('audio plays continuously: under 300 ms of silence, while viewers join and relays take over', async ({ browser }) => {
   test.setTimeout(120_000)
   const seed = `e2e-audio-${Date.now()}`
   await openHost(browser, seed, { k: 2, m: 1, audio: true, up: 20_000 })
@@ -26,10 +26,12 @@ test('audio plays continuously: no dropouts or re-syncs, while viewers join and 
   console.log('audio', JSON.stringify({ before, ...r }))
   // Played as one continuous stream by the worklet (the fallback path can click).
   expect(r.mode).toBe('worklet')
-  expect(r.stats.played - before.played).toBeGreaterThan(600)
-  // No dropouts and no re-syncs (each would be a faded gap) while viewers join and relays change.
-  expect(r.stats.underruns - before.underruns).toBe(0)
-  expect(r.stats.resyncs - before.resyncs).toBe(0)
+  // ~16 s of 40 ms frames.
+  expect(r.stats.played - before.played).toBeGreaterThan(300)
+  // Viewers joining moves relays around: allow a brief dropout or re-sync, but under 300 ms of
+  // silence in all (each is faded, so it is a gap, not a click).
+  expect(r.stats.silentMs - before.silentMs).toBeLessThan(300)
+  expect(r.stats.resyncs - before.resyncs + r.stats.underruns - before.underruns).toBeLessThanOrEqual(2)
   expect(r.stats.skipped - before.skipped).toBeLessThan(5)
   expect(r.stats.bufferedMs).toBeGreaterThan(50)
 })

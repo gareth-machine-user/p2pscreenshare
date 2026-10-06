@@ -1,11 +1,9 @@
 <script lang="ts">
   let {
     requests,
-    nameOf,
     onrespond,
   }: {
-    requests: { id: string }[]
-    nameOf: (id: string) => string
+    requests: { id: string; name: string }[]
     onrespond: (id: string, answer: 'allow' | 'allow-all' | 'deny' | 'deny-all') => void
   } = $props()
 </script>
@@ -13,7 +11,7 @@
 <div class="toasts" aria-live="polite">
   {#each requests as r (r.id)}
     <div class="toast" data-testid="publish-request" data-peer={r.id}>
-      <div><b>{nameOf(r.id)}</b> wants to share their screen.</div>
+      <div><b>{r.name}</b> wants to share their screen.</div>
       <div class="toast-actions">
         <button class="primary" data-testid="allow" onclick={() => onrespond(r.id, 'allow')}>Allow</button>
         <button data-testid="allow-all" onclick={() => onrespond(r.id, 'allow-all')}>Allow all</button>

@@ -224,7 +224,8 @@
       canShare: session.canShare,
       sharing: !!session.publishing,
       request: session.requestState,
-      requests: [...session.requests.values()],
+      // Names resolved here, each tick: a requester's renamed record can arrive after its request.
+      requests: [...session.requests.values()].map((r) => ({ id: r.id, name: nameOf(r.id) })),
       policy: session.policy,
       revoked: session.revokedNotice,
       presenterAudio: session.publishing?.audio ?? null,
@@ -520,7 +521,7 @@
 {/if}
 
 {#if lobby?.requests.length}
-  <RequestToasts requests={lobby.requests} {nameOf} onrespond={(id, a) => void session?.respond(id, a)} />
+  <RequestToasts requests={lobby.requests} onrespond={(id, a) => void session?.respond(id, a)} />
 {/if}
 
 {#if dialogOpen}

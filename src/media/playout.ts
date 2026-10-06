@@ -21,6 +21,8 @@ export interface PlayoutStats {
   bufferedMs: number
   /** Smoothed timing error (positive: playing early), ms. */
   errorMs: number
+  /** Silence output since playback first started (dropouts, re-sync waits), ms. */
+  silentMs: number
 }
 
 export class Playout {
@@ -45,6 +47,10 @@ export class Playout {
   /** Chunk starts and their target play times (output-clock seconds), oldest first. */
   anchors: { idx: number; target: number }[] = []
   playing = false
+  /** Playback has started at least once (silence before that isn't a dropout). */
+  started = false
+  /** The current fade-out is because the buffer is running dry (not a re-sync). */
+  fadingDry = false
   gain = 0
   gainTarget = 0
   errEma = 0
@@ -56,7 +62,7 @@ export class Playout {
     this.resyncS = 0.12
     this.maxSkew = 0.01
     this.skewGain = 0.5
-    this.stats = { resyncs: 0, underruns: 0, droppedSamples: 0, bufferedMs: 0, errorMs: 0 }
+    this.stats = { resyncs: 0, underruns: 0, droppedSamples: 0, bufferedMs: 0, errorMs: 0, silentMs: 0 }
   }
 
   reset(): void {
@@ -67,9 +73,24 @@ export class Playout {
     this.readPos = 0
     this.anchors = []
     this.playing = false
+    this.started = false
+    this.fadingDry = false
     this.gain = 0
     this.gainTarget = 0
     this.errEma = 0
+  }
+
+  /** Stops after running dry. The few samples left can't be played smoothly, and keeping them
+   *  would leave the playhead on the stalled timeline, so the next chunk would look overdue by
+   *  the length of the stall and be dropped. */
+  stopDry(): void {
+    this.playing = false
+    this.fadingDry = false
+    this.gain = 0
+    this.gainTarget = 0
+    // Skip to the start of the next chunk (one may have arrived during the fade), else the end.
+    const next = this.anchors.find((a) => a.idx > this.readPos)
+    this.readPos = next ? next.idx : this.writeIdx
   }
 
   /** Queues one chunk of planar samples that should start playing at output-clock time `target`. */
@@ -129,6 +150,8 @@ export class Playout {
     const len = out[0]?.length ?? 0
     for (const o of out) o.fill(0)
     if (!len || !this.rate) return
+    if (!this.playing && this.started) this.stats.silentMs += (len / this.outRate) * 1000
+    this.stats.bufferedMs = Math.max(0, ((this.writeIdx - this.readPos) / this.rate) * 1000)
     // Forget anchors the playhead has passed (keeping the one it is in).
     while (this.anchors.length > 1 && this.anchors[1].idx <= this.readPos) this.anchors.shift()
 
@@ -146,7 +169,10 @@ export class Playout {
       }
       const wait = Math.round((target - now) * this.outRate)
       if (wait >= len) return
+      if (this.started) this.stats.silentMs -= ((len - Math.max(0, wait)) / this.outRate) * 1000
       this.playing = true
+      this.started = true
+      this.fadingDry = false
       this.gain = 0
       this.gainTarget = 1
       this.errEma = 0
@@ -173,10 +199,11 @@ export class Playout {
       if (avail / step <= this.fadeLen + 2 && this.gainTarget > 0) {
         this.stats.underruns++
         this.gainTarget = 0
+        this.fadingDry = true
       }
       if (avail < 2) {
-        this.playing = false
-        this.gain = 0
+        this.stopDry()
+        this.stats.silentMs += ((len - n) / this.outRate) * 1000
         break
       }
       const i = Math.floor(this.readPos)
@@ -196,7 +223,9 @@ export class Playout {
       else if (this.gain > this.gainTarget) this.gain = Math.max(this.gainTarget, this.gain - fadeStep)
       if (this.gain === 0 && this.gainTarget === 0) {
         // Faded out (re-sync or running dry): start again from the target timeline.
-        this.playing = false
+        if (this.fadingDry) this.stopDry()
+        else this.playing = false
+        if (n + 1 < len) this.stats.silentMs += ((len - n - 1) / this.outRate) * 1000
         break
       }
     }
