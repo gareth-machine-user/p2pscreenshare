@@ -1,7 +1,9 @@
 import { defineConfig } from '@playwright/test'
 
-const TRACKER_PORT = 8765
-const APP_PORT = 5179
+// Overridable so two checkouts can run suites side by side: servers on these ports are reused
+// (reuseExistingServer), so a shared port would silently test the other checkout's code.
+const TRACKER_PORT = Number(process.env.E2E_TRACKER_PORT) || 8765
+const APP_PORT = Number(process.env.E2E_APP_PORT) || 5179
 
 export default defineConfig({
   testDir: './e2e',
