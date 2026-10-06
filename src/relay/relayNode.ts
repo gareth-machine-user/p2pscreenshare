@@ -2,16 +2,17 @@ import { decodeFragment, peekIsKey, peekLayer, withReplayFlag, type Fragment, ty
 import type { MediaLink } from '../net/link'
 import { after } from '../net/ticker'
 import type { Uplink } from '../net/uplink'
+import { tuning } from '../tuning'
 
 const SEEN_RETAIN_MS = 5000
 const MAX_CACHE_BYTES = 6 * 1024 * 1024
 /** Replayed GOP fragments may wait longer in the queue than live ones. */
-const REPLAY_MAX_AGE_MS = 2500
+const REPLAY_MAX_AGE_MS = tuning.replayMaxAgeMs
 /**
  * Keyframe fragments may wait longer than other base-layer fragments: a late keyframe still unlocks
  * every frame after it, while dropping one leaves an overloaded child unable to decode at all.
  */
-const KEY_MAX_AGE_MS = 2000
+const KEY_MAX_AGE_MS = tuning.keyMaxAgeMs
 
 interface StripeCache {
   gopId: number
@@ -161,10 +162,12 @@ export class RelayNode {
     if (kids?.size) {
       const layer = peekLayer(frag.raw)
       const maxAge = h.key ? KEY_MAX_AGE_MS : undefined
+      // Pieces of one frame on one stripe: if any fragment misses its deadline, the rest go too.
+      const frame = h.fragCount > 1 ? `${h.channel >>> 0}:${h.stripe}:${h.epoch}:${h.frameSeq}` : undefined
       for (const child of kids) {
         if (child === from) continue
         const link = this.linkFor(child)
-        if (link) this.uplink.send(link, frag.raw, layer, maxAge)
+        if (link) this.uplink.send(link, frag.raw, layer, maxAge, false, frame)
       }
     }
 

@@ -18,6 +18,7 @@ import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer,
 import { plan } from '../topology/planner'
 import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
 import { after, every } from '../net/ticker'
+import { tuning } from '../tuning'
 
 export interface ShareOptions {
   k: number
@@ -117,8 +118,11 @@ export class ChannelPublisher {
   private stopped = false
   /** Bytes emitted per stripe since the last measurement, and the smoothed result (kbps). */
   private stripeBytes: number[] = []
+  /** Busiest stripe's rate in each recent quarter-second window (kbps), newest last. */
+  private stripeSamples: number[] = []
   private measuredStripeKbps = 0
   private announcedStripeKbps = 0
+  private lastAnnounceAt = 0
   private lastMeasureAt = performance.now()
   /** Excess lateness (ms) per `${parent}:${stripe}`, from children's reports. */
   readonly lateness = new Map<string, number>()
@@ -142,24 +146,28 @@ export class ChannelPublisher {
     this.timers.push(every(REPLAN_INTERVAL_MS, () => this.replan()))
     this.timers.push(every(250, () => this.checkLiveness()))
     this.timers.push(every(TOPOLOGY_REPORT_MS, () => void this.sendTopology()))
-    this.timers.push(every(2000, () => this.measureStripes()))
+    this.timers.push(every(250, () => this.measureStripes()))
   }
 
   /**
-   * Encoders overshoot their target (keyframes, variable bitrate), so the stripe bitrate that
-   * relays plan their slots with is the larger of the nominal one and what is actually sent.
+   * Encoders overshoot their target (keyframes, motion), and relays must carry the bursts, not
+   * just the average: the stripe bitrate that relays plan their slots with is the larger of the
+   * nominal one and the 90th percentile of quarter-second rates over the last 10 s.
    */
   private measureStripes(): void {
     const now = performance.now()
     const dt = now - this.lastMeasureAt
     this.lastMeasureAt = now
     if (dt <= 0) return
-    const peak = (Math.max(0, ...this.stripeBytes) * 8) / dt
+    this.stripeSamples.push((Math.max(0, ...this.stripeBytes) * 8) / dt)
     this.stripeBytes = []
-    this.measuredStripeKbps = this.measuredStripeKbps === 0 ? peak : this.measuredStripeKbps * 0.7 + peak * 0.3
+    if (this.stripeSamples.length > 40) this.stripeSamples.shift()
+    const sorted = [...this.stripeSamples].sort((a, b) => a - b)
+    this.measuredStripeKbps = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))]
     const kbps = this.stripeKbps
-    if (Math.abs(kbps - this.announcedStripeKbps) > this.announcedStripeKbps * 0.1) {
+    if (now - this.lastAnnounceAt >= 2000 && Math.abs(kbps - this.announcedStripeKbps) > this.announcedStripeKbps * 0.1) {
       this.announcedStripeKbps = kbps
+      this.lastAnnounceAt = now
       this.ctx.announce()
     }
   }
@@ -684,7 +692,9 @@ export class PublishedStream {
   constructor(
     readonly opts: ShareOptions,
     private ctx: PublisherContext,
-  ) {}
+  ) {
+    this.ceilingKbps = opts.bitrateKbps
+  }
 
   get full(): ChannelPublisher | undefined {
     return this.channels.find((c) => c.kind === 'full')
@@ -725,13 +735,13 @@ export class PublishedStream {
     this.channels.push(full, preview)
 
     const vt = stream.getVideoTracks()[0]
-    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: 30, keyframeIntervalMs: 2000 })
+    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: 30, keyframeIntervalMs: tuning.keyframeIntervalMs })
     this.video.onFrame = (f) => full.emit(f)
     this.video.onStreamInfo = (info) => full.setStream({ ...info, audio: this.audioPipe?.info ?? undefined })
     this.video.onRawFrame = (frame) => this.feedPreview(frame)
     void this.video.start()
 
-    this.preview = new VideoPipeline(null, { bitrateKbps: PREVIEW.kbps, fps: PREVIEW.fps, keyframeIntervalMs: 2000 })
+    this.preview = new VideoPipeline(null, { bitrateKbps: PREVIEW.kbps, fps: PREVIEW.fps, keyframeIntervalMs: tuning.keyframeIntervalMs })
     this.preview.onFrame = (f) => preview.emit(f)
     this.preview.onStreamInfo = (info) => preview.setStream(info)
 
@@ -773,6 +783,7 @@ export class PublishedStream {
   async setQuality(bitrateKbps: number, maxSize?: [number, number]): Promise<void> {
     const full = this.full
     if (!full || !this.video) return
+    this.ceilingKbps = bitrateKbps
     full.kbps = bitrateKbps
     ;(this.opts as { bitrateKbps: number }).bitrateKbps = bitrateKbps
     this.video.setBitrate(bitrateKbps)
@@ -782,6 +793,20 @@ export class PublishedStream {
       ;(this.opts as { maxSize?: [number, number] }).maxSize = maxSize
     }
     full.limited = null
+    this.ctx.announce()
+  }
+
+  /** The most the bitrate may go up to: the quality the presenter chose. */
+  ceilingKbps: number
+
+  /** Adapts the encoder's bitrate (congestion control) without changing the chosen quality. */
+  adaptBitrate(kbps: number): void {
+    const full = this.full
+    if (!full || !this.video) return
+    const next = Math.round(Math.min(this.ceilingKbps, Math.max(300, kbps)) / 50) * 50
+    if (next === full.kbps) return
+    full.kbps = next
+    this.video.setBitrate(next)
     this.ctx.announce()
   }
 
@@ -801,6 +826,7 @@ export class PublishedStream {
     return {
       codec: v.codec,
       targetKbps: this.full?.kbps ?? this.opts.bitrateKbps,
+      ceilingKbps: this.ceilingKbps,
       kbps: Math.round((r.bytes * 8) / 1000),
       captureFps: round1(r.captured),
       encodedFps: round1(r.encoded),

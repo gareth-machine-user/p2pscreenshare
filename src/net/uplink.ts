@@ -1,14 +1,18 @@
 import { LINK_BUFFER_HIGH, type MediaLink } from './link'
+import { tuning } from '../tuning'
 
-// Per-layer queueing deadlines: when the uplink can't keep up, enhancement layers (T2, then T1)
-// expire first, so overloaded relays degrade frame rate instead of stalling the base layer.
-const MAX_AGE_MS_BY_LAYER = [900, 350, 180, 180]
+// Per-layer queueing deadlines (see tuning.ts): when the uplink can't keep up, enhancement layers
+// (T2, then T1) expire first, so overloaded relays degrade frame rate instead of stalling the
+// base layer.
+const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
 
 interface Item {
   data: Uint8Array
   layer: number
   /** GOP-cache replay for a newly attached child: queued behind live fragments. */
   replay: boolean
+  /** Which frame this fragment belongs to: once one fragment of a frame is dropped, the rest are useless. */
+  frame?: string
   enqueuedAt: number
   maxAge: number
 }
@@ -66,6 +70,8 @@ export class Uplink {
 
   /** Links whose traffic only uses spare upload (e.g. probes): served when no media is waiting. */
   private background = new Set<MediaLink>()
+  /** Per link: frames that already lost a fragment there (until when to remember them). */
+  private deadFrames = new Map<MediaLink, Map<string, number>>()
 
   setBackground(link: MediaLink, on = true): void {
     if (on) this.background.add(link)
@@ -76,13 +82,19 @@ export class Uplink {
    * Queues one message for a link. Replayed (GOP cache) fragments wait behind live ones: a new
    * child's live frames then arrive on time and its jitter buffer isn't inflated by the backlog.
    */
-  send(link: MediaLink, data: Uint8Array, layer: number, maxAgeMs?: number, replay = false): void {
+  send(link: MediaLink, data: Uint8Array, layer: number, maxAgeMs?: number, replay = false, frame?: string): void {
+    // The rest of a frame that already lost a fragment on this link would only waste upload.
+    if (frame && this.deadFrames.get(link)?.has(frame)) {
+      this.stats.droppedItems++
+      this.stats.droppedByLayer[Math.min(3, layer)]++
+      return
+    }
     let q = this.queues.get(link)
     if (!q) {
       q = []
       this.queues.set(link, q)
     }
-    const item = { data, layer, replay, enqueuedAt: performance.now(), maxAge: maxAgeMs ?? MAX_AGE_MS_BY_LAYER[layer] ?? 900 }
+    const item: Item = { data, layer, replay, frame, enqueuedAt: performance.now(), maxAge: maxAgeMs ?? MAX_AGE_MS_BY_LAYER[layer] ?? 900 }
     const firstReplay = replay ? -1 : q.findIndex((it) => it.replay)
     if (firstReplay >= 0) q.splice(firstReplay, 0, item)
     else q.push(item)
@@ -100,6 +112,7 @@ export class Uplink {
     if (q) for (const it of q) this.stats.queuedBytes -= it.data.byteLength
     this.queues.delete(link)
     this.background.delete(link)
+    this.deadFrames.delete(link)
   }
 
   /** Called when a link's send buffer drains. */
@@ -121,12 +134,21 @@ export class Uplink {
       const now = performance.now()
       this.refill(now)
       // Expired items go once per drain (not once per pass: that made a congested drain quadratic).
+      // A frame that loses one fragment loses all of them on that link (frame-aware dropping).
       for (const [link, q] of this.queues) {
         if (!q.length) continue
         const bg = this.background.has(link)
+        let dead = this.deadFrames.get(link)
+        if (dead) for (const [f, until] of dead) if (now > until) dead.delete(f)
+        for (const it of q) {
+          if (it.frame && now - it.enqueuedAt > it.maxAge) {
+            if (!dead) this.deadFrames.set(link, (dead = new Map()))
+            dead.set(it.frame, now + 2000)
+          }
+        }
         let kept = 0
         for (const it of q) {
-          if (now - it.enqueuedAt > it.maxAge) this.drop(it, bg)
+          if (now - it.enqueuedAt > it.maxAge || (it.frame && dead?.has(it.frame))) this.drop(it, bg)
           else q[kept++] = it
         }
         q.length = kept

@@ -29,23 +29,27 @@ const CANDIDATES: Candidate[] = [
 ]
 
 async function pickConfig(width: number, height: number, o: VideoEncoderOptions): Promise<VideoEncoderConfig> {
-  for (const c of CANDIDATES) {
-    const config: VideoEncoderConfig = {
-      codec: c.codec,
-      width,
-      height,
-      bitrate: o.bitrateKbps * 1000,
-      framerate: o.fps,
-      latencyMode: 'realtime',
-      bitrateMode: 'variable',
-      ...(c.scalabilityMode ? { scalabilityMode: c.scalabilityMode } : {}),
-      ...(c.avc ? { avc: c.avc } : {}),
-    }
-    try {
-      const res = await VideoEncoder.isConfigSupported(config)
-      if (res.supported) return res.config ?? config
-    } catch {
-      // try next
+  // Constant bitrate first: fast motion then costs quality instead of making frames several times
+  // the average size, which would overflow the uplinks the relay trees were planned for.
+  for (const bitrateMode of ['constant', 'variable'] as const) {
+    for (const c of CANDIDATES) {
+      const config: VideoEncoderConfig = {
+        codec: c.codec,
+        width,
+        height,
+        bitrate: o.bitrateKbps * 1000,
+        framerate: o.fps,
+        latencyMode: 'realtime',
+        bitrateMode,
+        ...(c.scalabilityMode ? { scalabilityMode: c.scalabilityMode } : {}),
+        ...(c.avc ? { avc: c.avc } : {}),
+      }
+      try {
+        const res = await VideoEncoder.isConfigSupported(config)
+        if (res.supported) return res.config ?? config
+      } catch {
+        // try next
+      }
     }
   }
   throw new Error('No supported WebCodecs video encoder configuration')

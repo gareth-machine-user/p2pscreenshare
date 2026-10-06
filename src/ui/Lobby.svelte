@@ -321,6 +321,7 @@
       loss: sub?.loss ?? null,
       uplinkRates: s.uplinkStatsNow,
       encoderRates: s.encoderStatsNow,
+      ccReason: s.ccReason,
       channel: presenting ? (pub?.id ?? null) : (sub?.channel ?? null),
       tiles,
       pub: pub
@@ -444,7 +445,7 @@
                   <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
                   <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
                 </div>
-                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} />
+                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.ccReason} />
               {:else}
                 <div class="stats-grid" data-testid="viewer-stats">
                   <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>

@@ -22,7 +22,9 @@ only to find the lobby; no media server is involved.
   make-before-break. The planner fails together with the stream it plans, so there is no leader.
 - **Cut-through forwarding and low latency.** Relays forward each fragment as soon as it arrives.
   A jitter buffer that tracks reference dependencies plays out at the 95th percentile of frame
-  arrival times. Measured glass-to-glass latency in local e2e tests is about **70 ms**.
+  arrival times. The default profile favours complete frames over delay (see
+  [Quality versus latency](#quality-versus-latency)); the low-latency profile measured about
+  **70 ms** glass-to-glass in local e2e tests.
 - **Graceful degradation.** Uplink queues drop temporal enhancement layers (T2, then T1) first, so
   an overloaded relay lowers the frame rate instead of stalling. A relay cache of the frames since
   the last keyframe (the GOP) lets new or re-attached children start decoding immediately.
@@ -79,6 +81,7 @@ Useful URL parameters (put them in the page query or the hash query):
 | `tracker=ws://a,wss://b` | Tracker URLs to use instead of the public defaults |
 | `ice=none` / `ice=stun:…,turn:…` | ICE servers (`none` for LAN or tests; add TURN for hostile NATs) |
 | `name=…` | Display name for this page only |
+| `priority=latency` | Low-latency tuning instead of the default quality profile (see [Quality versus latency](#quality-versus-latency)) |
 | `up=800` | Debug upload cap in kbps (token-bucket shaper) to emulate a weak peer; applies to presenters too |
 | `share=1` | Share right away (asking the owner first if needed) with the overrides below; used by the e2e tests |
 | `k`, `m`, `bitrate`, `quality=auto` | With `share=1`: data and parity stripes, video kbps, Auto quality |
@@ -338,6 +341,39 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Upload-starved audience | `k=1, m=0` or `k=4, m=1` with a lower bitrate | Parity overhead competes with capacity you don't have |
 | Large audience with strong uplinks | `k=8, m=2..4` with a higher `maxFanout` | Most resilient per byte of overhead; needs many relays |
 
+### Quality versus latency
+
+`src/tuning.ts` holds every knob that trades delay for smooth, complete frames. The default
+**quality** profile suits screen sharing; `?priority=latency` picks the low-latency one.
+
+| Knob | Quality (default) | Latency | Why |
+|---|---|---|---|
+| Uplink deadlines T0 / T1 / T2 | 2500 / 1500 / 800 ms | 900 / 350 / 180 ms | Bursts drain from the queue instead of costing frames |
+| Keyframe / replay deadline | 4 s | 2 / 2.5 s | Keyframes and GOP replays survive overload |
+| Jitter buffer | 99th percentile + 120 ms, ≥ 150 ms | 95th percentile + 40 ms | Far fewer late or skipped frames on jittery paths |
+| Media channel retransmits | up to 3 s | up to 1 s | Lost packets are re-sent instead of lost |
+| Congestion back-off | queueing > 800 ms | queueing > 250 ms | The bitrate drops only on real congestion |
+| Stripe-silence detection | 1.5 s | 1 s | Fewer false reattaches |
+| Keyframe interval | 3 s | 2 s | More bits for detail at the same bitrate; joins replay the cached GOP |
+
+Rate control, in both profiles:
+- **Constant-bitrate encoding.** Fast motion costs a little sharpness instead of producing frames
+  several times the average size, which would overflow the uplinks the relay trees were planned
+  for.
+- **Planning for peaks.** The publisher announces the 90th percentile of quarter-second stripe
+  rates over the last 10 s, so relay slots cover bursts.
+- **Frame-aware dropping.** When one fragment of a frame misses its deadline on a link, the rest of
+  that frame's fragments on that link are dropped too, freeing upload for frames that can still
+  play.
+- **Congestion control.** Every 2 s the publisher lowers its bitrate by 25% (by half when clearly
+  swamped) while its uplink drops fragments or queues them for long, or the median viewer loses
+  frames, and raises it by 15% after 10 s clean, never above the chosen quality. The presenter's
+  Stats show why it last changed. Changes apply in place, with no new capture.
+
+Every place a frame can go missing is counted and shown in **Stats** (and per viewer in
+**Topology**): frames dropped by the encoder, uplink fragments dropped by temporal layer and
+queueing delay, and frames a viewer received incomplete, late, undecodable or skipped.
+
 ### Knobs
 
 | Knob | Where | Default | Effect |
@@ -348,12 +384,11 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | `MAX_FANOUT` | `session/capacity.ts` | 16 | Children per relay. Higher uses strong peers fully but enlarges each failure's blast radius. |
 | `minUptimeMsForRelay` | `ChannelPublisher.plannerConfig` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |
 | `switchGain`, `rttSwitchMs` | `ChannelPublisher.plannerConfig` | 1, 40 | How many levels shallower (or ms closer) a parent must be before a peer is moved. Higher means less churn. |
-| `STRIPE_SILENCE_MS` | `session/subscription.ts` | 1000 | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
+| `STRIPE_SILENCE_MS` | `tuning.ts` | 1500 (quality) | Failure detection time, which dominates `m=0` recovery. Lower recovers faster but risks false alarms on jittery links. |
 | `REATTACH_BATCH_MS`, `LIVENESS_TIMEOUT_MS` | `session/publisher.ts` | 400, 1200 | Collateral-blame window, and the dead-parent confirmation timeout |
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
-| `keyframeIntervalMs` | `PublishedStream.start` | 2000 | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
-| Layer deadlines | `uplink.ts` `MAX_AGE_MS_BY_LAYER` | T0 900, T1 350, T2 180 ms | How long an overloaded relay queues each temporal layer before dropping it |
-| Playout quantile / safety | `PlayoutClock` | 0.95 / 40 ms | Latency vs late-frame drops |
+| `keyframeIntervalMs` | `tuning.ts` | 3000 (quality) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
+| Layer deadlines, jitter buffer, retransmits | `tuning.ts` | see the table above | Latency vs complete, smooth frames |
 
 ## Tests
 

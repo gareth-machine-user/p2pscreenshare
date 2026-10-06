@@ -52,7 +52,9 @@ export interface UplinkRates {
 /** A publisher's encoder, per second over the last stats window. */
 export interface EncoderRates {
   codec: string | null
+  /** Current encoder target, and the most it may go up to (the chosen quality preset). */
   targetKbps: number
+  ceilingKbps: number
   kbps: number
   captureFps: number
   encodedFps: number

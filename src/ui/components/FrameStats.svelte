@@ -7,11 +7,14 @@
     renderedFps = null,
     uplink = null,
     encoder = null,
+    adapting = null,
   }: {
     loss?: LossRates | null
     renderedFps?: number | null
     uplink?: UplinkRates | null
     encoder?: EncoderRates | null
+    /** Why the presenter's bitrate last changed. */
+    adapting?: string | null
   } = $props()
 
   const n = (x: number) => (x === 0 ? '0' : x < 10 ? x.toFixed(1) : Math.round(x).toString())
@@ -24,12 +27,13 @@
     <h4>Encoder</h4>
     <div class="stats-grid" data-testid="encoder-stats">
       <div><span>Codec</span><b>{encoder.codec ?? '—'}</b></div>
-      <div><span>Bitrate (target)</span><b>{fmtKbps(encoder.kbps)} ({fmtKbps(encoder.targetKbps)})</b></div>
+      <div><span>Bitrate (target / max)</span><b>{fmtKbps(encoder.kbps)} ({fmtKbps(encoder.targetKbps)} / {fmtKbps(encoder.ceilingKbps)})</b></div>
       <div><span>Captured → encoded fps</span><b>{n(encoder.captureFps)} → {n(encoder.encodedFps)}</b></div>
       <div><span>Dropped by encoder /s</span><b class:warn={warn(encoder.droppedFps)} data-testid="encoder-dropped">{n(encoder.droppedFps)}</b></div>
       <div><span>Encode time</span><b>{fmtMs(encoder.encodeMs)}</b></div>
       <div><span>Biggest frame</span><b>{n(encoder.maxFrameKB)} KB</b></div>
       <div><span>Keyframes /s</span><b>{n(encoder.keyframes)}</b></div>
+      {#if adapting}<div><span>Bitrate control</span><b data-testid="cc-reason">{adapting}</b></div>{/if}
     </div>
   {/if}
   {#if loss}

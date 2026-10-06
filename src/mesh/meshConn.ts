@@ -4,6 +4,7 @@
 // so joining or switching parents never needs new ICE or DTLS setup.
 import { wallClock } from '../net/clock'
 import { LINK_BUFFER_LOW, type LinkState, type MediaLink } from '../net/link'
+import { tuning } from '../tuning'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
 const CONNECT_TIMEOUT_MS = 15_000
@@ -48,7 +49,7 @@ export class MeshConn implements MediaLink {
     public remoteId: string,
   ) {
     this.pc = new RTCPeerConnection({ iceServers })
-    this.media = this.pc.createDataChannel('media', { negotiated: true, id: 0, ordered: false, maxPacketLifeTime: 1000 })
+    this.media = this.pc.createDataChannel('media', { negotiated: true, id: 0, ordered: false, maxPacketLifeTime: tuning.mediaMaxPacketLifeTimeMs })
     this.ctl = this.pc.createDataChannel('ctl', { negotiated: true, id: 1, ordered: true })
     this.bin = this.pc.createDataChannel('bin', { negotiated: true, id: 2, ordered: true })
     this.media.binaryType = 'arraybuffer'

@@ -21,6 +21,7 @@ import { CapacityEstimator, rebalanceWeights, splitBudget, stripeKbpsFor } from 
 import { PublishedStream, type ChannelPublisher, type PublisherContext, type ShareOptions } from './publisher'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { after, every } from '../net/ticker'
+import { tuning } from '../tuning'
 
 export interface PeerSessionOptions {
   joinCode: string
@@ -59,6 +60,21 @@ const REPROBE_MIN_GAP_MS = 30_000
 const REBALANCE_MS = 10_000
 /** Auto quality: wait this long between automatic restarts of a stream. */
 const AUTO_RESTART_GAP_MS = 30_000
+/**
+ * Congestion control for a presenter's bitrate: back off by 25% (at most every 4 s) while its uplink
+ * drops fragments or queues them for long, or the median viewer loses frames; after 10 s clean,
+ * creep back up by 15% (at most every 10 s), never above the chosen quality.
+ */
+const CC_DOWN = 0.75
+/** Clearly swamped (dropping a lot, or queueing over twice the limit): halve instead. */
+const CC_DOWN_SEVERE = 0.5
+const CC_SEVERE_DROPS_PER_S = 50
+const CC_UP = 1.15
+const CC_DOWN_GAP_MS = 4000
+const CC_UP_AFTER_MS = 10_000
+const CC_DROPS_PER_S = 5
+const CC_QUEUE_MS = tuning.ccQueueMs
+const CC_VIEWER_LOSS = 0.15
 
 /** Auto quality falls back to the preview when the full stream stalls this long... */
 const AUTO_STALL_MS = 6000
@@ -129,6 +145,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private timers: (() => void)[] = []
   private topoWatching = new Set<number>()
   private lastProbeAt = -Infinity
+  private ccLastDown = -Infinity
+  private ccLastUp = -Infinity
+  private ccCleanSince: number | null = null
+  /** Why the congestion controller last moved the bitrate (shown in Stats). */
+  ccReason: string | null = null
   private lastAutoRestart = -Infinity
   private stallSince: number | null = null
   private smoothSince: number | null = null
@@ -559,6 +580,48 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     void s.setQuality(full.limited.feasibleKbps)
   }
 
+  /** Congestion control: see CC_* above. Runs on each 2 s uplink sample. */
+  private adaptBitrate(now: number): void {
+    const s = this.publishing
+    const full = s?.full
+    const up = this.uplinkStatsNow
+    if (!s || !full || !up) return
+    const drops = up.drops[0] + up.drops[1] + up.drops[2]
+    const losses = [...full.subscribers.values()]
+      .filter((x) => x.active && x.stats?.loss)
+      .map((x) => {
+        const l = x.stats!.loss!
+        const lost = l.incomplete + l.late + l.undecodable + l.skipped
+        return lost / Math.max(1, l.incomingFps + lost)
+      })
+      .sort((a, b) => a - b)
+    const viewerLoss = losses.length ? losses[Math.floor(losses.length / 2)] : 0
+    const reason =
+      drops > CC_DROPS_PER_S
+        ? `uplink dropping ${Math.round(drops)} fragments/s`
+        : up.queueMs > CC_QUEUE_MS
+          ? `uplink queueing ${up.queueMs} ms`
+          : viewerLoss > CC_VIEWER_LOSS
+            ? `viewers losing ${Math.round(viewerLoss * 100)}% of frames`
+            : null
+    if (reason) {
+      this.ccCleanSince = null
+      if (now - this.ccLastDown >= CC_DOWN_GAP_MS && full.kbps > 300) {
+        this.ccLastDown = now
+        this.ccReason = `lowered: ${reason}`
+        const severe = drops > CC_SEVERE_DROPS_PER_S || up.queueMs > 2 * CC_QUEUE_MS
+        s.adaptBitrate(full.kbps * (severe ? CC_DOWN_SEVERE : CC_DOWN))
+      }
+      return
+    }
+    this.ccCleanSince ??= now
+    if (full.kbps < s.ceilingKbps && !full.limited && now - this.ccCleanSince >= CC_UP_AFTER_MS && now - this.ccLastUp >= CC_UP_AFTER_MS) {
+      this.ccLastUp = now
+      this.ccReason = 'raised: no congestion for 10 s'
+      s.adaptBitrate(full.kbps * CC_UP)
+    }
+  }
+
   /**
    * Auto mode picks a second parity stripe when the lobby has enough relays: at least two capable
    * relays (two stripes of upload) per stripe.
@@ -678,6 +741,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       queueMs: dN > 0 ? Math.round(dSum / dN) : 0,
     }
     this.encoderStatsNow = this.publishing?.sampleEncoder() ?? null
+    this.adaptBitrate(now)
     this.capacity.observe(this.uplinkNow.kbps, this.uplinkNow.dropRate)
     const dropRate = Math.round(this.uplinkNow.dropRate * 1000) / 1000
     if (dropRate !== (this.mesh.record.dropRate ?? 0)) this.mesh.updateRecord({ dropRate })

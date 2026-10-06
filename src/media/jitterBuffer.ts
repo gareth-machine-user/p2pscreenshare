@@ -1,5 +1,6 @@
 import { NO_REF } from '../proto/framing'
 import type { AssembledFrame } from './reassembler'
+import { tuning } from '../tuning'
 
 export interface PlayoutClockOptions {
   /** Fraction of frames that should arrive before their render time. */
@@ -13,10 +14,10 @@ export interface PlayoutClockOptions {
 }
 
 const DEFAULT_CLOCK: PlayoutClockOptions = {
-  quantile: 0.95,
-  safetyMs: 40,
+  quantile: tuning.playoutQuantile,
+  safetyMs: tuning.playoutSafetyMs,
   windowMs: 8000,
-  minDelayMs: 30,
+  minDelayMs: tuning.playoutMinDelayMs,
   maxDelayMs: 4500,
   slewMsPerSec: 250,
 }

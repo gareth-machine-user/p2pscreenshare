@@ -10,15 +10,16 @@ import type { LossRates, PublisherMsg, StripeStat, SubscriberMsg, SubscriberStat
 import { RateWindow, round1 } from './rates'
 import { treeKey, type RelayNode } from '../relay/relayNode'
 import { every } from '../net/ticker'
+import { tuning } from '../tuning'
 
 const HEALTH_INTERVAL_MS = 250
 const STATS_INTERVAL_MS = 2000
 /**
- * A stripe silent this long means its parent is gone or stalled. Reattaching reuses an existing
- * mesh link, so a false alarm costs little and detection can be quick (the publisher re-encodes
- * the last frame every 400 ms while the screen is idle, so a live stripe is never this quiet).
+ * A stripe silent this long means its parent is gone or stalled (see tuning.ts). Reattaching reuses
+ * an existing mesh link, so a false alarm costs little; the publisher re-encodes the last frame
+ * every 400 ms while the screen is idle, so a live stripe is never this quiet.
  */
-export const STRIPE_SILENCE_MS = 1000
+export const STRIPE_SILENCE_MS = tuning.stripeSilenceMs
 const PARENT_GRACE_MS = 3000
 /** Extra time allowed for a parent whose mesh link is still connecting. */
 const LINK_SETUP_GRACE_MS = 8000
