@@ -119,8 +119,9 @@ export class CapacityEstimator {
   }
 }
 
-/** Opus bitrate: near-transparent stereo for music and game audio (64 kbps sounded compressed). */
-export const AUDIO_KBPS = 128
+/** Opus bitrate: transparent stereo for music and game audio, with headroom for sources that were
+ *  already lossy (e.g. YouTube); 64 kbps sounded compressed. Erasure coded, so cheap per stripe. */
+export const AUDIO_KBPS = 192
 /** Opus frame length. 40 ms rather than 20: half as many pieces, so half the per-piece header
  *  and signature overhead, for 20 ms more delay (small next to the playout delay). */
 export const AUDIO_FRAME_MS = 40

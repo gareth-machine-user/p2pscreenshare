@@ -25,7 +25,7 @@ only to find the lobby; no media server is involved.
   arrival times. The default profile favours complete frames over delay (see
   [Quality versus latency](#quality-versus-latency)); the low-latency profile measured about
   **70 ms** glass-to-glass in local e2e tests.
-- **Gapless audio.** 128 kbps Opus tuned for music, in 40 ms frames erasure coded across the full
+- **Gapless audio.** 192 kbps Opus tuned for music, in 40 ms frames erasure coded across the full
   channel's stripes like the video (any k of the k+m stripes play it). A small jitter buffer
   reorders frames and decodes them in sequence, and an AudioWorklet plays them as one continuous stream, correcting
   drift by playing up to 1% fast or slow and fading across real gaps, so there are no clicks.
@@ -260,8 +260,8 @@ signature per piece, and plays from any `k` stripes. (It used to be copied whole
 a whole connection, which carries several stripes: upload probes and media bursts deep enough to
 stall Chromium's SCTP association. With send buffers capped at 64 KB those are gone, and coded
 audio plays without gaps. Frames copied whole, with k=1 and m=0 on any stripe, are still accepted
-from older publishers.) At k=4, m=2 a stripe carries about 53 kbps of the 128 kbps audio, against
-149 kbps for a whole copy.
+from older publishers.) At k=4, m=2 a stripe carries about 69 kbps of the 192 kbps audio, against
+213 kbps for a whole copy.
 
 ## Failure handling and recovery
 
@@ -328,8 +328,8 @@ k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent c
 
 "Degraded" means some viewer's k-th best stripe passes through a parent whose children need more
 than its true upload. 8+2 degrades heavily because, when these tables were made, every one of its
-10 stripes carried a whole copy of the audio (then about 440 kbps a stripe; with today's 128 kbps
-audio erasure coded, about 380), and most of the upload that could carry them sits with a few
+10 stripes carried a whole copy of the audio (then about 440 kbps a stripe; with today's 192 kbps
+audio erasure coded, about 390), and most of the upload that could carry them sits with a few
 strong peers that the 16-child fanout cap holds back (see below; with `--fanout 48` it is 0). Other options:
 `--lifetime`, `--repair`, `--gossip`, `--fanout`, `--audio`, `--only 4:1,8:2`, and the sweeps below.
 
