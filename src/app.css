@@ -6,6 +6,10 @@
   --muted: #7d8590;
   --accent: #4fa3ff;
   --danger: #ff6b6b;
+  /* Raised controls: buttons, badges. */
+  --raised: #21262d;
+  --warn: #f2c94c;
+  --warn-border: #5b4b1a;
   color-scheme: dark;
   font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
   font-size: 15px;
@@ -70,8 +74,7 @@ label {
   color: var(--muted);
   font-size: 13px;
 }
-label.check,
-label.inline {
+label.check {
   flex-direction: row;
   align-items: center;
   gap: 8px;
@@ -81,14 +84,14 @@ select,
 button {
   font: inherit;
   color: var(--text);
-  background: #0d1117;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 7px 10px;
 }
 button {
   cursor: pointer;
-  background: #21262d;
+  background: var(--raised);
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -193,7 +196,7 @@ tr.stale td {
   margin-bottom: 4px;
 }
 code {
-  background: #0d1117;
+  background: var(--bg);
   padding: 6px 8px;
   border-radius: 6px;
   word-break: break-all;
@@ -240,6 +243,8 @@ h4 {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 .lobby-name {
   white-space: nowrap;
@@ -254,22 +259,18 @@ h4 {
   word-break: normal;
   padding: 4px 6px;
 }
-.members {
-  color: var(--muted);
-  white-space: nowrap;
-}
 .badge {
   font-size: 11px;
   padding: 1px 6px;
   border-radius: 8px;
-  background: #21262d;
+  background: var(--raised);
   color: var(--muted);
   border: 1px solid var(--border);
   white-space: nowrap;
 }
 .badge.warn {
-  color: #f2c94c;
-  border-color: #5b4b1a;
+  color: var(--warn);
+  border-color: var(--warn-border);
 }
 .lobby-body {
   flex: 1;
@@ -641,12 +642,12 @@ button.danger {
   margin: 8px 16px 0;
   padding: 8px 12px;
   border-radius: 8px;
-  border: 1px solid #5b4b1a;
-  color: #f2c94c;
+  border: 1px solid var(--warn-border);
+  color: var(--warn);
   background: rgba(242, 201, 76, 0.08);
 }
 
 .warn,
 td.warn {
-  color: #f2c94c;
+  color: var(--warn);
 }

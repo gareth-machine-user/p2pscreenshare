@@ -1,5 +1,14 @@
 <script lang="ts">
-  import { QUALITY_PRESETS, saveSettings, settings, type QualityPreset, type SourceKind } from '../settings.svelte'
+  import { fmtKbps } from '../route'
+  import {
+    clampStripes,
+    DEFAULT_SETTINGS,
+    QUALITY_PRESETS,
+    saveSettings,
+    settings,
+    STRIPE_LIMITS,
+    type SourceKind,
+  } from '../settings.svelte'
 
   let {
     onstart,
@@ -11,7 +20,7 @@
   }: { onstart: () => void; oncancel: () => void; micSupported?: boolean; title?: string; action?: string } = $props()
 
   const s = settings.share
-  let advanced = $state(s.source === 'test' || s.k !== 4 || s.m !== 1)
+  let advanced = $state(s.source === 'test' || s.k !== DEFAULT_SETTINGS.share.k || s.m !== DEFAULT_SETTINGS.share.m)
   let dialog: HTMLDialogElement | undefined = $state()
 
   $effect(() => {
@@ -26,8 +35,8 @@
 
   function start(e: SubmitEvent) {
     e.preventDefault()
-    s.k = Math.min(16, Math.max(1, Math.round(s.k)))
-    s.m = Math.min(8, Math.max(0, Math.round(s.m)))
+    s.k = clampStripes(s.k, STRIPE_LIMITS.k)
+    s.m = clampStripes(s.m, STRIPE_LIMITS.m)
     saveSettings()
     dialog?.close()
     onstart()
@@ -62,7 +71,7 @@
       Quality
       <select data-testid="quality-preset" bind:value={s.quality}>
         {#each Object.entries(QUALITY_PRESETS) as [value, p]}
-          <option {value}>{p.label}{value === 'auto' ? '' : ` (${(p.kbps / 1000).toFixed(1)} Mbps)`}</option>
+          <option {value}>{p.label}{value === 'auto' ? '' : ` (${fmtKbps(p.kbps)})`}</option>
         {/each}
       </select>
     </label>
@@ -70,8 +79,8 @@
     <details bind:open={advanced}>
       <summary>Advanced</summary>
       <div class="row">
-        <label>Data stripes (k)<input type="number" min="1" max="16" data-testid="k" bind:value={s.k} /></label>
-        <label>Parity stripes (m)<input type="number" min="0" max="8" data-testid="m" bind:value={s.m} /></label>
+        <label>Data stripes (k)<input type="number" min={STRIPE_LIMITS.k.min} max={STRIPE_LIMITS.k.max} data-testid="k" bind:value={s.k} /></label>
+        <label>Parity stripes (m)<input type="number" min={STRIPE_LIMITS.m.min} max={STRIPE_LIMITS.m.max} data-testid="m" bind:value={s.m} /></label>
       </div>
       <label class="check">
         <input
@@ -83,7 +92,7 @@
         Use a test pattern instead of capturing
       </label>
       <p class="hint">
-        Viewers receive {s.k + s.m} stripes of ~{Math.round(QUALITY_PRESETS[s.quality as QualityPreset].kbps / s.k)} kbps
+        Viewers receive {s.k + s.m} stripes of ~{Math.round(QUALITY_PRESETS[s.quality].kbps / s.k)} kbps
         and need any {s.k} to decode. Parity stripes hide a relay leaving.
       </p>
     </details>

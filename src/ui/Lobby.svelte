@@ -5,7 +5,8 @@
   import { DEFAULT_ICE } from '../net/bootstrap'
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publisher'
-  import { fmtKbps, fmtMs, iceFrom, lobbyUrl, numParam, randomId, trackersFrom } from './route'
+  import { fmtKbps, fmtMs, iceFrom, lobbyUrl, randomId, trackersFrom } from './route'
+  import { applyAutoQuality, resolveShareOptions, stageMessage } from './lobbyView'
   import { ownerSeed, QUALITY_PRESETS, saveSettings, settings, type QualityPreset } from './settings.svelte'
   import Stage from './components/Stage.svelte'
   import ShareDialog from './components/ShareDialog.svelte'
@@ -130,30 +131,9 @@
   let dialogOpen = $state(false)
   let switching = $state(false)
 
+  /** The options to share with: the settings (or URL overrides), with auto quality applied to the session. */
   function shareOptions(): ShareOptions {
-    const sh = settings.share
-    const preset = QUALITY_PRESETS[sh.quality]
-    const test = sh.source === 'test' || (urlOverrides && params.get('source') === 'test')
-    const auto = urlOverrides ? params.get('quality') === 'auto' : sh.quality === 'auto'
-    const k = Math.max(1, urlOverrides ? numParam(params, 'k', sh.k) : sh.k)
-    const bitrateKbps = urlOverrides ? numParam(params, 'bitrate', preset.kbps) : preset.kbps
-    let m = Math.max(0, urlOverrides ? numParam(params, 'm', sh.m) : sh.m)
-    // Auto quality adapts the bitrate to the audience, and adds parity when relays allow.
-    if (session) {
-      session.autoBitrate = auto
-      if (auto && !urlOverrides) m = session.autoParity(k, m, bitrateKbps)
-    }
-    return {
-      k,
-      m,
-      bitrateKbps,
-      source: test ? 'test' : 'screen',
-      surface: sh.source === 'window' ? 'window' : sh.source === 'tab' ? 'browser' : 'monitor',
-      maxSize: [preset.maxWidth, preset.maxHeight],
-      audio: urlOverrides ? params.get('audio') === '1' : sh.systemAudio,
-      mic: urlOverrides ? params.get('mic') === '1' : sh.mic,
-      testSize: (params.get('res')?.split('x').map(Number) as [number, number] | undefined) ?? undefined,
-    }
+    return applyAutoQuality(resolveShareOptions(settings.share, params, urlOverrides), session)
   }
 
   /** Starts (or restarts, with the current settings: a brief blip) this peer's stream. */
@@ -277,21 +257,16 @@
     const p = stageView.player?.stats ?? null
     const streams = s.liveStreams()
     const stage = streams.find((x) => x.publisher === s.selected) ?? null
-    const message = !lobby?.joined
-      ? `Looking for the lobby… (${lobby?.trackers ?? 0} trackers connected)`
-      : presenting
-        ? null
-        : !stage
-          ? shareError
-            ? `Couldn't start sharing: ${shareError}`
-            : s.canShare
-              ? 'Click Share screen to present to the lobby.'
-              : lobby?.ownerAway
-                ? 'The owner is away. Nobody is sharing.'
-                : 'Nobody is sharing yet.'
-          : !p || p.decodedFrames === 0
-            ? `Connecting to ${nameOf(stage.publisher)}'s stream…`
-            : null
+    const message = stageMessage({
+      joined: !!lobby?.joined,
+      trackers: lobby?.trackers ?? 0,
+      presenting,
+      showOwnPreview,
+      stage: stage ? { name: nameOf(stage.publisher), decoding: !!p && p.decodedFrames > 0 } : null,
+      shareError,
+      canShare: s.canShare,
+      ownerAway: !!lobby?.ownerAway,
+    })
     const pub = s.publishing?.full ?? null
     const tiles: Tile[] =
       streams.length >= 2
@@ -312,7 +287,7 @@
       // The presenter sees what it shares while this tab is focused. Otherwise (it is probably in
       // the window it is sharing) a placeholder, so the capture doesn't film its own preview.
       localStream: presenting && showOwnPreview ? (s.publishing?.localStream ?? null) : null,
-      message: presenting && !showOwnPreview ? 'You are presenting to the lobby. The preview is hidden while this tab isn’t focused.' : message,
+      message,
       sub,
       stats: sub?.lastStats ?? null,
       playerStats: p,

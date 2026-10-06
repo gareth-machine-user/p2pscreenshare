@@ -3,9 +3,6 @@ import { closeContexts, meshSnapshot, openHost, openMember, openViewer, viewerSn
 
 test.afterEach(closeContexts)
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Any = any
-
 test('auto quality: an audience that cannot carry the stream gets a lower bitrate', async ({ browser }) => {
   test.setTimeout(180_000)
   const seed = `e2e-auto-${Date.now()}`
@@ -14,7 +11,7 @@ test('auto quality: an audience that cannot carry the stream gets a lower bitrat
   const owner = await openHost(browser, seed, { k: 2, m: 1, bitrate: 2500, up: 4000, autoQuality: true })
   const viewers: Page[] = []
   for (let i = 0; i < 6; i++) viewers.push(await openViewer(browser, seed, `w${i}`, 600))
-  const kbps = () => owner.evaluate(() => (window.__p2p as Any).publishing?.full?.kbps as number | undefined)
+  const kbps = () => owner.evaluate(() => window.__p2p!.publishing?.full?.kbps)
   expect(await kbps()).toBe(2500)
 
   // The presenter is told, and the stream restarts at a bitrate the audience can carry.

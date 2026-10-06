@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { hostSnapshot, median, openHost, openViewer, viewerSnapshot, waitFor, type ViewerSnapshot, closeContexts } from './helpers'
+import { hostSnapshot, median, openHost, openViewer, PERF, viewerSnapshot, waitFor, type ViewerSnapshot, closeContexts } from './helpers'
 
 test.afterEach(closeContexts)
 
@@ -39,11 +39,11 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
 
   for (const s of snaps) {
     expect(s.state).toBe('connected')
-    expect(s.fps).toBeGreaterThan(15)
+    expect(s.fps).toBeGreaterThan(PERF.minFps)
     expect(s.parents.filter((p) => p !== null).length).toBeGreaterThanOrEqual(2) // any k of k+m
   }
   const lat = snaps.map((s) => s.latencyMs!).filter((x) => x !== null)
-  expect(median(lat)).toBeLessThan(1500)
+  expect(median(lat)).toBeLessThan(PERF.maxLatencyMs)
   // Weak peers (< 1 stripe of upload) never relay.
   snaps.forEach((s, i) => {
     if (CAPS[i] <= 800) expect(s.home).toBeNull()
@@ -69,7 +69,7 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
   console.log('min fps per viewer during failover', minFps)
   after.forEach((s, i) => {
     expect(s.decoded).toBeGreaterThan(before[i].decoded + 60) // kept decoding through the failover
-    expect(minFps[i]).toBeGreaterThan(10)
+    expect(minFps[i]).toBeGreaterThan(PERF.minFailoverFps)
   })
 
   // The tree heals: nobody is left on the departed relay, and everyone has at least k live parents
@@ -92,7 +92,7 @@ test('single tree (k=1, m=0): orphans recover after their relay leaves; late joi
   for (const [i, cap] of caps.entries()) viewers.push(await openViewer(browser, streamId, `s${i}`, cap))
   await waitFor(
     () => all(viewers),
-    (ss) => ss.every((s) => s.fps > 15) && ss.filter((s) => s.children > 0).length >= 1,
+    (ss) => ss.every((s) => s.fps > PERF.minFps) && ss.filter((s) => s.children > 0).length >= 1,
     60_000,
     'tree up',
   )

@@ -60,6 +60,15 @@ export function numParam(params: URLSearchParams, key: string, fallback: number)
   return Number.isFinite(n) ? n : fallback
 }
 
+/** A `WxH` size parameter (e.g. `res=1280x720`) of positive integers; undefined if missing or malformed. */
+export function sizeParam(params: URLSearchParams, key: string): [number, number] | undefined {
+  const m = /^(\d+)x(\d+)$/.exec(params.get(key) ?? '')
+  if (!m) return undefined
+  const w = Number(m[1])
+  const h = Number(m[2])
+  return w > 0 && h > 0 ? [w, h] : undefined
+}
+
 export function randomId(len = 10): string {
   const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789'
   const bytes = crypto.getRandomValues(new Uint8Array(len))

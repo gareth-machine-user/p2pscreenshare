@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 // (tsconfig.tools.json lacks the app type for import.meta.env used by src/ui/route.ts.)
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { fmtKbps, fmtMs, joinCodeFrom, lobbyUrl, numParam, parseRoute } from '../src/ui/route'
+import { fmtKbps, fmtMs, joinCodeFrom, lobbyUrl, numParam, parseRoute, sizeParam } from '../src/ui/route'
 
 const CODE = 'abcDEF_-12.xyz-_789'
 
@@ -70,6 +70,15 @@ describe('numParam', () => {
     expect(numParam(p, 'missing', 7)).toBe(7)
     expect(numParam(p, 'd', 7)).toBe(1.5)
     expect(numParam(p, 'e', 7)).toBe(7)
+  })
+})
+
+describe('sizeParam', () => {
+  it('parses WxH and rejects malformed sizes', () => {
+    const p = new URLSearchParams({ a: '1280x720', b: '1280', c: '0x720', d: '12.5x3', e: 'x', f: '-1x2', g: '640x360x2' })
+    expect(sizeParam(p, 'a')).toEqual([1280, 720])
+    expect(sizeParam(p, 'missing')).toBeUndefined()
+    for (const key of ['b', 'c', 'd', 'e', 'f', 'g']) expect(sizeParam(p, key)).toBeUndefined()
   })
 })
 

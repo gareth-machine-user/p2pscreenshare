@@ -1,13 +1,13 @@
 import { expect, test } from '@playwright/test'
 import { TRACKER_URL } from '../playwright.config'
-import { meshSnapshot, openHost, openMember, openOwner, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
+import { meshSnapshot, newContext, openHost, openMember, openOwner, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
 
 test.afterEach(closeContexts)
 
 const LOCAL = new URLSearchParams({ tracker: TRACKER_URL, ice: 'none' })
 
 test('home and share settings persist across reloads; the creator stays owner', async ({ browser }) => {
-  const ctx = await browser.newContext()
+  const ctx = await newContext(browser)
   const page = await ctx.newPage()
   await page.goto(`/?${LOCAL}#/`)
   await page.getByTestId('name').fill('Ada')
@@ -87,7 +87,7 @@ test('player overlay: starts muted, mute toggles, fullscreen targets the stage, 
 })
 
 test("a presenter sees what it shares, but only while the tab is focused", async ({ browser }) => {
-  const ctx = await browser.newContext()
+  const ctx = await newContext(browser)
   const page = await ctx.newPage()
   // A real (fake-device) screen capture, not the test pattern.
   const q = new URLSearchParams({ stream: `e2e-preview-${Date.now()}`, tracker: TRACKER_URL, ice: 'none', share: '1', audio: '0' })

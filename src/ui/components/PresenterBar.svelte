@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { fmtKbps } from '../route'
   import { QUALITY_PRESETS, type QualityPreset } from '../settings.svelte'
   import Icon from './Icon.svelte'
 
@@ -48,7 +49,7 @@
   <span class="spacer"></span>
   {#if limited}
     <span class="badge warn" data-testid="audience-limited">
-      Audience upload is limited: about {(limited.feasibleKbps / 1000).toFixed(1)} Mbps will play smoothly{auto ? ' (adjusting)' : ''}
+      Audience upload is limited: about {fmtKbps(limited.feasibleKbps)} will play smoothly{auto ? ' (adjusting)' : ''}
     </span>
   {/if}
   <button class="danger" data-testid="presenter-stop" onclick={onstop}><Icon name="stop" />Stop</button>

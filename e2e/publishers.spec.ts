@@ -3,24 +3,24 @@ import { openHost, openMember, waitFor, closeContexts } from './helpers'
 
 test.afterEach(closeContexts)
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+/** For page code that reaches past the session's types (forcing a stream by hand). */
 type Any = any
 
 /** What a page's session knows about live streams and its stage. */
 function streams(page: Page) {
   return page.evaluate(() => {
-    const s = window.__p2p as Any
+    const s = window.__p2p!
     const name = (id: string) => s.mesh.member(id)?.name ?? (id === s.selfId ? s.mesh.record.name : id.slice(0, 4))
     return {
       id: s.selfId as string,
-      live: s.liveStreams().map((c: Any) => name(c.publisher)) as string[],
+      live: s.liveStreams().map((c) => name(c.publisher)),
       selected: s.selected ? name(s.selected) : null,
       source: s.stageView().source as string,
       previews: Object.fromEntries(
-        s.liveStreams().map((c: Any) => [name(c.publisher), s.subFor(c.publisher, 'preview')?.player.stats.decodedFrames ?? -1]),
+        s.liveStreams().map((c) => [name(c.publisher), s.subFor(c.publisher, 'preview')?.player.stats.decodedFrames ?? -1]),
       ) as Record<string, number>,
       stageDecoded: (s.stageView().player?.stats.decodedFrames ?? 0) as number,
-      log: s.stageLog.map((e: Any) => `${e.publisher ? name(e.publisher) : '-'}:${e.source}`) as string[],
+      log: s.stageLog.map((e) => `${e.publisher ? name(e.publisher) : '-'}:${e.source}`) as string[],
       canShare: s.canShare as boolean,
       publishing: !!s.publishing,
       rejected: s.relay.rejected as number,
@@ -94,7 +94,7 @@ test('revoking a publisher stops its stream, and relays drop what it still sends
 
   // A revoked publisher that keeps sending anyway: the viewer rejects the fragments, plays nothing.
   // share() refuses without the right to publish, so force a stream by hand like a misbehaving client.
-  expect(await alice.evaluate(() => (window.__p2p as Any).share({ k: 1, m: 0, bitrateKbps: 600, source: 'test', audio: false }).then(() => 'ok', () => 'refused'))).toBe('refused')
+  expect(await alice.evaluate(() => window.__p2p!.share({ k: 1, m: 0, bitrateKbps: 600, source: 'test', audio: false }).then(() => 'ok', () => 'refused'))).toBe('refused')
   const forced = await alice.evaluate(async (viewerId: string) => {
     const s = window.__p2p as Any
     s.debugIgnoreRevocation = true

@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { TRACKER_URL } from '../playwright.config'
-import { closeContexts, meshSnapshot, openMember, viewerSnapshot, waitFor } from './helpers'
+import { closeContexts, meshSnapshot, newContext, openMember, viewerSnapshot, waitFor } from './helpers'
 
 test.afterEach(closeContexts)
 
@@ -12,10 +12,8 @@ const all = (pages: Page[]) => Promise.all(pages.map(meshSnapshot))
 /** Leaves like a crash or a killed browser: no goodbye record, links just die. */
 async function vanish(page: Page): Promise<void> {
   await page.evaluate(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const w = window as any
-    w.__mesh.leave = async () => {}
-    w.__p2p.leave = async () => {}
+    window.__mesh!.leave = async () => {}
+    window.__p2p!.leave = async () => {}
   })
   await page.close()
 }
@@ -23,7 +21,7 @@ async function vanish(page: Page): Promise<void> {
 test('the owner vanishes without a goodbye and comes back: everyone finds it again', async ({ browser }) => {
   test.setTimeout(120_000)
   const seed = `e2e-owner-back-${Date.now()}`
-  const ownerCtx = await browser.newContext()
+  const ownerCtx = await newContext(browser)
   let owner = await ownerCtx.newPage()
   await owner.goto(ownerUrl(seed))
   const a = await openMember(browser, seed, 'a')
@@ -47,7 +45,7 @@ test('the owner vanishes without a goodbye and comes back: everyone finds it aga
 test('a client that was offline for a while (page still open) finds the lobby and the owner again', async ({ browser }) => {
   test.setTimeout(120_000)
   const seed = `e2e-offline-${Date.now()}`
-  const ownerCtx = await browser.newContext()
+  const ownerCtx = await newContext(browser)
   const owner = await ownerCtx.newPage()
   await owner.goto(ownerUrl(seed))
   const a = await openMember(browser, seed, 'a')
@@ -55,7 +53,7 @@ test('a client that was offline for a while (page still open) finds the lobby an
   await waitFor(() => viewerSnapshot(b), (s) => s.decoded > 30, 30_000, 'watching')
 
   // b drops off for 20 s: everyone declares it gone, and it declares everyone gone.
-  await b.evaluate(() => (window.__mesh as { debugGoOffline: (ms: number) => void }).debugGoOffline(20_000))
+  await b.evaluate(() => window.__mesh!.debugGoOffline(20_000))
   await waitFor(() => all([owner, a]), (ss) => ss.every((s) => s.members === 2), 15_000, 'b dropped')
   await waitFor(() => meshSnapshot(b), (s) => s.members === 1, 15_000, 'b alone')
 
@@ -71,7 +69,7 @@ test('a client that was offline for a while (page still open) finds the lobby an
 test('a client that reloads finds the owner, and so does a newcomer to a long-running lobby', async ({ browser }) => {
   test.setTimeout(120_000)
   const seed = `e2e-reload-${Date.now()}`
-  const ownerCtx = await browser.newContext()
+  const ownerCtx = await newContext(browser)
   const owner = await ownerCtx.newPage()
   await owner.goto(ownerUrl(seed))
   const a = await openMember(browser, seed, 'a')

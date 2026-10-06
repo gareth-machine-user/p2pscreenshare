@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { hostSnapshot, openHost, openViewer, viewerSnapshot, waitFor, closeContexts } from './helpers'
+import { hostSnapshot, openHost, openViewer, viewerSnapshot, waitFor, closeContexts, type HostSnapshot } from './helpers'
 
 test.afterEach(closeContexts)
 
@@ -18,16 +18,14 @@ test('deep tree: grandchildren do not blame healthy relays; departed children ar
   const ids = await Promise.all(pages.map((p) => waitFor(() => viewerSnapshot(p), (s) => s.state === 'connected', 30_000, 'connected').then((s) => s.id)))
   const byId = new Map(ids.map((id, i) => [id, pages[i]]))
 
-  const h0 = await waitFor(
-    () => hostSnapshot(host),
-    (h) => {
-      const depth = (id: string): number => (h.topology.parents[id]?.[0] === h.id ? 1 : 1 + depth(h.topology.parents[id]?.[0] ?? h.id))
-      return Object.keys(h.topology.parents).length === caps.length && Math.max(...ids.map(depth)) >= 3
-    },
-    60_000,
-    'depth-3 tree',
-  )
+  const deepTree = (h: HostSnapshot) => {
+    const depth = (id: string): number => (h.topology.parents[id]?.[0] === h.id ? 1 : 1 + depth(h.topology.parents[id]?.[0] ?? h.id))
+    return Object.keys(h.topology.parents).length === caps.length && Math.max(...ids.map(depth)) >= 3
+  }
+  await waitFor(() => hostSnapshot(host), deepTree, 60_000, 'depth-3 tree')
   await sleep(4000) // let it stream
+  // Re-snapshot right before choosing the victim: the tree may have been replanned while streaming.
+  const h0 = await waitFor(() => hostSnapshot(host), deepTree, 15_000, 'depth-3 tree (still)')
   const parentOf = (id: string) => h0.topology.parents[id][0]!
   const top = ids.find((id) => parentOf(id) === h0.id)!
   const midRelays = ids.filter((id) => parentOf(id) === top && ids.some((c) => parentOf(c) === id))

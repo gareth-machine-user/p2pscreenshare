@@ -6,7 +6,7 @@ declare class MediaStreamTrackProcessor<T = VideoFrame> {
 
 interface Window {
   /** Debug/e2e hook: the active session. */
-  __p2p?: unknown
+  __p2p?: import('./session/peerSession').PeerSession
   /** Debug/e2e hook: the lobby mesh. */
-  __mesh?: unknown
+  __mesh?: import('./mesh/mesh').Mesh
 }

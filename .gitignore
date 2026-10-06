@@ -25,3 +25,6 @@ dist-ssr
 tools/nosme/*.so
 test-results
 playwright-report
+
+# Claude Code worktrees
+.claude/worktrees/

@@ -1,9 +1,11 @@
 // User settings, persisted in localStorage. Reads and writes are wrapped so the app still works
 // when storage is unavailable (private windows, blocked site data).
+import type { ViewQuality } from '../session/peerSession'
+import { storageGet, storageSet } from '../util/storage'
 
+export type { ViewQuality }
 export type SourceKind = 'screen' | 'window' | 'tab' | 'test'
 export type QualityPreset = 'auto' | '4k' | '2k' | '1080p-ultra' | '1080p-hi' | '1080p' | '720p' | 'low'
-export type ViewQuality = 'auto' | 'full' | 'preview'
 
 export interface ShareSettings {
   source: SourceKind
@@ -41,23 +43,15 @@ export const QUALITY_PRESETS: Record<QualityPreset, { label: string; kbps: numbe
   '1080p': { label: '1080p', kbps: 4500, maxWidth: 1920, maxHeight: 1080 },
   '720p': { label: '720p', kbps: 2500, maxWidth: 1280, maxHeight: 720 },
   low: { label: 'Low', kbps: 900, maxWidth: 960, maxHeight: 540 },
-};
-export function storageGet(key: string): string | null {
-  try {
-    return localStorage.getItem(key)
-  } catch {
-    return null
-  }
 }
 
-export function storageSet(key: string, value: string): void {
-  try {
-    localStorage.setItem(key, value)
-  } catch {
-    // storage unavailable: settings last for this page only
-  }
-}
+/** Bounds of the advanced stripe settings (data stripes k, parity stripes m). */
+export const STRIPE_LIMITS = { k: { min: 1, max: 16 }, m: { min: 0, max: 8 } } as const
 
+/** `v` rounded and clamped to `limits`. */
+export function clampStripes(v: number, limits: { min: number; max: number }): number {
+  return Math.min(limits.max, Math.max(limits.min, Math.round(v)))
+}
 const SOURCES: readonly SourceKind[] = ['screen', 'window', 'tab', 'test']
 const VIEW_QUALITIES: readonly ViewQuality[] = ['auto', 'full', 'preview']
 
@@ -100,8 +94,8 @@ export function parseSettings(raw: string | null): Settings {
       systemAudio: bool(share.systemAudio, d.share.systemAudio),
       mic: bool(share.mic, d.share.mic),
       quality: Object.hasOwn(QUALITY_PRESETS, share.quality as string) ? (share.quality as QualityPreset) : d.share.quality,
-      k: int(share.k, 1, 16, d.share.k),
-      m: int(share.m, 0, 8, d.share.m),
+      k: int(share.k, STRIPE_LIMITS.k.min, STRIPE_LIMITS.k.max, d.share.k),
+      m: int(share.m, STRIPE_LIMITS.m.min, STRIPE_LIMITS.m.max, d.share.m),
     },
     view: {
       quality: oneOf(view.quality, VIEW_QUALITIES, d.view.quality),

@@ -3,13 +3,13 @@ import { TRACKER_URL } from '../playwright.config'
 import { hostIdentity } from '../src/net/lobby'
 
 /**
- * Contexts opened by these helpers. Playwright doesn't close contexts made with
+ * Contexts opened by these helpers (and by tests, through newContext()). Playwright doesn't close contexts made with
  * browser.newContext() when a test ends, and a lobby left running keeps streaming: call
  * closeContexts() after each test (test.afterEach) so tests don't load each other.
  */
 const contexts = new Set<BrowserContext>()
 
-async function newContext(browser: Browser): Promise<BrowserContext> {
+export async function newContext(browser: Browser): Promise<BrowserContext> {
   const ctx = await browser.newContext()
   contexts.add(ctx)
   ctx.on('close', () => contexts.delete(ctx))
@@ -63,8 +63,7 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
   })
   await page.goto(`/#/host?${q}`)
   await page.waitForFunction(() => {
-    const s = window.__p2p as { codec: string | null } | undefined
-    return !!s?.codec
+    return !!window.__p2p?.codec
   })
   return page
 }
@@ -98,8 +97,7 @@ export interface ViewerSnapshot {
 }
 
 export function viewerSnapshot(page: Page): Promise<ViewerSnapshot> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return page.evaluate(() => (window.__p2p as any).debugViewer())
+  return page.evaluate(() => window.__p2p!.debugViewer())
 }
 
 export interface HostSnapshot {
@@ -114,8 +112,7 @@ export interface HostSnapshot {
 }
 
 export function hostSnapshot(page: Page): Promise<HostSnapshot> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return page.evaluate(() => (window.__p2p as any).debugPublisher())
+  return page.evaluate(() => window.__p2p!.debugPublisher())
 }
 
 export async function waitFor<T>(fn: () => Promise<T>, ok: (v: T) => boolean, timeoutMs: number, label: string): Promise<T> {
@@ -131,6 +128,25 @@ export async function waitFor<T>(fn: () => Promise<T>, ok: (v: T) => boolean, ti
     await new Promise((r) => setTimeout(r, 500))
   }
   throw new Error(`timed out waiting for ${label}; last=${JSON.stringify(last)}`)
+}
+
+/** A number from the environment, else `fallback`. */
+function envNumber(name: string, fallback: number): number {
+  const n = Number(process.env[name])
+  return process.env[name] && Number.isFinite(n) ? n : fallback
+}
+
+/**
+ * Performance thresholds. Slow machines can relax them: E2E_MIN_FPS, E2E_MIN_FAILOVER_FPS and
+ * E2E_MAX_LATENCY_MS.
+ */
+export const PERF = {
+  /** Steady-state frame rate every viewer must exceed. */
+  minFps: envNumber('E2E_MIN_FPS', 15),
+  /** Lowest frame rate allowed while a relay fails over. */
+  minFailoverFps: envNumber('E2E_MIN_FAILOVER_FPS', 10),
+  /** Glass-to-glass latency bound (median, for trees). */
+  maxLatencyMs: envNumber('E2E_MAX_LATENCY_MS', 1500),
 }
 
 export function median(xs: number[]): number {
@@ -175,21 +191,17 @@ export interface MeshSnapshot {
 
 export function meshSnapshot(page: Page): Promise<MeshSnapshot> {
   return page.evaluate(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const m = window.__mesh as any
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const recs = [m.record, ...m.members()] as any[]
+    const m = window.__mesh!
+    const recs = [m.record, ...m.members()]
     return {
       id: m.selfId,
       name: m.record.name,
       members: m.memberCount,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      openLinks: [...m.conns.values()].filter((c: any) => c.isOpen).length,
+      openLinks: [...m.conns.values()].filter((c) => c.isOpen).length,
       isDoor: m.isDoor,
       unreachable: [...m.record.unreachable],
       records: Object.fromEntries(recs.map((r) => [r.id, { name: r.name, unreachable: [...r.unreachable] }])),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      chat: m.chat.map((c: any) => `${c.name}: ${c.text}`),
+      chat: m.chat.map((c) => `${c.name}: ${c.text}`),
     }
   })
 }
