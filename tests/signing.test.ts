@@ -25,9 +25,16 @@ function frame(over: Partial<EncodedFrame> = {}): EncodedFrame {
   }
 }
 
+/** A signature over `raw` as the publisher makes it. */
+async function signedCopy(raw: Uint8Array): Promise<Uint8Array> {
+  const stripes = [[raw.slice()]]
+  await signFrame(host.signingKey, stripes)
+  return stripes[0][0].subarray(-64)
+}
+
 async function signed(f = frame(), key = host.signingKey): Promise<Uint8Array[][]> {
   const stripes = packetize(f, 2, 1, 77)
-  await signFrame(key, stripes, f.audio)
+  await signFrame(key, stripes)
   return stripes
 }
 
@@ -41,9 +48,29 @@ describe('fragment signatures', () => {
     }
   })
 
-  it('shares one signature across the per-stripe copies of an audio frame', async () => {
-    const stripes = await signed(frame({ audio: true, key: false, data: new Uint8Array(120) }))
+  it('signs each coded audio piece', async () => {
+    const stripes = await signed(frame({ audio: true, key: false, data: crypto.getRandomValues(new Uint8Array(640)) }))
     for (const [raw] of stripes) expect(await verifyFragment(hostKey, raw)).toBe(true)
+    // Parity and data pieces differ, so their signatures do too.
+    expect(stripes[0][0].subarray(-64)).not.toEqual(stripes[2][0].subarray(-64))
+  })
+
+  it('verifies legacy audio copies (one signature for every stripe) and holds coded pieces to their stripe', async () => {
+    // Older publishers sent audio whole on every stripe under one signature: the stripe byte isn't signed.
+    const raw = (await signed(frame({ audio: true, key: false, data: new Uint8Array(120) })))[0][0].slice()
+    raw[24] = 1 // k
+    raw[25] = 0 // m
+    raw.set(await signedCopy(raw), raw.length - 64)
+    for (const stripe of [0, 1, 2]) {
+      const copy = raw.slice()
+      copy[27] = stripe
+      expect(await verifyFragment(hostKey, copy)).toBe(true)
+      expect(decodeFragment(copy)!.header.stripe).toBe(stripe)
+    }
+    // A coded piece moved to another stripe still verifies (the byte is unsigned) but is refused.
+    const coded = (await signed(frame({ audio: true, key: false, data: new Uint8Array(120) })))[1][0].slice()
+    coded[27] = 0
+    expect(decodeFragment(coded)).toBeNull()
   })
 
   it('rejects unsigned, impostor-signed, and tampered fragments', async () => {

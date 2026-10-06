@@ -120,8 +120,8 @@ export class AudioPipeline {
 /**
  * Decodes Opus frames and plays them on the shared playout timeline.
  *
- * Audio frames travel on every stripe over unordered channels and different relay paths, so they
- * arrive out of order. They are kept in a small jitter buffer and decoded in sequence (Opus is
+ * Audio frames are erasure coded across the stripes, which take unordered channels and different
+ * relay paths, so they complete out of order. They are kept in a small jitter buffer and decoded in sequence (Opus is
  * stateful); a missing frame is skipped only when the next one is due. Decoded chunks go to an
  * AudioWorklet that plays them as one continuous, resampled stream (see playout.ts). Without
  * AudioWorklet, chunks are scheduled back to back as separate buffers, which can click.

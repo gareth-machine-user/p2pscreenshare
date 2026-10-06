@@ -110,6 +110,14 @@ describe('packetize + reassemble', () => {
     captureTime: 1000 + seq,
     data: randomBytes(size, seq + 3),
   })
+  /** An audio frame as older publishers sent it: whole on every stripe, header k=1/m=0. */
+  const legacyAudio = (f: EncodedFrame, stripes: number): Uint8Array[] =>
+    Array.from({ length: stripes }, (_, stripe) =>
+      encodeFragment(
+        { channel: 9, key: f.key, audio: true, replay: false, layer: 0, epoch: f.epoch, frameSeq: f.seq, gopId: f.gopId, refSeq: f.refSeq, captureTime: f.captureTime, k: 1, m: 0, pieceIdx: 0, stripe, frameLen: f.data.byteLength, fragIdx: 0, fragCount: 1 },
+        f.data,
+      ),
+    )
 
   it('reassembles from shuffled fragments with one stripe missing (k=4, m=1)', () => {
     const out: AssembledFrame[] = []
@@ -132,15 +140,64 @@ describe('packetize + reassemble', () => {
     expect(out).toHaveLength(0)
   })
 
-  it('audio is duplicated on every stripe and emitted once', () => {
+  it('erasure codes audio like video: one piece per stripe, any k of them play it', () => {
+    const a = frame(5, 640, true)
+    const stripes = packetize(a, 4, 2, 9)
+    expect(stripes).toHaveLength(6)
+    for (const [s, frags] of stripes.entries()) {
+      expect(frags).toHaveLength(1)
+      const h = decodeFragment(frags[0])!.header
+      expect([h.audio, h.k, h.m, h.pieceIdx, h.stripe]).toEqual([true, 4, 2, s, s])
+    }
+    // (k+m)/k of the frame on the wire, not k+m copies.
+    const payload = stripes.flat().reduce((n, raw) => n + decodeFragment(raw)!.payload.byteLength, 0)
+    expect(payload).toBe(6 * 160)
+    for (const keep of combinations(6, 4)) {
+      const out: AssembledFrame[] = []
+      const r = new Reassembler((f) => out.push(f))
+      for (const s of keep) r.push(decodeFragment(stripes[s][0])!, 0)
+      expect(out, `stripes ${keep}`).toHaveLength(1)
+      expect(out[0].audio).toBe(true)
+      expect(out[0].data).toEqual(a.data)
+    }
+    const out: AssembledFrame[] = []
+    const r = new Reassembler((f) => out.push(f))
+    for (const s of [0, 3, 5]) r.push(decodeFragment(stripes[s][0])!, 0)
+    expect(out).toHaveLength(0)
+  })
+
+  it('audio pieces larger than a fragment are split and reassembled', () => {
+    const a = frame(8, 50_000, true)
+    const stripes = packetize(a, 2, 1, 9)
+    expect(stripes[0].length).toBeGreaterThan(1)
+    const out: AssembledFrame[] = []
+    const r = new Reassembler((f) => out.push(f))
+    for (const raw of [...stripes[2], ...stripes[0]].reverse()) r.push(decodeFragment(raw)!, 0)
+    expect(out).toHaveLength(1)
+    expect(out[0].data).toEqual(a.data)
+  })
+
+  it('still plays legacy audio (older publishers: copied whole onto every stripe) once', () => {
     const out: AssembledFrame[] = []
     const r = new Reassembler((f) => out.push(f))
     const a = frame(5, 300, true)
-    const stripes = packetize(a, 3, 1, 9)
-    expect(stripes.every((s) => s.length === 1)).toBe(true)
-    for (const raw of stripes.flat()) r.push(decodeFragment(raw)!, 0)
+    const copies = legacyAudio(a, 4)
+    for (const [s, raw] of copies.entries()) {
+      const h = decodeFragment(raw)!.header
+      expect([h.k, h.m, h.pieceIdx, h.stripe]).toEqual([1, 0, 0, s])
+    }
+    for (const raw of copies) r.push(decodeFragment(raw)!, 0)
     expect(out).toHaveLength(1)
     expect(out[0].audio).toBe(true)
     expect(out[0].data).toEqual(a.data)
+  })
+
+  it('rejects a coded piece on the wrong stripe, video or audio', () => {
+    for (const audio of [false, true]) {
+      const raw = packetize(frame(9, 900, audio), 2, 1, 9)[1][0].slice()
+      raw[27] = 0 // stripe byte
+      expect(decodeFragment(raw), `audio=${audio}`).toBeNull()
+    }
+    expect(decodeFragment(legacyAudio(frame(9, 900, true), 3)[1])!.header.stripe).toBe(1)
   })
 })

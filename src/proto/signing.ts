@@ -2,13 +2,7 @@
 import { signatureOf, signedRegion } from './framing'
 
 /** Signs every fragment of one packetized frame in place. */
-export async function signFrame(key: CryptoKey, stripes: Uint8Array[][], audio: boolean): Promise<void> {
-  if (audio) {
-    // The copies on each stripe differ only in the (unsigned) stripe byte: sign once.
-    const sigs = await Promise.all(stripes[0].map((raw) => sign(key, raw)))
-    for (const frags of stripes) frags.forEach((raw, i) => signatureOf(raw).set(sigs[i]))
-    return
-  }
+export async function signFrame(key: CryptoKey, stripes: Uint8Array[][]): Promise<void> {
   await Promise.all(stripes.flat().map(async (raw) => signatureOf(raw).set(await sign(key, raw))))
 }
 

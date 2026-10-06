@@ -14,9 +14,11 @@ export interface EncodedFrame {
 }
 
 /**
- * Turns an encoded frame into wire fragments, grouped by stripe.
- * Video: erasure coded into k+m pieces, piece i -> stripe i.
- * Audio: tiny, so the whole frame is sent unsplit on every stripe (first arrival wins).
+ * Turns an encoded frame into wire fragments, grouped by stripe: erasure coded into k data + m
+ * parity pieces, piece i -> stripe i. Audio is coded like the video, so it costs (k+m)/k of its
+ * size and plays from any k stripes, like the video. (It used to be copied whole onto every
+ * stripe, header k=1/m=0, for k+m times its size; receivers still accept that from older
+ * publishers, see framing.ts isLegacyAudio.)
  */
 export function packetize(frame: EncodedFrame, k: number, m: number, channel: number): Uint8Array[][] {
   const stripes = k + m
@@ -34,13 +36,6 @@ export function packetize(frame: EncodedFrame, k: number, m: number, channel: nu
     frameLen: frame.data.byteLength,
   }
   const out: Uint8Array[][] = Array.from({ length: stripes }, () => [])
-
-  if (frame.audio) {
-    for (let s = 0; s < stripes; s++) {
-      out[s].push(...fragmentPiece(frame.data, { ...base, k: 1, m: 0, pieceIdx: 0, stripe: s }))
-    }
-    return out
-  }
 
   const pieces = encodePieces(frame.data, k, m)
   for (let s = 0; s < stripes; s++) {

@@ -105,9 +105,15 @@ export function decodeFragment(raw: Uint8Array): Fragment | null {
   }
   if (header.fragCount === 0 || header.fragIdx >= header.fragCount) return null
   if (header.k === 0 || header.pieceIdx >= header.k + header.m) return null
-  // Video piece i only travels on stripe i (the stripe byte isn't signed, see signedRegion).
-  if (!header.audio && header.stripe !== header.pieceIdx) return null
+  // Piece i only travels on stripe i (the stripe byte isn't signed, see signedRegion). Older
+  // publishers sent each audio frame whole (k=1, m=0) on every stripe: still accepted from them.
+  if (header.stripe !== header.pieceIdx && !isLegacyAudio(header)) return null
   return { header, payload: raw.subarray(HEADER_SIZE, raw.byteLength - SIG_SIZE), raw }
+}
+
+/** An audio frame sent whole on every stripe, the format before audio was erasure coded. */
+export function isLegacyAudio(h: FragmentHeader): boolean {
+  return h.audio && h.k === 1 && h.m === 0
 }
 
 /** Returns a copy of `raw` with the replay flag set (used when serving from a GOP cache). */
@@ -119,8 +125,9 @@ export function withReplayFlag(raw: Uint8Array): Uint8Array {
 
 /**
  * The bytes the publisher signs: header and payload, with the two bytes relays may legitimately vary
- * zeroed — the replay flag (set when serving from a GOP cache) and the stripe (audio frames go out
- * identically on every stripe, so one signature covers every copy).
+ * zeroed — the replay flag (set when serving from a GOP cache) and the stripe (older publishers sent
+ * audio identically on every stripe under one signature; decodeFragment holds every other piece i
+ * to stripe i).
  */
 export function signedRegion(raw: Uint8Array): Uint8Array<ArrayBuffer> {
   const msg = raw.slice(0, raw.byteLength - SIG_SIZE)

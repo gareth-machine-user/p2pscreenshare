@@ -204,7 +204,7 @@ export class ChannelPublisher {
     })
     this.signing = this.signing
       .then(async () => {
-        await signFrame(this.ctx.signingKey, stripes, frame.audio)
+        await signFrame(this.ctx.signingKey, stripes)
         if (this.stopped) return
         for (const frags of stripes) for (const raw of frags) this.ctx.relay.inject(raw)
       })

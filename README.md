@@ -25,9 +25,9 @@ only to find the lobby; no media server is involved.
   arrival times. The default profile favours complete frames over delay (see
   [Quality versus latency](#quality-versus-latency)); the low-latency profile measured about
   **70 ms** glass-to-glass in local e2e tests.
-- **Gapless audio.** 128 kbps Opus tuned for music, in 40 ms frames that ride on every stripe of
-  the full channel (the first copy to arrive wins). A small jitter buffer reorders frames and
-  decodes them in sequence, and an AudioWorklet plays them as one continuous stream, correcting
+- **Gapless audio.** 128 kbps Opus tuned for music, in 40 ms frames erasure coded across the full
+  channel's stripes like the video (any k of the k+m stripes play it). A small jitter buffer
+  reorders frames and decodes them in sequence, and an AudioWorklet plays them as one continuous stream, correcting
   drift by playing up to 1% fast or slow and fading across real gaps, so there are no clicks.
   Catch-up replays and upload probes are paced so live audio never waits behind them.
 - **Graceful degradation.** Uplink queues drop temporal enhancement layers (T2, then T1) first, so
@@ -186,8 +186,8 @@ needs about 21.6 Mbps on that one connection. So each mesh pair opens **media la
 - **Sending.** Stripe *s* of any channel goes over slot *s* mod *K* of the pair, slot 0 being the
   mesh link. A lane that isn't open (yet, or while it reconnects) falls back to the mesh link, so
   the mapping only changes when a lane is given up for good. Each lane has its own uplink queue;
-  the receiver de-duplicates by fragment id, so the split is invisible downstream. Audio, which
-  rides every stripe, therefore also travels over every lane.
+  the receiver de-duplicates by fragment id, so the split is invisible downstream. Audio is coded
+  across the stripes like the video, so it spreads over the lanes the same way.
 - **Congestion.** Each lane is its own flow: a peer counts as congested only when most of its
   active lanes are (one lane at its window is that connection's ceiling, not the uplink), and the
   upload probe runs over every lane of each neighbour at once, so in a two-peer lobby it measures
@@ -253,10 +253,15 @@ Each media message is one fragment: a 40-byte header (version, flags with key/au
 and the temporal layer, epoch, frame seq, GOP id, reference seq, capture time, k, m, piece,
 stripe, frame length, fragment index and count, and the u32 channel id) followed by up to about
 16 KB of payload and the publisher's 64-byte Ed25519 signature (`WIRE_VERSION` 3). See
-`src/proto/framing.ts`. Audio (Opus, 40 ms frames) is small, so it is sent unsplit on every stripe
-of the full channel. That costs `k+m` times its bitrate, but whichever copy arrives first wins, so
-audio rides past a stripe that is briefly backed up. Sending fewer copies (or erasure coding audio
-like video) caused audible dropouts while viewers joined in e2e tests.
+`src/proto/framing.ts`. Audio (Opus, 40 ms frames) is erasure coded like the video: piece *i* of
+each frame on stripe *i*, so it costs `(k+m)/k` times its bitrate plus 104 bytes of header and
+signature per piece, and plays from any `k` stripes. (It used to be copied whole onto every stripe,
+`k+m` times its bitrate, because coded audio broke up while viewers joined. The cause was stalls of
+a whole connection, which carries several stripes: upload probes and media bursts deep enough to
+stall Chromium's SCTP association. With send buffers capped at 64 KB those are gone, and coded
+audio plays without gaps. Frames copied whole, with k=1 and m=0 on any stripe, are still accepted
+from older publishers.) At k=4, m=2 a stripe carries about 53 kbps of the 128 kbps audio, against
+149 kbps for a whole copy.
 
 ## Failure handling and recovery
 
@@ -302,10 +307,10 @@ Not handled yet:
 
 `npm run sim -- --peers 200 --seconds 300` runs one publisher's planner under churn with a mix of
 residential uplinks: 25% at 0.5 Mbps, 35% at 2 Mbps, 25% at 8 Mbps and 15% at 30 Mbps. Viewers
-stay a mean of 240 s, and the stream is 2.5 Mbps with audio (each stripe carries the audio, as in
-the app; `--audio 0` drops it). The simulator uses the app's own planner, planner config, stripe
-bitrate formula and late-parent policy (`topology/policy.ts`), and `tests/sim.test.ts` runs a small
-scenario on every `npm test` to catch regressions. Peers offer slots from a noisy upload estimate,
+stay a mean of 240 s, and the stream is 2.5 Mbps with audio (`--audio 0` drops it; the tables
+below predate erasure-coded audio and were made with a whole copy of the audio on every stripe).
+The simulator uses the app's own planner, planner config, stripe bitrate formula and late-parent
+policy (`topology/policy.ts`), and `tests/sim.test.ts` runs a small scenario on every `npm test` to catch regressions. Peers offer slots from a noisy upload estimate,
 re-measured every 10 s, and the publisher sees offers and joins `--gossip` ms late (default 500).
 When a peer leaves, its subtree loses that stripe for `--repair` ms (default 2225: the app's
 stripe-silence timeout, the health-check interval, the reattach batch and relinking). A viewer stalls while more than `m` of its stripes are missing.
@@ -322,9 +327,10 @@ k  m | p50 ms | p95 ms | max depth | stall % | stalls/hr | degraded % | parent c
 ```
 
 "Degraded" means some viewer's k-th best stripe passes through a parent whose children need more
-than its true upload. 8+2 degrades heavily because every one of its 10 stripes carries the audio
-(about 440 kbps a stripe), and most of the upload that could carry them sits with a few strong
-peers that the 16-child fanout cap holds back (see below; with `--fanout 48` it is 0). Other options:
+than its true upload. 8+2 degrades heavily because, when these tables were made, every one of its
+10 stripes carried a whole copy of the audio (then about 440 kbps a stripe; with today's 128 kbps
+audio erasure coded, about 380), and most of the upload that could carry them sits with a few
+strong peers that the 16-child fanout cap holds back (see below; with `--fanout 48` it is 0). Other options:
 `--lifetime`, `--repair`, `--gossip`, `--fanout`, `--audio`, `--only 4:1,8:2`, and the sweeps below.
 
 Three scenarios exercise the hardening:
@@ -426,8 +432,8 @@ Takeaways:
 
 **About the "degraded" column.** Its high values for 8+m come mostly from the 16-child
 `maxFanout` cap. Strong peers hit the cap long before their upload limit, so their spare capacity
-goes unused, and every stripe carrying the audio makes more stripes cost more. With `--fanout 48`
-the column is 0 for all of these. Bigger subtrees have a cost, though: each departure affects more
+goes unused, and (with the audio copied onto every stripe, as when these tables were made) more
+stripes cost more. With `--fanout 48` the column is 0 for all of these. Bigger subtrees have a cost, though: each departure affects more
 viewers (4+2 and 8+2 stall more).
 
 ```
