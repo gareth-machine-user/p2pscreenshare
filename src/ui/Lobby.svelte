@@ -216,10 +216,26 @@
     }
   })
 
+  /** Whether this tab has focus (the presenter's own preview only shows then, like Discord). */
+  let focused = $state(document.hasFocus() && !document.hidden)
+  $effect(() => {
+    const update = () => (focused = document.hasFocus() && !document.hidden)
+    window.addEventListener('focus', update)
+    window.addEventListener('blur', update)
+    document.addEventListener('visibilitychange', update)
+    return () => {
+      window.removeEventListener('focus', update)
+      window.removeEventListener('blur', update)
+      document.removeEventListener('visibilitychange', update)
+    }
+  })
+
   const view = $derived.by(() => {
     void tick
     const s = session
     if (!s) return null
+    // A test pattern can't film itself, so it always shows.
+    const showOwnPreview = focused || s.publishing?.opts.source === 'test'
     const stageView = s.stageView()
     const presenting = stageView.source === 'local'
     const sub = s.stageSub
@@ -248,7 +264,7 @@
             publisher: x.publisher,
             name: x.publisher === s.selfId ? `${nameOf(x.publisher)} (you)` : nameOf(x.publisher),
             player: s.subFor(x.publisher, 'preview')?.player ?? null,
-            localStream: x.publisher === s.selfId && s.publishing?.opts.source === 'test' ? s.publishing.localStream : null,
+            localStream: x.publisher === s.selfId && showOwnPreview ? (s.publishing?.localStream ?? null) : null,
             hasAudio: !!x.ann.stream?.audio,
             selected: x.publisher === s.selected,
             canStop: s.isOwner && x.publisher !== s.selfId,
@@ -258,10 +274,10 @@
       presenting,
       source: stageView.source,
       player: stageView.player,
-      // Mirroring a real screen capture on the screen being captured makes a flickering feedback
-      // loop, so the presenter sees a placeholder (the test pattern is safe to show).
-      localStream: presenting && s.publishing?.opts.source === 'test' ? s.publishing.localStream : null,
-      message: presenting && s.publishing?.opts.source !== 'test' ? 'You are presenting to the lobby.' : message,
+      // The presenter sees what it shares while this tab is focused. Otherwise (it is probably in
+      // the window it is sharing) a placeholder, so the capture doesn't film its own preview.
+      localStream: presenting && showOwnPreview ? (s.publishing?.localStream ?? null) : null,
+      message: presenting && !showOwnPreview ? 'You are presenting to the lobby. The preview is hidden while this tab isn’t focused.' : message,
       sub,
       stats: sub?.lastStats ?? null,
       playerStats: p,

@@ -55,8 +55,9 @@ npm run tracker             # ws://localhost:8000
   who may share: ask each time, anyone, or only the owner. The share dialog picks the source
   (screen, window or tab), system audio and microphone, a quality preset, and under **Advanced**
   the stripe layout and a test pattern. All of it is remembered.
-- **Presenting.** A presenter bar mutes the mic or the stream audio, switches the source, changes
-  the quality and stops. With the **Auto** preset the stream drops its bitrate if the audience
+- **Presenting.** You see a preview of what you share while the lobby tab is focused; it hides
+  when you switch away (so sharing the whole screen doesn't film the preview). A presenter bar
+  mutes the mic or the stream audio, switches the source, changes the quality and stops. With the **Auto** preset the stream drops its bitrate if the audience
   can't upload enough to carry it ("Audience upload is limited" shows either way).
 - **Watching.** With two or more streams live, a tile rail shows live previews; click one to put it
   on the stage. Hover the player for mute (every stream starts muted), quality (Auto, Full or

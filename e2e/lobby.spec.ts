@@ -85,3 +85,29 @@ test('player overlay: starts muted, mute toggles, fullscreen targets the stage, 
   await expect(viewer.getByTestId('topology-panel')).toBeVisible({ timeout: 10_000 })
   await expect(viewer.getByTestId('topology-panel')).toContainText('Subscribers1')
 })
+
+test("a presenter sees what it shares, but only while the tab is focused", async ({ browser }) => {
+  const ctx = await browser.newContext()
+  const page = await ctx.newPage()
+  // A real (fake-device) screen capture, not the test pattern.
+  const q = new URLSearchParams({ stream: `e2e-preview-${Date.now()}`, tracker: TRACKER_URL, ice: 'none', share: '1', audio: '0' })
+  await page.goto(`/#/host?${q}`)
+  await expect(page.getByTestId('stop-share')).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByTestId('local-preview')).toBeVisible()
+
+  // Focus moves elsewhere (e.g. to the window being shared): the preview hides.
+  await page.evaluate(() => {
+    document.hasFocus = () => false
+    window.dispatchEvent(new Event('blur'))
+  })
+  await expect(page.getByTestId('local-preview')).toHaveCount(0)
+  await expect(page.getByTestId('stage-message')).toContainText('preview is hidden')
+
+  // Back to the tab: the preview returns.
+  await page.evaluate(() => {
+    document.hasFocus = () => true
+    window.dispatchEvent(new Event('focus'))
+  })
+  await expect(page.getByTestId('local-preview')).toBeVisible()
+  await ctx.close()
+})
