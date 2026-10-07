@@ -35,10 +35,6 @@
   {#if route.page === 'lobby'}
     <Lobby joinCode={route.joinCode} params={route.params} />
   {:else if route.page === 'home'}
-    <header class="topbar">
-      <a href="#/" class="brand">▣ p2pscreenshare</a>
-      <span class="tagline">peer-to-peer screen sharing lobbies over WebRTC</span>
-    </header>
-    <main><Home /></main>
+    <Home />
   {/if}
 {/key}

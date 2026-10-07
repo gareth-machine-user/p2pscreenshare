@@ -98,3 +98,34 @@ export function stageMessage(s: StageState): string | null {
   }
   return s.stage.decoding ? null : `Connecting to ${s.stage.name}'s stream…`
 }
+
+/**
+ * A member's connection in a word or two, for the People list: from the mesh link's state and
+ * its round-trip time. Warns when it is slow or missing.
+ */
+export function connectionWord(
+  status: 'open' | 'connecting' | 'unreachable' | 'none',
+  rttMs: number | null,
+): { text: string; title: string; warn: boolean } {
+  if (status === 'connecting') return { text: 'Connecting…', title: 'Setting up a direct connection', warn: false }
+  if (status === 'unreachable') return { text: "Can't connect", title: 'No direct connection: the stream reaches them through others', warn: true }
+  if (status === 'none') return { text: 'No link', title: 'No direct connection yet', warn: true }
+  if (rttMs === null) return { text: 'Connected', title: 'Direct connection', warn: false }
+  const title = `Direct connection, ${Math.round(rttMs)} ms round trip`
+  if (rttMs < 150) return { text: 'Good', title, warn: false }
+  if (rttMs < 400) return { text: 'OK', title, warn: false }
+  return { text: 'Slow', title, warn: true }
+}
+
+/** The viewer's one-line playback readout ("1080p30 · 84 ms"), or null until frames decode. */
+export function playbackReadout(
+  p: { latencyMs: number | null; fps: number; height: number; decodedFrames: number; droppedFrames: number } | null,
+): { text: string; title: string; level: 'good' | 'ok' | 'poor' } | null {
+  if (!p || p.decodedFrames === 0 || !p.height) return null
+  const parts = [`${p.height}p${Math.round(p.fps)}`]
+  if (p.latencyMs !== null) parts.push(`${Math.round(p.latencyMs)} ms`)
+  const dropped = p.droppedFrames / Math.max(1, p.decodedFrames + p.droppedFrames)
+  const latency = p.latencyMs ?? 0
+  const level = latency > 1500 || dropped > 0.1 ? 'poor' : latency > 600 || dropped > 0.02 ? 'ok' : 'good'
+  return { text: parts.join(' · '), title: 'Resolution and frame rate, and the delay from the presenter’s screen to yours', level }
+}

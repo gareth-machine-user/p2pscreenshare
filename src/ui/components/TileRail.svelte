@@ -45,9 +45,10 @@
 </script>
 
 <div class="tile-rail" data-testid="tile-rail">
+  <span class="tile-rail-label">Live now</span>
   {#each tiles as t (t.publisher)}
     <div class="tile" class:selected={t.selected} data-testid="tile" data-publisher={t.publisher}>
-      <button class="tile-pick" onclick={() => onselect(t.publisher)} title={`Watch ${t.name}`}>
+      <button class="tile-pick" aria-pressed={t.selected} onclick={() => onselect(t.publisher)} title={`Watch ${t.name}`}>
         {#if t.localStream}
           <video use:videoFor={t.localStream} autoplay muted playsinline></video>
         {:else}

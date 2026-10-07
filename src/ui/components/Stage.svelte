@@ -14,7 +14,11 @@
     quality = $bindable<ViewQuality>('auto'),
     qualityOptions = null,
     buffering = $bindable<Buffering>('auto'),
+    live = false,
+    readout = null,
     panel,
+    chip,
+    children,
   }: {
     /** Remote stream to draw. */
     player?: Player | null
@@ -30,8 +34,16 @@
     qualityOptions?: ViewQuality[] | null
     /** Playback buffering: less delay or fewer stalls. */
     buffering?: Buffering
-    /** Contents of the gear panel. */
+    /** This peer is presenting what the stage shows. */
+    live?: boolean
+    /** A short playback readout for the overlay ("1080p30 · 84 ms") and how healthy it is. */
+    readout?: { text: string; title: string; level: 'good' | 'ok' | 'poor' } | null
+    /** Contents of the details panel. */
     panel?: Snippet
+    /** A label over the top-left corner (who is presenting). */
+    chip?: Snippet
+    /** Shown over the stage instead of a message (an empty stage's card). */
+    children?: Snippet
   } = $props()
 
   let stage: HTMLDivElement | undefined = $state()
@@ -78,7 +90,7 @@
     else void stage?.requestFullscreen()
   }
 
-  const QUALITY_LABELS: Record<ViewQuality, string> = { auto: 'Auto', full: 'Full', preview: 'Preview' }
+  const QUALITY_LABELS: Record<ViewQuality, string> = { auto: 'Auto quality', full: 'Full quality', preview: 'Preview quality' }
   const BUFFERING_LABELS: Record<Buffering, string> = { low: 'Low latency', auto: 'Auto buffer', extra: 'Extra smooth' }
   const BUFFERING_TITLES: Record<Buffering, string> = {
     low: 'Play as soon as possible: least delay, more stutter on a bad connection',
@@ -91,6 +103,9 @@
   class="stage"
   class:touched
   class:fullscreen
+  class:live
+  class:has-card={!!children}
+  class:playing={!!(player || localStream) && !message && !children}
   bind:this={stage}
   data-testid="stage"
   role="presentation"
@@ -103,32 +118,47 @@
   {:else}
     <canvas bind:this={canvas} data-testid="video"></canvas>
   {/if}
-  {#if message}
+  {#if children}
+    <div class="stage-card">{@render children()}</div>
+  {:else if message}
     <div class="overlay-msg" data-testid="stage-message">{message}</div>
   {/if}
+  {#if chip && !children}{@render chip()}{/if}
 
-  <div class="player-overlay" data-testid="player-overlay">
-    {#if hasAudio && !localStream}
-      <button data-testid="mute" aria-pressed={!muted} onclick={toggleMute} title={muted ? 'Unmute' : 'Mute'}>
-        <Icon name={muted ? 'muted' : 'volume'} />{muted ? 'Unmute' : 'Mute'}
-      </button>
-    {/if}
-    {#if qualityOptions}
-      <select data-testid="quality" bind:value={quality} aria-label="Quality">
-        {#each qualityOptions as q}<option value={q}>{QUALITY_LABELS[q]}</option>{/each}
-      </select>
-      <select data-testid="buffering" bind:value={buffering} aria-label="Buffering" title={BUFFERING_TITLES[buffering]}>
-        {#each Object.keys(BUFFERING_LABELS) as Buffering[] as b}<option value={b}>{BUFFERING_LABELS[b]}</option>{/each}
-      </select>
-    {/if}
-    <span class="spacer"></span>
-    {#if panel}
-      <button data-testid="gear" aria-expanded={gearOpen} onclick={() => (gearOpen = !gearOpen)} title="Stats and details"><Icon name="gear" /></button>
-    {/if}
-    <button data-testid="fullscreen" onclick={toggleFullscreen} title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}>
-      <Icon name={fullscreen ? 'shrink' : 'expand'} />
-    </button>
-  </div>
+  <!-- An empty stage keeps the details button: the diagnostics are useful before anyone shares. -->
+  {#if !children || panel}
+    <div class="player-overlay" data-testid="player-overlay">
+      {#if hasAudio && !localStream}
+        <button data-testid="mute" class:primary={muted} aria-pressed={!muted} onclick={toggleMute} title={muted ? 'Unmute' : 'Mute'}>
+          <Icon name={muted ? 'muted' : 'volume'} />{muted ? 'Unmute' : 'Mute'}
+        </button>
+      {/if}
+      {#if qualityOptions}
+        <select data-testid="quality" bind:value={quality} aria-label="Quality">
+          {#each qualityOptions as q}<option value={q}>{QUALITY_LABELS[q]}</option>{/each}
+        </select>
+        <select data-testid="buffering" bind:value={buffering} aria-label="Buffering" title={BUFFERING_TITLES[buffering]}>
+          {#each Object.keys(BUFFERING_LABELS) as Buffering[] as b}<option value={b}>{BUFFERING_LABELS[b]}</option>{/each}
+        </select>
+      {/if}
+      {#if readout}
+        <span class="sep"></span>
+        <span class="readout" data-testid="readout" title={readout.title}>
+          <span class="bars {readout.level}"><i></i><i></i><i></i></span>{readout.text}
+        </span>
+      {/if}
+      {#if panel}
+        <button data-testid="gear" aria-expanded={gearOpen} aria-label="Stream details" title="Stream details" onclick={() => (gearOpen = !gearOpen)}>
+          <Icon name="activity" />
+        </button>
+      {/if}
+      {#if !children}
+        <button data-testid="fullscreen" aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'} title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'} onclick={toggleFullscreen}>
+          <Icon name={fullscreen ? 'shrink' : 'expand'} />
+        </button>
+      {/if}
+    </div>
+  {/if}
 
   {#if gearOpen && panel}
     <div class="gear-panel" data-testid="gear-panel">

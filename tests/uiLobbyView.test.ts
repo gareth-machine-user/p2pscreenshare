@@ -2,7 +2,7 @@
 /// <reference types="vite/client" />
 // (tsconfig.tools.json lacks the app types these src/ui modules use: runes, import.meta.env.)
 import { describe, expect, it } from 'vitest'
-import { applyAutoQuality, resolveShareOptions, stageMessage, type StageState } from '../src/ui/lobbyView'
+import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage, type StageState } from '../src/ui/lobbyView'
 import { DEFAULT_SETTINGS, type ShareSettings } from '../src/ui/settings.svelte'
 import { maxSizeFor, targetKbps, type VideoQuality } from '../src/media/quality'
 
@@ -132,5 +132,33 @@ describe('stageMessage', () => {
     expect(stageMessage(base)).toBe('Nobody is sharing yet.')
     expect(stageMessage({ ...base, stage: { name: 'ann', decoding: false } })).toBe("Connecting to ann's stream…")
     expect(stageMessage({ ...base, stage: { name: 'ann', decoding: true }, shareError: 'x' })).toBeNull()
+  })
+})
+
+describe('connectionWord', () => {
+  it('names the link state, then grades an open link by its round trip', () => {
+    expect(connectionWord('connecting', null)).toMatchObject({ text: 'Connecting…', warn: false })
+    expect(connectionWord('unreachable', null)).toMatchObject({ text: "Can't connect", warn: true })
+    expect(connectionWord('none', null)).toMatchObject({ text: 'No link', warn: true })
+    expect(connectionWord('open', null)).toMatchObject({ text: 'Connected', warn: false })
+    expect(connectionWord('open', 40)).toMatchObject({ text: 'Good', warn: false, title: 'Direct connection, 40 ms round trip' })
+    expect(connectionWord('open', 200)).toMatchObject({ text: 'OK', warn: false })
+    expect(connectionWord('open', 500)).toMatchObject({ text: 'Slow', warn: true })
+  })
+})
+
+describe('playbackReadout', () => {
+  const p = { latencyMs: 84, fps: 29.6, height: 1080, decodedFrames: 1000, droppedFrames: 0 }
+  it('is null until a frame decodes', () => {
+    expect(playbackReadout(null)).toBeNull()
+    expect(playbackReadout({ ...p, decodedFrames: 0 })).toBeNull()
+  })
+  it('shows size, frame rate and delay, graded by delay and drops', () => {
+    expect(playbackReadout(p)).toMatchObject({ text: '1080p30 · 84 ms', level: 'good' })
+    expect(playbackReadout({ ...p, latencyMs: null })?.text).toBe('1080p30')
+    expect(playbackReadout({ ...p, latencyMs: 900 })?.level).toBe('ok')
+    expect(playbackReadout({ ...p, droppedFrames: 50 })?.level).toBe('ok')
+    expect(playbackReadout({ ...p, latencyMs: 2000 })?.level).toBe('poor')
+    expect(playbackReadout({ ...p, droppedFrames: 200 })?.level).toBe('poor')
   })
 })

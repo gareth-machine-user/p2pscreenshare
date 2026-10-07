@@ -1,19 +1,24 @@
 <script lang="ts">
   import { CHAT_MAX_LEN, type ChatMessage } from '../../mesh/mesh'
+  import Avatar from './Avatar.svelte'
+  import Badges from './Badges.svelte'
   import Icon from './Icon.svelte'
 
   let {
     messages,
     selfId,
     badges,
-    open = $bindable(true),
+    guestName = null,
+    onpickname,
     onsend,
   }: {
     messages: ChatMessage[]
     selfId: string
-    /** Badge text per peer id (owner, presenter). */
+    /** Badge text per peer id (owner, presenting). */
     badges: (id: string) => string[]
-    open?: boolean
+    /** This peer's placeholder name while it hasn't picked one. */
+    guestName?: string | null
+    onpickname?: () => void
     /** Returns false when rate limited. */
     onsend: (text: string) => boolean
   } = $props()
@@ -41,29 +46,37 @@
   const time = (at: number) => new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 </script>
 
-<aside class="chat" class:collapsed={!open} data-testid="chat">
-  <button class="chat-toggle" data-testid="chat-toggle" aria-expanded={open} onclick={() => (open = !open)} title={open ? 'Hide chat' : 'Show chat'}>
-    <Icon name="chat" />{open ? 'Chat' : ''}
-  </button>
-  {#if open}
-    <div class="chat-list" bind:this={list} data-testid="chat-list">
-      {#each messages as m (m.id)}
-        <div class="chat-msg" class:mine={m.from === selfId} data-testid="chat-msg">
+{#if messages.length}
+  <div class="chat-list" bind:this={list} data-testid="chat-list">
+    {#each messages as m (m.id)}
+      {@const who = m.name || m.from.slice(0, 6)}
+      <div class="chat-msg" class:mine={m.from === selfId} data-testid="chat-msg">
+        <Avatar id={m.from} name={who} />
+        <div class="chat-body">
           <div class="chat-meta">
-            <b>{m.name || m.from.slice(0, 6)}</b>
-            {#each badges(m.from) as b}<span class="badge">{b}</span>{/each}
+            <b>{who}</b>
+            <Badges list={badges(m.from)} />
             <span class="chat-time">{time(m.at)}</span>
           </div>
           <div class="chat-text">{m.text}</div>
         </div>
-      {:else}
-        <p class="hint">No messages yet.</p>
-      {/each}
-    </div>
-    <form class="chat-form" onsubmit={send}>
-      <input data-testid="chat-input" placeholder="Message the lobby" maxlength={CHAT_MAX_LEN} bind:value={draft} />
-      <button type="submit" data-testid="chat-send">Send</button>
-    </form>
-    {#if limited}<p class="hint">Slow down a little.</p>{/if}
+      </div>
+    {/each}
+  </div>
+{:else}
+  <div class="chat-empty" data-testid="chat-list">
+    <Icon name="chat" size={28} />
+    <span>No messages yet. Say hi when people arrive.</span>
+  </div>
+{/if}
+<div class="chat-foot">
+  {#if guestName}
+    <p class="hint">You're <b>{guestName}</b>. <button class="link" data-testid="pick-name" onclick={onpickname}>Pick a name</button></p>
   {/if}
-</aside>
+  <form class="chat-form" onsubmit={send}>
+    <label class="sr-only" for="chat-input">Message</label>
+    <input id="chat-input" data-testid="chat-input" placeholder="Message the lobby" maxlength={CHAT_MAX_LEN} autocomplete="off" bind:value={draft} />
+    <button type="submit" data-testid="chat-send" aria-label="Send"><Icon name="send" /></button>
+  </form>
+  {#if limited}<p class="hint">Slow down a little.</p>{/if}
+</div>

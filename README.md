@@ -45,8 +45,8 @@ npm install
 npm run dev                 # http://localhost:5173
 ```
 
-Open the app, enter your name and click **Create lobby**. Copy the lobby link and send it to
-others, then click **Share screen**. Public WebTorrent trackers are used by default; for local
+Open the app, enter your name and click **Create a lobby**. Copy the link (from **Invite** in the
+top bar, or the card on the empty stage) and send it to others, then click **Share screen**. Public WebTorrent trackers are used by default; for local
 development run your own:
 
 ```sh
@@ -56,14 +56,17 @@ npm run tracker             # ws://localhost:8000
 
 ## Using a lobby
 
-- **Owner.** Whoever clicks **Create lobby** owns it. The owner's private seed stays in that
+- **Home.** One screen to start: your name, **Create a lobby**, or paste a link to join. Scroll down
+  (or click **How it works**) for a short explanation of the relay trees.
+- **Owner.** Whoever clicks **Create a lobby** owns it. The owner's private seed stays in that
   browser's `localStorage`, so reloading the lobby there keeps you its owner; the link you share
   only carries the join code. The lobby keeps working while the owner is away (an "Owner away"
-  badge shows), except that new requests to share wait for the owner.
+  badge shows), except that new requests to share wait for the owner. While nobody is sharing, the
+  stage shows the lobby link with **Copy link** and a share button.
 - **Sharing.** The owner can always share. Everyone else clicks **Ask to share**; the owner gets a
-  toast with **Allow**, **Allow all**, **Deny** and **Deny all**, and the requester sees "Waiting
-  for the owner…" (or "Owner is away"). The lobby settings (gear in the top bar, owner only) set
-  who may share: ask each time, anyone, or only the owner. The share dialog picks the source
+  toast with **Allow** and **Not now**, plus **Let anyone share from now on**, and the requester
+  sees "Waiting for the owner…" (or "Owner is away"). The lobby settings (the sliders button in the
+  top bar, owner only) set who can share: ask each time, anyone, or only the owner. The share dialog picks the source
   (screen, window, tab or camera), system audio and microphone, and under **Advanced** the stripe
   layout and a test pattern. Video quality shows as one line ("1080p30 · Standard · 5 Mbps") with a
   **Change** link. All of it is remembered.
@@ -81,29 +84,36 @@ npm run tracker             # ws://localhost:8000
   if you leave the page, so keep the lobby in front while sharing. Camera access needs HTTPS (or
   localhost).
 - **Presenting.** You see a preview of what you share while the lobby tab is focused; it hides
-  when you switch away (so sharing the whole screen doesn't film the preview). A presenter bar
-  mutes the mic or the stream audio, switches the source, changes the quality (a button showing the
-  live choice opens the same picker; changes apply at once, with a brief blur while the encoder
-  restarts at a new resolution or frame rate) and stops, and shows
-  what you are uploading right now ("Uploading 4.2 Mbps", amber with the reason on hover while
-  the bitrate is held below the chosen quality, e.g. "limited by your upload: ~8.0 Mbps"). With **Lower automatically** the stream drops
-  its bitrate if the audience can't upload enough to carry it ("Audience upload is limited" shows
-  either way).
-- **Watching.** With two or more streams live, a tile rail shows live previews; click one to put it
-  on the stage. Hover the player for mute (every stream starts muted), quality (Auto, Full or
-  Preview), buffering (Low latency, Auto, or Extra smooth, which adds 1.5 s for flaky
-  connections), fullscreen, and a gear with **Stats** (including what you receive and upload right
+  when you switch away (so sharing the whole screen doesn't film the preview); the stage is outlined
+  in red while you're live. A presenter bar under it shows **Live · N watching**, mutes the mic or
+  the stream audio, switches the source, changes the quality (a button showing the live choice
+  opens the same picker; changes apply at once, with a brief blur while the encoder restarts at a
+  new resolution or frame rate) and has **Stop sharing**, and shows what you are uploading right
+  now ("Uploading 4.2 Mbps", with a meter against what your upload carries; amber with the reason
+  on hover while the bitrate is held below the chosen quality, e.g. "limited by your upload:
+  ~8.0 Mbps"). With **Lower automatically** the stream drops its bitrate if the audience can't
+  upload enough to carry it; either way one amber line above the bar says what the audience can
+  carry and why the bitrate is held back.
+- **Watching.** A chip on the stage says who is presenting. With two or more streams live, a
+  **Live now** strip under the stage shows live previews; click one to put it on the stage. Hover
+  the player for mute (every stream starts muted), quality (Auto, Full or Preview), buffering (Low
+  latency, Auto, or Extra smooth, which adds 1.5 s for flaky connections), a readout of the
+  resolution, frame rate and delay, fullscreen, and **Details** with **Stats** (including what you receive and upload right
   now, and a per-peer list: every member's measured upload capacity, marked "est.", and for peers you're
   connected to the live sending / receiving rates and RTT), **Peers** (who is connected; see
   [Per-link stats](#per-link-stats)) and **Topology** (the stream's relay trees, fetched from its
   presenter; every node carries a number, P for the publisher and #1, #2, … in join order, that
   matches the table below it, which also shows each peer's live send rate).
+- **People.** The side panel's **People** tab lists everyone, with Owner and Live badges, who has
+  asked to share, and each connection in a word (Good, OK, Slow, Connecting…, Can't connect;
+  the round trip on hover).
 - **Moderation.** The owner can stop anyone's stream from its tile menu (which revokes their right
-  to share) and kick members from the Peers panel.
+  to share), and remove members from their menu in **People** (or the Details › Peers panel).
 - **Names.** Guests may join and watch anonymously, but pick a name before sharing, asking to
-  share, or sending their first chat message. It is remembered; change it from the name field on
-  the home page (it applies the next time a lobby loads).
-- **Chat.** Signed, rate limited, collapsible; a joiner receives the last 50 messages.
+  share, or sending their first chat message (the chat box offers **Pick a name** up front). It is
+  remembered; change it from the name field on the home page (it applies the next time a lobby loads).
+- **Chat.** The side panel's **Chat** tab: signed, rate limited, collapsible; a joiner receives the
+  last 50 messages.
 
 Useful URL parameters (put them in the page query or the hash query):
 
@@ -231,7 +241,7 @@ bitrate settles at 85% of what it carries; with lanes the same stream should hol
 
 ### Security
 
-The owner's URL never leaves its device: **Create lobby** draws a private seed, keeps it in
+The owner's URL never leaves its device: **Create a lobby** draws a private seed, keeps it in
 `localStorage`, and shows the lobby link `#/lobby/<secret>.<owner public key>`. From the seed the
 owner derives (HKDF, `src/net/lobby.ts`) the 128-bit lobby secret and its Ed25519 key. Links keep the
 code in the fragment, so it is never sent to a server. From the join code everyone derives:
@@ -248,11 +258,12 @@ DTLS encrypts every hop. Gossip records, chat messages and channel announcements
 envelopes (`src/mesh/envelope.ts`) that any peer can verify and forward.
 
 **Publishing rights** (`src/mesh/auth.ts`). The owner signs one gossiped document holding the
-lobby's publish policy (`ask`, `open` = *Allow all*, `closed` = *Deny all*), grants bound to
+lobby's publish policy (`ask`, `open` = *Anyone*, `closed` = *Only me*), grants bound to
 grantees' public keys, revocations and bans. Only the key pinned in the join code can change it,
 everyone (including later joiners) holds the latest version, and it keeps working while the owner
-is away. A member who may not publish asks the owner, who answers with **Allow**, **Allow all**,
-**Deny** or **Deny all**; stopping a stream from its tile revokes the grant.
+is away. A member who may not publish asks the owner, who answers `allow`, `deny` or `allow-all`
+(**Allow**, **Not now**, **Let anyone share from now on**; the protocol also has `deny-all`, which
+the UI does as the *Only me* policy); stopping a stream from its tile revokes the grant.
 
 **Tamper-proofing.** Every media fragment is signed by its channel's publisher
 (`src/proto/signing.ts`), and the signature covers the channel id. Relays look up the publisher's

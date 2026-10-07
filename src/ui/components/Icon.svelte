@@ -18,6 +18,19 @@
     link: 'M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7',
     close: 'M18 6 6 18M6 6l12 12',
     more: 'M12 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2zM19 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2zM5 13a1 1 0 1 0 0-2 1 1 0 0 0 0 2z',
+    activity: 'M22 12h-4l-3 9L9 3l-3 9H2',
+    copy: 'M9 9h12v12H9zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1',
+    send: 'M22 2 11 13M22 2l-7 20-4-9-9-4z',
+    arrowRight: 'M5 12h14M13 6l6 6-6 6',
+    arrowUp: 'M12 19V5M6 11l6-6 6 6',
+    chevronDown: 'm6 9 6 6 6-6',
+    eye: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
+    alert: 'M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01',
+    check: 'M20 6 9 17l-5-5',
+    sliders: 'M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M16 4v4M10 10v4M18 16v4',
+    sidebar: 'M3 4h18v16H3zM15 4v16',
+    zap: 'M13 2 4 14h7l-1 8 9-12h-7z',
+    shield: 'M12 3 4 6v6c0 5 3.4 8.3 8 9 4.6-.7 8-4 8-9V6zM9 12l2 2 4-4',
   } as const
   export type IconName = keyof typeof PATHS
 </script>

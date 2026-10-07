@@ -7,7 +7,7 @@
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publishedStream'
   import { fmtKbps, fmtMs, iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
-  import { applyAutoQuality, resolveShareOptions, stageMessage } from './lobbyView'
+  import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage } from './lobbyView'
   import { ownerSeed, saveSettings, settings } from './settings.svelte'
   import { maxSizeFor, targetKbps } from '../media/quality'
   import { nativeScreenSize } from './screen'
@@ -25,6 +25,11 @@
   import { fmtMbps, sessionPeers, uploadBadge } from './liveRates'
   import PeerRates from './components/PeerRates.svelte'
   import Icon from './components/Icon.svelte'
+  import Logo from './components/Logo.svelte'
+  import Avatar from './components/Avatar.svelte'
+  import SidePanel from './components/SidePanel.svelte'
+  import PeopleList, { type Person } from './components/PeopleList.svelte'
+  import InviteCard from './components/InviteCard.svelte'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
   // The page is remounted on every route change, so reading the initial props is intended.
@@ -207,7 +212,23 @@
   let muted = $state(true)
   let copied = $state(false)
   let gearTab = $state<'stats' | 'peers' | 'topology'>('stats')
-  let settingsOpen = $state(false)
+  /** The top bar's open popover. */
+  let popover = $state<'invite' | 'settings' | null>(null)
+  let settingsOpen = $derived(popover === 'settings')
+
+  // Closes the popover on a click outside it, or Escape.
+  $effect(() => {
+    if (!popover) return
+    const close = (e: Event) => {
+      if (e instanceof KeyboardEvent ? e.key === 'Escape' : !(e.target as Element).closest?.('.popover-anchor')) popover = null
+    }
+    document.addEventListener('pointerdown', close)
+    document.addEventListener('keydown', close)
+    return () => {
+      document.removeEventListener('pointerdown', close)
+      document.removeEventListener('keydown', close)
+    }
+  })
 
   $effect(() => {
     void settings.view.chatOpen
@@ -267,6 +288,29 @@
           })
         : null,
     }
+  })
+
+  /** Everyone in the lobby for the People tab: you first, then the owner, presenters and the rest. */
+  const people = $derived.by((): Person[] => {
+    void tick
+    const s = session
+    if (!s) return []
+    const mesh = s.mesh
+    const live = new Set(s.liveStreams().map((x) => x.publisher))
+    const rank = (id: string) => (id === mesh.selfId ? 0 : id === ownerId ? 1 : live.has(id) ? 2 : 3)
+    return [mesh.record, ...mesh.members()]
+      .map((r) => {
+        const self = r.id === mesh.selfId
+        return {
+          id: r.id,
+          name: r.name || r.id.slice(0, 6),
+          self,
+          badges: badges(r.id),
+          asking: s.requests.has(r.id),
+          conn: self ? null : connectionWord(mesh.linkStatus(r.id), mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
+        }
+      })
+      .sort((a, b) => rank(a.id) - rank(b.id))
   })
 
   // A phone that sleeps stops its camera: keep the screen on while sharing one.
@@ -347,6 +391,12 @@
         : []
     return {
       presenting,
+      /** Who is on stage, when it's someone else. */
+      onStage: stage && !presenting ? { id: stage.publisher, name: nameOf(stage.publisher) } : null,
+      /** Nobody is sharing and this peer isn't either: the stage shows the invite card instead. */
+      empty: !stage && !presenting && !shareError && (!!lobby?.joined || isOwner),
+      ownPreviewShowing: presenting && showOwnPreview,
+      readout: presenting ? null : playbackReadout(p),
       source: stageView.source,
       player: stageView.player,
       // The presenter sees what it shares while this tab is focused. Otherwise (it is probably in
@@ -410,46 +460,86 @@
   })
 </script>
 
+{#snippet invite()}
+  {#if lobby}
+    <InviteCard
+      {link}
+      {isOwner}
+      {cameraOnly}
+      {copied}
+      ownerAway={lobby.ownerAway}
+      canShare={lobby.canShare}
+      policy={lobby.policy}
+      showShare={lobby.request !== 'waiting' && lobby.request !== 'owner-away' && (lobby.canShare || lobby.policy !== 'closed')}
+      oncopy={copyLink}
+      onshare={onShareClick}
+      onpolicy={isOwner ? () => (popover = 'settings') : undefined}
+    />
+  {/if}
+{/snippet}
+
 <div class="lobby">
   <header class="lobby-bar">
-    <a href="#/" class="brand" title="Home">▣ p2pscreenshare</a>
+    <a href="#/" class="home-link" title="Home" aria-label="Home"><Logo size={28} /></a>
+    <span class="bar-divider"></span>
     <b class="lobby-name" data-testid="lobby-name">{lobby?.name ?? 'Lobby'}</b>
+    {#if lobby}
+      {@const faces = people.slice(0, 3)}
+      <span class="presence" class:solo={faces.length < 2} title={lobby.joined ? 'People in this lobby' : `Looking for the lobby (${lobby.trackers} trackers connected)`}>
+        {#if faces.length >= 2}
+          <span class="avatar-stack">{#each faces as f (f.id)}<Avatar id={f.id} name={f.name} />{/each}</span>
+        {:else}
+          <span class="dot" class:off={!lobby.joined}></span>
+        {/if}
+        {#if lobby.joined || isOwner}<span><span data-testid="member-count">{lobby.members}</span> here</span>{:else}Connecting…{/if}
+      </span>
+    {/if}
     {#if lobby?.ownerAway && lobby.joined}<span class="badge warn" data-testid="owner-away">Owner away</span>{/if}
-    <button data-testid="copy-link" onclick={copyLink}><Icon name="link" />{copied ? 'Copied' : 'Copy link'}</button>
-    <code class="lobby-link" data-testid="lobby-link">{link}</code>
     <span class="spacer"></span>
-    {#if lobby}<span class="members" data-testid="member-count" title="Members"><Icon name="users" /> {lobby.members}</span>{/if}
+    <div class="popover-anchor">
+      <button data-testid="invite" aria-expanded={popover === 'invite'} onclick={() => (popover = popover === 'invite' ? null : 'invite')}>
+        <Icon name="link" />Invite
+      </button>
+      {#if popover === 'invite'}
+        <div class="popover" data-testid="invite-panel">
+          <p class="hint">Anyone with this link can join the lobby.</p>
+          <div class="link-field">
+            <label class="sr-only" for="lobby-link">Lobby link</label>
+            <input id="lobby-link" data-testid="lobby-link" readonly value={link} onfocus={(e) => e.currentTarget.select()} />
+            <button class="soft" data-testid="copy-link" onclick={copyLink}><Icon name={copied ? 'check' : 'copy'} />{copied ? 'Copied' : 'Copy'}</button>
+          </div>
+        </div>
+      {/if}
+    </div>
     {#if lobby?.sharing}
-      <button data-testid="stop-share" onclick={stopSharing}><Icon name="stop" />Stop sharing</button>
+      <!-- Stop is in the presenter bar under the stage. -->
     {:else if lobby?.request === 'waiting'}
-      <span class="badge" data-testid="request-waiting">Waiting for the owner…</span>
-      <button onclick={() => session?.cancelRequest()}>Cancel</button>
+      <span class="request-state"><span class="badge accent" data-testid="request-waiting">Waiting for the owner…</span><button onclick={() => session?.cancelRequest()}>Cancel</button></span>
     {:else if lobby?.request === 'owner-away'}
-      <span class="badge warn" data-testid="request-owner-away">Owner is away</span>
-      <button onclick={() => session?.cancelRequest()}>Cancel</button>
+      <span class="request-state"><span class="badge warn" data-testid="request-owner-away">Owner is away</span><button onclick={() => session?.cancelRequest()}>Cancel</button></span>
     {:else if lobby}
       {#if lobby.request === 'denied'}<span class="badge warn" data-testid="request-denied">The owner declined</span>{/if}
-      <button class="primary" data-testid="share-screen" onclick={onShareClick}>
+      <button class={lobby.canShare ? 'primary' : 'soft'} data-testid="share-screen" onclick={onShareClick}>
         <Icon name={cameraOnly ? 'camera' : 'screen'} />{lobby.canShare ? (cameraOnly ? 'Share camera' : 'Share screen') : 'Ask to share'}
       </button>
     {/if}
     {#if isOwner && lobby}
       <div class="popover-anchor">
-        <button data-testid="lobby-settings" aria-expanded={settingsOpen} onclick={() => (settingsOpen = !settingsOpen)} title="Lobby settings">
-          <Icon name="gear" />
+        <button class="icon-only" data-testid="lobby-settings" aria-expanded={settingsOpen} aria-label="Lobby settings" title="Lobby settings" onclick={() => (popover = settingsOpen ? null : 'settings')}>
+          <Icon name="sliders" size={17} />
         </button>
         {#if settingsOpen}
           <div class="popover" data-testid="lobby-settings-panel">
             <label>
-              Who may share
+              Who can share
               <select
                 data-testid="policy"
                 value={lobby.policy}
                 onchange={(e) => void session?.setPolicy((e.currentTarget as HTMLSelectElement).value as PublishPolicy)}
               >
                 <option value="ask">Ask me each time</option>
-                <option value="open">Anyone (Allow all)</option>
-                <option value="closed">Only me (Deny all)</option>
+                <option value="open">Anyone</option>
+                <option value="closed">Only me</option>
               </select>
             </label>
           </div>
@@ -470,18 +560,29 @@
       {#if invalid}
         <Stage message="This link is incomplete. Ask for the full lobby link." />
       {:else if view}
-        <div class="main-row">
           <Stage
             player={view.player}
             localStream={view.localStream}
             mirror={view.mirror}
             message={view.message}
             hasAudio={view.hasAudio}
+            live={view.presenting}
+            readout={view.readout}
+            children={view.empty && lobby ? invite : undefined}
             qualityOptions={view.presenting || !view.sub ? null : ['auto', 'full', 'preview']}
             bind:quality={settings.view.quality}
             bind:buffering={settings.view.buffering}
             bind:muted
           >
+            {#snippet chip()}
+              {#if view.onStage}
+                <span class="stage-chip" data-testid="presenter-chip">
+                  <Avatar id={view.onStage.id} name={view.onStage.name} /><span><b>{view.onStage.name}</b> is presenting</span>
+                </span>
+              {:else if view.ownPreviewShowing && session?.publishing?.opts.source === 'screen'}
+                <span class="stage-chip plain"><Icon name="eye" size={15} />Your preview. It hides when you leave this tab.</span>
+              {/if}
+            {/snippet}
             {#snippet panel()}
               <div class="tabs">
                 <button class:active={gearTab === 'stats'} onclick={() => (gearTab = 'stats')}>Stats</button>
@@ -550,13 +651,14 @@
               onstop={(p) => void session?.revokePublisher(p)}
             />
           {/if}
-        </div>
         {#if lobby?.sharing && lobby.presenterAudio}
           <PresenterBar
             audio={lobby.presenterAudio}
+            viewers={view.pub?.subscribers ?? null}
             limited={lobby.limited}
             clamp={lobby.clamp}
             uploading={lobby.uploading}
+            uploadFraction={view.live.sendKbps !== null && view.capacity ? view.live.sendKbps / view.capacity : null}
             auto={session?.autoBitrate ?? false}
             bind:quality={settings.share.video}
             bind:autoLower={settings.share.autoLower}
@@ -585,13 +687,26 @@
     </div>
 
     {#if session}
-      <ChatPanel
-        messages={lobby?.chat ?? []}
-        selfId={session.selfId}
-        {badges}
-        bind:open={settings.view.chatOpen}
-        onsend={sendChat}
-      />
+      {@const s = session}
+      <SidePanel bind:open={settings.view.chatOpen} count={people.length} messages={lobby?.chat.length ?? 0}>
+        {#snippet chat()}
+          <ChatPanel
+            messages={lobby?.chat ?? []}
+            selfId={s.selfId}
+            {badges}
+            guestName={hasName ? null : name}
+            onpickname={() => withName('to show in chat and the people list', () => {})}
+            onsend={sendChat}
+          />
+        {/snippet}
+        {#snippet roster()}
+          <PeopleList
+            {people}
+            onkick={isOwner ? (id) => void s.kick(id) : null}
+            onallow={isOwner ? (id) => void s.respond(id, 'allow') : null}
+          />
+        {/snippet}
+      </SidePanel>
     {/if}
   </div>
 </div>
