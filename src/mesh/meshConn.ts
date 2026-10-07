@@ -3,13 +3,13 @@
 // upload probes. A tree edge is just "forward channel X stripe s over this pair's media channel",
 // so joining or switching parents never needs new ICE or DTLS setup.
 import { wallClock } from '../net/clock'
-import { LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from '../net/link'
+import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from '../net/link'
 import { parseLinkStats, type StatsLike } from '../net/linkStats'
+import { after } from '../net/ticker'
 import { tuning } from '../tuning'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
 export const CONNECT_TIMEOUT_MS = 15_000
-const BIN_BUFFER_HIGH = 1024 * 1024
 
 export type Ctl = { t: string; [k: string]: unknown }
 
@@ -30,7 +30,6 @@ export interface PeerConn extends MediaLink {
   readonly rttMs: number | null
   onCtl: (msg: Ctl) => void
   onMedia: (data: Uint8Array) => void
-  onBin: (data: Uint8Array) => void
   onStateChange: (state: LinkState) => void
   onBufferLow: () => void
   armTimeout(ms?: number): void
@@ -44,7 +43,7 @@ export interface PeerConn extends MediaLink {
   usesRelay(): Promise<boolean | null>
   /** The connection's getStats() report (absent in tests' fakes; null when closed). */
   stats?(): Promise<StatsLike | null>
-  /** The `bin` channel as a probe link (see uploadProbe.ts). */
+  /** The `bin` channel as a probe link (see session/headroom.ts). */
   readonly probeLink: ProbeLink
   close(): void
 }
@@ -83,7 +82,13 @@ export async function selectedPairRelayed(pc: RTCPeerConnection): Promise<boolea
   return (report && parseLinkStats(report)?.relayed) ?? null
 }
 
-/** A reliable `bin` channel as a ProbeLink (buffer-low events drive the probe's refills). */
+/** Sets up a connection's reliable `bin` channel: buffer-low events drive the probe's refills. */
+export function setUpBin(bin: RTCDataChannel): void {
+  bin.binaryType = 'arraybuffer'
+  bin.bufferedAmountLowThreshold = BACKGROUND_BUFFER_MAX / 2
+}
+
+/** A reliable `bin` channel as a ProbeLink (received bytes are dropped: nothing reads them). */
 export function binProbeLink(bin: RTCDataChannel, state: () => LinkState): ProbeLink {
   const link: ProbeLink = {
     get isOpen() {
@@ -96,12 +101,6 @@ export function binProbeLink(bin: RTCDataChannel, state: () => LinkState): Probe
       return bin.bufferedAmount
     },
     onBufferLow: null,
-    get bufferLowThreshold() {
-      return bin.bufferedAmountLowThreshold
-    },
-    set bufferLowThreshold(v: number) {
-      bin.bufferedAmountLowThreshold = v
-    },
     send(data: Uint8Array) {
       if (bin.readyState !== 'open') return false
       try {
@@ -138,18 +137,15 @@ export class MeshConn implements MediaLink, PeerConn {
   lastHeardAt = performance.now()
   /** Smoothed ping round-trip time. */
   rttMs: number | null = null
-  bytesSent = 0
-  bytesReceived = 0
 
   onCtl: (msg: Ctl) => void = () => {}
   onMedia: (data: Uint8Array) => void = () => {}
-  onBin: (data: Uint8Array) => void = () => {}
   onStateChange: (state: LinkState) => void = () => {}
   onBufferLow: () => void = () => {}
 
   private pingSeq = 0
   private pongWaiters = new Map<number, { sentAt: number; resolve: (remoteClock: number) => void }>()
-  private timeout: ReturnType<typeof setTimeout> | null = null
+  private timeout: (() => void) | null = null
 
   constructor(
     iceServers: RTCIceServer[],
@@ -161,19 +157,13 @@ export class MeshConn implements MediaLink, PeerConn {
     this.ctl = this.pc.createDataChannel('ctl', { negotiated: true, id: 1, ordered: true })
     this.bin = this.pc.createDataChannel('bin', { negotiated: true, id: 2, ordered: true })
     this.media.binaryType = 'arraybuffer'
-    this.bin.binaryType = 'arraybuffer'
     this.media.bufferedAmountLowThreshold = LINK_BUFFER_LOW
-    this.bin.bufferedAmountLowThreshold = BIN_BUFFER_HIGH / 4
+    setUpBin(this.bin)
 
     this.ctl.onopen = () => this.setState('open')
     this.ctl.onclose = () => this.setState('closed')
     this.media.onbufferedamountlow = () => this.onBufferLow()
-    this.media.onmessage = (ev) => {
-      const data = new Uint8Array(ev.data as ArrayBuffer)
-      this.bytesReceived += data.byteLength
-      this.onMedia(data)
-    }
-    this.bin.onmessage = (ev) => this.onBin(new Uint8Array(ev.data as ArrayBuffer))
+    this.media.onmessage = (ev) => this.onMedia(new Uint8Array(ev.data as ArrayBuffer))
     this.ctl.onmessage = (ev) => {
       let msg: Ctl
       try {
@@ -199,9 +189,9 @@ export class MeshConn implements MediaLink, PeerConn {
    */
   armTimeout(ms = CONNECT_TIMEOUT_MS): void {
     if (this.timeout !== null || this.state !== 'connecting') return
-    this.timeout = setTimeout(() => {
+    this.timeout = after(ms, () => {
       if (this.state === 'connecting') this.setState('failed')
-    }, ms)
+    })
   }
 
   /** Waits for ICE gathering (signaling is not trickled), bounded by a timeout. */
@@ -241,7 +231,6 @@ export class MeshConn implements MediaLink, PeerConn {
     if (!this.isOpen) return false
     try {
       this.media.send(data as Uint8Array<ArrayBuffer>)
-      this.bytesSent += data.byteLength
       return true
     } catch {
       // closed between the check and the send
@@ -271,34 +260,25 @@ export class MeshConn implements MediaLink, PeerConn {
     return selectedPairRelayed(this.pc)
   }
 
-  /** Sends on the probe channel, waiting while its buffer is full. */
-  async sendBin(data: Uint8Array): Promise<void> {
-    if (this.bin.readyState !== 'open') throw new Error('not connected')
-    if (this.bin.bufferedAmount > BIN_BUFFER_HIGH) {
-      await new Promise<void>((r) => this.bin.addEventListener('bufferedamountlow', () => r(), { once: true }))
-    }
-    this.bin.send(data as Uint8Array<ArrayBuffer>)
-  }
-
   /** Pings the remote; resolves with its wall clock (for clock sync), rejects on timeout. */
   ping(timeoutMs = 3000): Promise<number> {
     return new Promise((resolve, reject) => {
       const id = ++this.pingSeq
       const sentAt = performance.now()
       this.pingSentAt = sentAt
-      const t = setTimeout(() => {
+      const cancel = after(timeoutMs, () => {
         this.pongWaiters.delete(id)
         reject(new Error('ping timeout'))
-      }, timeoutMs)
+      })
       this.pongWaiters.set(id, {
         sentAt,
         resolve: (v) => {
-          clearTimeout(t)
+          cancel()
           resolve(v)
         },
       })
       if (!this.sendCtl({ t: '__ping', id })) {
-        clearTimeout(t)
+        cancel()
         this.pongWaiters.delete(id)
         reject(new Error('not connected'))
       }
@@ -333,7 +313,7 @@ export class MeshConn implements MediaLink, PeerConn {
     if (this.state === state || this.state === 'closed' || this.state === 'failed') return
     this.state = state
     if (state === 'open') this.wasOpen = true
-    if (state !== 'connecting' && this.timeout !== null) clearTimeout(this.timeout)
+    if (state !== 'connecting') this.timeout?.()
     if (state === 'closed' || state === 'failed') {
       try {
         this.pc.close()

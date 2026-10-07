@@ -13,7 +13,7 @@
 //
 // Everything is driven by timers, so tests run it under fake timers (see clock.ts).
 import type { RendezvousOptions, RendezvousPort } from '../../src/net/bootstrap'
-import { LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../../src/net/link'
+import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../../src/net/link'
 import type { LaneConn } from '../../src/mesh/lane'
 import type { Ctl, PeerConn } from '../../src/mesh/meshConn'
 import { every } from '../../src/net/ticker'
@@ -296,7 +296,6 @@ export class FakeConn implements PeerConn, FakeEnd {
 
   onCtl: (msg: Ctl) => void = () => {}
   onMedia: (data: Uint8Array) => void = () => {}
-  onBin: (data: Uint8Array) => void = () => {}
   onStateChange: (state: LinkState) => void = () => {}
   onBufferLow: () => void = () => {}
 
@@ -321,6 +320,7 @@ export class FakeConn implements PeerConn, FakeEnd {
     this.media.bufferLowThreshold = LINK_BUFFER_LOW
     this.media.onBufferLow = () => this.onBufferLow()
     this.bin = new FakeChannel(net, this, 'bin')
+    this.bin.bufferLowThreshold = BACKGROUND_BUFFER_MAX / 2
   }
 
   get isOpen(): boolean {
@@ -344,8 +344,8 @@ export class FakeConn implements PeerConn, FakeEnd {
   }
 
   receiveData(kind: 'media' | 'bin', data: Uint8Array): void {
+    // The bin channel's bytes are dropped, as in the real connections.
     if (kind === 'media') this.onMedia(data)
-    else this.onBin(data)
   }
 
   async usesRelay(): Promise<boolean | null> {
@@ -477,7 +477,6 @@ export class FakeLane implements LaneConn, FakeEnd {
   readonly media: FakeChannel
   readonly bin: FakeChannel
   onMedia: (data: Uint8Array) => void = () => {}
-  onBin: (data: Uint8Array) => void = () => {}
   onStateChange: (state: LinkState) => void = () => {}
   onBufferLow: () => void = () => {}
   private timeout: ReturnType<typeof setTimeout> | null = null
@@ -493,6 +492,7 @@ export class FakeLane implements LaneConn, FakeEnd {
     this.media.bufferLowThreshold = LINK_BUFFER_LOW
     this.media.onBufferLow = () => this.onBufferLow()
     this.bin = new FakeChannel(net, this, 'bin')
+    this.bin.bufferLowThreshold = BACKGROUND_BUFFER_MAX / 2
   }
 
   get isOpen(): boolean {
@@ -516,8 +516,8 @@ export class FakeLane implements LaneConn, FakeEnd {
   }
 
   receiveData(kind: 'media' | 'bin', data: Uint8Array): void {
+    // The bin channel's bytes are dropped, as in the real connections.
     if (kind === 'media') this.onMedia(data)
-    else this.onBin(data)
   }
 
   armTimeout(ms = CONNECT_TIMEOUT_MS): void {

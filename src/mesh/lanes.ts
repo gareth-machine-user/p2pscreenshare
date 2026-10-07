@@ -15,7 +15,7 @@
 // the lanes that are open, connecting or waiting for a retry; a slot whose lane isn't open falls
 // back to lane 0. So the mapping only changes when a lane is given up for good (or declined), or
 // the pair's trees change, not while one reconnects.
-import type { MediaLink, ProbeLink } from '../net/link'
+import type { MediaLink } from '../net/link'
 import { after } from '../net/ticker'
 import type { LaneConn, LaneFactory } from './lane'
 import type { PeerConn } from './meshConn'
@@ -78,7 +78,6 @@ export interface LaneHost {
   readonly wanted: number
   connect: LaneFactory
   onMedia(data: Uint8Array, from: string): void
-  onBinary(data: Uint8Array, from: string): void
   onBufferLow(): void
   onChange(): void
 }
@@ -131,19 +130,8 @@ export class Lanes {
     return out
   }
 
-  /** The probe links of a peer's open lanes. */
-  probeLinks(id: string): ProbeLink[] {
-    return this.openLanes(id).map((l) => l.probeLink)
-  }
-
   relayed(id: string): boolean {
     return !!this.pairs.get(id)?.relayed
-  }
-
-  /** The peer a lane leads to, if `link` is one of the lanes. */
-  peerOf(link: unknown): string | undefined {
-    for (const [id, pair] of this.pairs) for (const s of pair.slots.values()) if (s.lane === link) return id
-    return undefined
   }
 
   /** Lane signaling from `conn`'s peer (already validated with isLaneMsg). */
@@ -206,7 +194,6 @@ export class Lanes {
     this.created++
     slot.lane = lane
     lane.onMedia = (data) => this.host.onMedia(data, id)
-    lane.onBin = (data) => this.host.onBinary(data, id)
     lane.onBufferLow = () => this.host.onBufferLow()
     lane.onStateChange = (state) => {
       if (state === 'open') this.host.onChange()
@@ -304,7 +291,6 @@ export class Lanes {
     if (!lane) return
     lane.onStateChange = () => {}
     lane.onMedia = () => {}
-    lane.onBin = () => {}
     lane.close()
   }
 

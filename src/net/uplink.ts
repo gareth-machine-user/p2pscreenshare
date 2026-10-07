@@ -1,12 +1,10 @@
-import { LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type MediaLink } from './link'
+import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type MediaLink } from './link'
 import { tuning } from '../tuning'
 
 // Per-layer queueing deadlines (see tuning.ts): when the uplink can't keep up, enhancement layers
 // (T2, then T1) expire first, so overloaded relays degrade frame rate instead of stalling the
 // base layer.
 const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
-/** Replays and headroom-probe data are sent only while the channel's send buffer holds less than this (bytes). */
-export const REPLAY_BUFFER_MAX = 64 * 1024
 
 /**
  * A connection whose send buffer holds more than LINK_BUFFER_LOW and hasn't drained a byte for this
@@ -50,11 +48,8 @@ export interface LinkCounters {
   drops: number
   queueDelaySum: number
   queueDelayN: number
-  stalls: number
   /** When the link was last seen stalled (STALL_MS without draining), or -Infinity. */
   lastStallAt: number
-  /** Stall episodes (each STALL_MS or longer). */
-  stallEpisodes: number
 }
 
 export interface UplinkStats {
@@ -113,21 +108,21 @@ export class Uplink {
   }
 
   /**
-   * Links whose traffic only uses spare upload (e.g. probes): served when no media is waiting, and
-   * only while their send buffer holds at most the given bytes.
+   * Links whose traffic only uses spare upload (headroom probes): served when no media is waiting,
+   * and only while their send buffer holds at most BACKGROUND_BUFFER_MAX.
    */
-  private background = new Map<MediaLink, number>()
+  private background = new Set<MediaLink>()
   /** Per link: frames that already lost a fragment there (until when to remember them). */
   private deadFrames = new Map<MediaLink, Map<string, number>>()
   /** Per-link counters (session/capacity.ts measures each connection's delivered rate from them). */
   readonly perLink = new Map<MediaLink, LinkCounters>()
   /** Per link: its send buffer as last seen (plus what was sent into it since), and when it last drained. */
-  private progress = new Map<MediaLink, { buffered: number; at: number; stalled: boolean }>()
+  private progress = new Map<MediaLink, { buffered: number; at: number }>()
 
   private counters(link: MediaLink): LinkCounters {
     let c = this.perLink.get(link)
     if (!c) {
-      c = { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, stalls: 0, lastStallAt: -Infinity, stallEpisodes: 0 }
+      c = { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, lastStallAt: -Infinity }
       this.perLink.set(link, c)
     }
     return c
@@ -142,21 +137,15 @@ export class Uplink {
     const b = link.isOpen ? link.bufferedAmount : 0
     const p = this.progress.get(link)
     if (!p) {
-      this.progress.set(link, { buffered: b, at: now, stalled: false })
+      this.progress.set(link, { buffered: b, at: now })
       return 0
     }
     if (b <= LINK_BUFFER_LOW || b < p.buffered) {
       p.at = now
-      p.stalled = false
     }
     p.buffered = b
     const ms = now - p.at
-    if (ms >= STALL_MS) {
-      const c = this.counters(link)
-      c.lastStallAt = now
-      if (!p.stalled) c.stallEpisodes++
-      p.stalled = true
-    }
+    if (ms >= STALL_MS) this.counters(link).lastStallAt = now
     return ms
   }
 
@@ -191,12 +180,9 @@ export class Uplink {
     }
   }
 
-  /**
-   * Marks a link as background (a headroom probe's `bin` channel). `bufferMax` bounds its send
-   * buffer (default REPLAY_BUFFER_MAX).
-   */
-  setBackground(link: MediaLink, on = true, bufferMax = REPLAY_BUFFER_MAX): void {
-    if (on) this.background.set(link, bufferMax)
+  /** Marks a link as background (a headroom probe's `bin` channel). */
+  setBackground(link: MediaLink, on = true): void {
+    if (on) this.background.add(link)
     else this.background.delete(link)
   }
 
@@ -312,10 +298,7 @@ export class Uplink {
         q.length = kept
         if (kept && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) {
           this.stats.bufferStalls++
-          if (!bg) {
-            this.counters(link).stalls++
-            this.stalledMs(link, now)
-          }
+          if (!bg) this.stalledMs(link, now)
         }
       }
       let progress = true
@@ -341,16 +324,13 @@ export class Uplink {
             if (link.state === 'closed' || link.state === 'failed') this.forget(link)
             continue
           }
-          // Background links (probes) are bounded by their own allowance, which grows past this on
-          // fast links.
+          // Background links (probes) are bounded below, by BACKGROUND_BUFFER_MAX.
           if (!q.length || (!this.background.has(link) && link.bufferedAmount > LINK_BUFFER_HIGH)) continue
           const it = q[0]
           // Catch-up replays and probes only go out while the channel's send buffer is nearly
           // empty: a mesh link's channels share one connection, so a deep backlog of either would
           // hold up live media (audio especially) inside it.
-          const bgMax = this.background.get(link)
-          if (it.replay && link.bufferedAmount > REPLAY_BUFFER_MAX) continue
-          if (bgMax !== undefined && link.bufferedAmount > bgMax) continue
+          if ((it.replay || this.background.has(link)) && link.bufferedAmount > BACKGROUND_BUFFER_MAX) continue
           // Tokens may go negative (debt), so messages larger than the burst still get through.
           if (this.capKbps !== null && this.tokens <= 0) {
             waitingOnTokens = true

@@ -10,9 +10,9 @@
 //
 // What real browsers expose (measured in e2e/linkstats.spec.ts, Chromium 150): candidate-pair
 // currentRoundTripTime / totalRoundTripTime / responsesReceived / bytesSent / bytesReceived, and
-// the transport's selectedCandidatePairId. No `sctp-transport` report (so no congestion window),
-// and no availableOutgoingBitrate on a data-only connection. Both are parsed in case a browser adds
-// them. Firefox has no selectedCandidatePairId: it flags the pair `selected`.
+// the transport's selectedCandidatePairId. No `sctp-transport` report (so no congestion window:
+// parsed in case a browser adds one), and no availableOutgoingBitrate on a data-only connection.
+// Firefox has no selectedCandidatePairId: it flags the pair `selected`.
 
 /** One stats object (RTCStats and its subtypes) as plain data. */
 export interface StatsRecord {
@@ -24,16 +24,6 @@ export interface StatsRecord {
 /** An RTCStatsReport, a Map of records, or a plain array of them. */
 export type StatsLike = { forEach(cb: (r: StatsRecord) => void): void }
 
-/** RTCSctpTransportStats, when the browser has them. */
-export interface SctpStats {
-  /** Bytes. */
-  congestionWindow: number | null
-  receiverWindow: number | null
-  smoothedRttMs: number | null
-  unackData: number | null
-  mtu: number | null
-}
-
 /** The interesting parts of one getStats() report. */
 export interface LinkStatsReport {
   pairId: string | null
@@ -42,12 +32,12 @@ export interface LinkStatsReport {
   /** Cumulative: the sum of all STUN round trips (s) and their count, to average between polls. */
   totalRttS: number | null
   responsesReceived: number | null
-  availableOutgoingKbps: number | null
   bytesSent: number | null
   bytesReceived: number | null
   /** Either end of the selected pair is a TURN relay candidate (null: unknown). */
   relayed: boolean | null
-  sctp: SctpStats | null
+  /** The SCTP congestion window (bytes), from an sctp-transport report (Chrome has none). */
+  cwnd: number | null
 }
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
@@ -79,19 +69,10 @@ export function parseLinkStats(report: StatsLike): LinkStatsReport | null {
     currentRttMs: scale(num(pair.currentRoundTripTime), 1000),
     totalRttS: num(pair.totalRoundTripTime),
     responsesReceived: num(pair.responsesReceived),
-    availableOutgoingKbps: scale(num(pair.availableOutgoingBitrate), 1 / 1000),
     bytesSent: num(pair.bytesSent),
     bytesReceived: num(pair.bytesReceived),
     relayed: local === undefined && remote === undefined ? null : local === 'relay' || remote === 'relay',
-    sctp: sctp
-      ? {
-          congestionWindow: num(sctp.congestionWindow),
-          receiverWindow: num(sctp.receiverWindow),
-          smoothedRttMs: scale(num(sctp.smoothedRoundTripTime), 1000),
-          unackData: num(sctp.unackData),
-          mtu: num(sctp.mtu),
-        }
-      : null,
+    cwnd: sctp ? num(sctp.congestionWindow) : null,
   }
 }
 
@@ -113,9 +94,8 @@ export interface LinkStats {
   /** Wire send / receive rate since the previous poll (all channels, with SCTP/DTLS overhead). */
   sendKbps: number | null
   recvKbps: number | null
-  availableOutgoingKbps: number | null
   relayed: boolean | null
-  sctp: SctpStats | null
+  cwnd: number | null
 }
 
 /**
@@ -159,9 +139,8 @@ export class LinkStatsTracker {
       fresh: now - this.lastRttAt <= this.staleMs,
       sendKbps: rate(r.bytesSent, prev?.r.bytesSent ?? null),
       recvKbps: rate(r.bytesReceived, prev?.r.bytesReceived ?? null),
-      availableOutgoingKbps: r.availableOutgoingKbps,
       relayed: r.relayed,
-      sctp: r.sctp,
+      cwnd: r.cwnd,
     }
     this.prev = { at: now, r }
     return this.latest

@@ -76,7 +76,6 @@ export interface LinkRow {
   relayed: boolean | null
   /** SCTP congestion window (bytes), if the browser exposes sctp-transport stats (Chrome doesn't). */
   cwnd: number | null
-  availableKbps: number | null
 }
 
 export interface LiveChannel {
@@ -844,8 +843,6 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const lagMs = Math.round(takeMainThreadLag())
     this.sampleLinks(now, lagMs)
     this.adaptBitrate(now)
-    const dropRate = Math.round(this.uplinkNow.dropRate * 1000) / 1000
-    if (dropRate !== (this.mesh.record.dropRate ?? 0)) this.mesh.updateRecord({ dropRate })
     this.updateOffers()
   }
 
@@ -1019,8 +1016,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
         drops: r?.drops ?? null,
         stalled: r?.stalled ?? false,
         relayed: s?.relayed ?? null,
-        cwnd: s?.sctp?.congestionWindow ?? null,
-        availableKbps: kbps(s?.availableOutgoingKbps),
+        cwnd: s?.cwnd ?? null,
       }
     })
   }

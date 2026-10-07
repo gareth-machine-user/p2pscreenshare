@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type LinkState, type MediaLink } from '../src/net/link'
+import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type LinkState, type MediaLink } from '../src/net/link'
 import { STALL_MS, Uplink } from '../src/net/uplink'
 import { tuning } from '../src/tuning'
 
@@ -182,20 +182,18 @@ describe('Uplink scheduling', () => {
     expect(u.stats.queueDelayN).toBe(2)
   })
 
-  it("a background link's send-buffer allowance can be raised", () => {
+  it('background data and replays wait while the send buffer holds more than BACKGROUND_BUFFER_MAX', () => {
     const u = new Uplink()
     const bg = new StubLink('bg')
     u.setBackground(bg)
-    bg.bufferedAmount = 100 * 1024
+    bg.bufferedAmount = BACKGROUND_BUFFER_MAX + 1
     u.send(bg, msg(1), 0)
-    // The default allowance (64 KB) holds it back.
     expect(sentBy('bg')).toEqual([])
-    u.setBackground(bg, true, 256 * 1024)
+    bg.bufferedAmount = BACKGROUND_BUFFER_MAX
     u.kick()
     expect(sentBy('bg')).toEqual([1])
-    // Replays to a media link keep the default allowance.
     const m = new StubLink('m')
-    m.bufferedAmount = 100 * 1024
+    m.bufferedAmount = BACKGROUND_BUFFER_MAX + 1
     u.send(m, msg(2), 0, undefined, true)
     expect(sentBy('m')).toEqual([])
   })
@@ -266,15 +264,15 @@ describe('Uplink stall detection', () => {
     expect(u.isStalled(a)).toBe(false)
     vi.advanceTimersByTime(20)
     expect(u.isStalled(a)).toBe(true)
-    expect(u.perLink.get(a)).toMatchObject({ stallEpisodes: 1 })
+    expect(u.perLink.get(a)).toMatchObject({ lastStallAt: performance.now() })
     // One byte drained: it moves again.
     a.bufferedAmount--
     expect(u.isStalled(a)).toBe(false)
     expect(u.stalledMs(a)).toBe(0)
-    // Stalls again later: a second episode.
+    // Stalls again later.
     vi.advanceTimersByTime(STALL_MS + 10)
     expect(u.isStalled(a)).toBe(true)
-    expect(u.perLink.get(a)).toMatchObject({ stallEpisodes: 2, lastStallAt: performance.now() })
+    expect(u.perLink.get(a)).toMatchObject({ lastStallAt: performance.now() })
   })
 
   it('does not count what was just sent into the buffer as draining', () => {

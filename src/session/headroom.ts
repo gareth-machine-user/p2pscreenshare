@@ -8,18 +8,18 @@
 // throttled. So refills are driven by the channels' buffer-low events (with the worker ticker as a
 // backstop) and the probe ends on the worker ticker: neither is throttled. A probe whose refills
 // were starved anyway (a frozen page) is discarded rather than taken as a (far too low) measurement.
-import type { ProbeLink } from '../net/link'
+import { BACKGROUND_BUFFER_MAX, type ProbeLink } from '../net/link'
 import { every, sleep } from '../net/ticker'
-import { REPLAY_BUFFER_MAX } from '../net/uplink'
 
 export const PROBE_DURATION_MS = 1500
 export const PROBE_CHUNK = 16 * 1024
 /**
- * Each channel's send-buffer allowance (refills happen when it falls to half). Small on purpose:
- * the `bin` channel shares its SCTP association with the connection's media (and the mesh link's
- * `ctl`), and in Chromium a deep buffer there can stall the whole association for seconds.
+ * Each channel's send-buffer allowance (the uplink's bound for background data; refills happen
+ * when it falls to half, the `bin` channel's low mark). Small on purpose: the `bin` channel shares
+ * its SCTP association with the connection's media (and the mesh link's `ctl`), and in Chromium a
+ * deep buffer there can stall the whole association for seconds.
  */
-export const PROBE_BUFFER = REPLAY_BUFFER_MAX
+export const PROBE_BUFFER = BACKGROUND_BUFFER_MAX
 /** Backstop refill period (worker ticker), should a buffer-low event not come. */
 const PROBE_TICK_MS = 50
 /** Longest normal gap between refills; longer means the page was starved (ms). */
@@ -32,7 +32,7 @@ export function probeStarved(r: { maxGapMs: number; elapsedMs: number }, duratio
 
 /** The slice of the uplink a probe drives. */
 export interface ProbeUplink {
-  setBackground(link: ProbeLink, on: boolean, bufferMax: number): void
+  setBackground(link: ProbeLink, on: boolean): void
   queued(link: ProbeLink): number
   send(link: ProbeLink, data: Uint8Array, layer: number, maxAgeMs?: number): void
   /** Drops what still waits for a link. */
@@ -59,7 +59,6 @@ export class HeadroomProbe {
     this.running = true
     this.lastAt = performance.now()
     const { uplink } = this
-    const saved = links.map((l) => ({ link: l, threshold: l.bufferLowThreshold }))
     let cancel = () => {}
     try {
       const depth = Math.ceil(PROBE_BUFFER / PROBE_CHUNK) + 1
@@ -77,8 +76,7 @@ export class HeadroomProbe {
         for (const l of links) for (let i = 0; i < 2 * depth && l.isOpen && uplink.queued(l) < depth; i++) uplink.send(l, this.chunk, 0, PROBE_DURATION_MS)
       }
       for (const l of links) {
-        uplink.setBackground(l, true, PROBE_BUFFER)
-        l.bufferLowThreshold = PROBE_BUFFER / 2
+        uplink.setBackground(l, true)
         l.onBufferLow = refill
       }
       const start = snapshot()
@@ -96,11 +94,10 @@ export class HeadroomProbe {
       return { start, end }
     } finally {
       cancel()
-      for (const { link, threshold } of saved) {
+      for (const link of links) {
         link.onBufferLow = null
-        link.bufferLowThreshold = threshold
         uplink.discard(link)
-        uplink.setBackground(link, false, PROBE_BUFFER)
+        uplink.setBackground(link, false)
       }
       this.running = false
     }

@@ -20,6 +20,11 @@ export type LinkState = 'connecting' | 'open' | 'closed' | 'failed'
  */
 export const LINK_BUFFER_HIGH = 64 * 1024
 export const LINK_BUFFER_LOW = 16 * 1024
+/**
+ * Low-priority data (GOP-cache replays, headroom probes) is only handed to a channel while its send
+ * buffer holds less than this (bytes): it shares the connection's SCTP association with live media.
+ */
+export const BACKGROUND_BUFFER_MAX = 64 * 1024
 
 export interface MediaLink {
   readonly isOpen: boolean
@@ -31,12 +36,10 @@ export interface MediaLink {
 
 /**
  * A neighbour's probe channel (the reliable `bin` channel): a MediaLink that also reports when
- * its send buffer drains, so the upload probe refills it from events, not timers (which a hidden
+ * its send buffer drains, so the headroom probe refills it from events, not timers (which a hidden
  * tab throttles).
  */
 export interface ProbeLink extends MediaLink {
-  /** Called whenever the send buffer falls to `bufferLowThreshold` or below. */
+  /** Called whenever the send buffer falls to half of BACKGROUND_BUFFER_MAX or below. */
   onBufferLow: (() => void) | null
-  /** Bytes. */
-  bufferLowThreshold: number
 }

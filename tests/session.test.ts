@@ -98,7 +98,8 @@ class StubProbeLink implements ProbeLink {
   bufferedAmount = 0
   sent = 0
   onBufferLow: (() => void) | null = null
-  bufferLowThreshold = 0
+  /** As a real `bin` channel's (mesh/meshConn.ts setUpBin). */
+  bufferLowThreshold = PROBE_BUFFER / 2
   send(data: Uint8Array): boolean {
     this.bufferedAmount += data.byteLength
     this.sent += data.byteLength
@@ -147,8 +148,7 @@ describe('headroom probe', () => {
     expect(kbps![1]).toBeGreaterThan(20_000 * 0.9)
     expect(kbps![1]).toBeLessThan(20_000 * 1.05)
     for (const l of links) {
-      // The channel's own low mark and handler are restored, and nothing is left queued.
-      expect(l.bufferLowThreshold).toBe(0)
+      // The handler is cleared, and nothing is left queued.
       expect(l.onBufferLow).toBeNull()
       expect(uplink.queued(l)).toBe(0)
     }

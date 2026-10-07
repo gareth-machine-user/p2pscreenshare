@@ -24,9 +24,9 @@ import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn, type ConnFactory, type PeerConn } from './meshConn'
 import { Lane, type LaneConn, type LaneFactory } from './lane'
 import { clampLanes, isLaneMsg, Lanes, type LaneMsg } from './lanes'
-import type { MediaLink, ProbeLink } from '../net/link'
+import type { MediaLink } from '../net/link'
 import { doorPeers, FailureDetector, GONE_MS, isMemberRecord, linkSuspected, RecordStore, retryDelayMs, SUSPECT_MS, type Digest, type MemberRecord } from './records'
-import { every } from '../net/ticker'
+import { after, every } from '../net/ticker'
 import { storageGet, storageSet } from '../util/storage'
 
 const HEARTBEAT_MS = 2000
@@ -168,7 +168,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
   onRecord: (rec: MemberRecord) => void = () => {}
   onApp: (msg: unknown, from: string) => void = () => {}
   onMedia: (data: Uint8Array, from: string) => void = () => {}
-  onBinary: (data: Uint8Array, from: string) => void = () => {}
   onBufferLow: () => void = () => {}
   onChat: (m: ChatMessage) => void = () => {}
   /** The owner's decisions changed. */
@@ -250,7 +249,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
       wanted: clampLanes(opts.lanes),
       connect: connectLane,
       onMedia: (data, from) => this.onMedia(data, from),
-      onBinary: (data, from) => this.onBinary(data, from),
       onBufferLow: () => this.onBufferLow(),
       onChange: () => this.onChange(),
     })
@@ -360,12 +358,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
    */
   isStalled: (link: MediaLink) => boolean = () => false
 
-  /** Probe links to `id`: the mesh link's and each open lane's (parallel flows). */
-  probeLinksFor(id: string): ProbeLink[] {
-    const c = this.linkFor(id)
-    return c ? [c.probeLink, ...this.lanes.probeLinks(id)] : []
-  }
-
   /** Open connections to `id` (the mesh link plus open lanes; 0 without a mesh link). */
   laneCount(id: string): number {
     return this.linkFor(id) ? 1 + this.lanes.openLanes(id).length : 0
@@ -376,12 +368,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
     const c = this.linkFor(id)
     if (!c) return []
     return [{ lane: 0, conn: c }, ...this.lanes.openLanes(id).map((l) => ({ lane: l.index, conn: l }))]
-  }
-
-  /** Whose link this is (a mesh link or a lane), if any. */
-  peerOfLink(link: unknown): string | undefined {
-    for (const c of this.conns.values()) if (c === link) return c.remoteId
-    return this.lanes.peerOf(link)
   }
 
   /** Whether the direct link to `id` is missing or its pings go unanswered. */
@@ -436,9 +422,9 @@ export class Mesh<C extends PeerConn = MeshConn> {
     if (this.selfId === this.ownerId) this.storage.setItem(this.authStoreKey, JSON.stringify(env))
     for (const c of this.conns.values()) c.sendCtl({ t: 'auth', env })
     // Kicked peers: close our links to them, once the news had time to reach them.
-    setTimeout(() => {
+    after(KICK_CLOSE_DELAY_MS, () => {
       for (const c of [...this.conns.values()]) if (this.isBannedPeer(c.remoteId)) c.close()
-    }, KICK_CLOSE_DELAY_MS)
+    })
     this.onAuth(this.auth)
     this.onChange()
   }
@@ -493,11 +479,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
       // closing anyway
     }
     this.rendezvous.close()
-    setTimeout(() => {
+    after(LEAVE_CLOSE_DELAY_MS, () => {
       this.lanes.closeAll()
       for (const c of this.conns.values()) c.close()
       this.conns.clear()
-    }, LEAVE_CLOSE_DELAY_MS)
+    })
   }
 
   // --- own record ------------------------------------------------------------------------------
@@ -546,7 +532,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
     this.conns.set(id, conn)
     conn.onCtl = (msg) => this.handle(msg as MeshMsg, id, conn)
     conn.onMedia = (data) => this.onMedia(data, id)
-    conn.onBin = (data) => this.onBinary(data, id)
     conn.onBufferLow = () => this.onBufferLow()
     conn.onStateChange = (state) => {
       if (state === 'open') {

@@ -4,11 +4,10 @@
 // stripes over several associations raises that ceiling (see lanes.ts for how lanes are opened
 // and used). A lane has no `ctl` channel: its signaling runs over the pair's mesh connection.
 import { LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from '../net/link'
+import { after } from '../net/ticker'
 import { tuning } from '../tuning'
 import type { StatsLike } from '../net/linkStats'
-import { binProbeLink, connStats, CONNECT_TIMEOUT_MS, gatherComplete } from './meshConn'
-
-const BIN_BUFFER_LOW = 256 * 1024
+import { binProbeLink, connStats, CONNECT_TIMEOUT_MS, gatherComplete, setUpBin } from './meshConn'
 
 /** What the mesh uses of a lane, so tests can substitute an in-memory one (tests/fakes/). */
 export interface LaneConn extends MediaLink {
@@ -17,7 +16,6 @@ export interface LaneConn extends MediaLink {
   readonly index: number
   readonly probeLink: ProbeLink
   onMedia: (data: Uint8Array) => void
-  onBin: (data: Uint8Array) => void
   onStateChange: (state: LinkState) => void
   onBufferLow: () => void
   armTimeout(ms?: number): void
@@ -36,15 +34,12 @@ export class Lane implements LaneConn {
   readonly media: RTCDataChannel
   readonly bin: RTCDataChannel
   state: LinkState = 'connecting'
-  bytesSent = 0
-  bytesReceived = 0
 
   onMedia: (data: Uint8Array) => void = () => {}
-  onBin: (data: Uint8Array) => void = () => {}
   onStateChange: (state: LinkState) => void = () => {}
   onBufferLow: () => void = () => {}
 
-  private timeout: ReturnType<typeof setTimeout> | null = null
+  private timeout: (() => void) | null = null
   private _probeLink: ProbeLink | null = null
 
   constructor(
@@ -57,18 +52,12 @@ export class Lane implements LaneConn {
     this.media = this.pc.createDataChannel('media', { negotiated: true, id: 0, ordered: false, maxPacketLifeTime: tuning.mediaMaxPacketLifeTimeMs })
     this.bin = this.pc.createDataChannel('bin', { negotiated: true, id: 2, ordered: true })
     this.media.binaryType = 'arraybuffer'
-    this.bin.binaryType = 'arraybuffer'
     this.media.bufferedAmountLowThreshold = LINK_BUFFER_LOW
-    this.bin.bufferedAmountLowThreshold = BIN_BUFFER_LOW
+    setUpBin(this.bin)
     this.media.onopen = () => this.setState('open')
     this.media.onclose = () => this.setState('closed')
     this.media.onbufferedamountlow = () => this.onBufferLow()
-    this.media.onmessage = (ev) => {
-      const data = new Uint8Array(ev.data as ArrayBuffer)
-      this.bytesReceived += data.byteLength
-      this.onMedia(data)
-    }
-    this.bin.onmessage = (ev) => this.onBin(new Uint8Array(ev.data as ArrayBuffer))
+    this.media.onmessage = (ev) => this.onMedia(new Uint8Array(ev.data as ArrayBuffer))
     this.pc.onconnectionstatechange = () => {
       if (this.pc.connectionState === 'failed') this.setState('failed')
       if (this.pc.connectionState === 'closed') this.setState('closed')
@@ -92,7 +81,6 @@ export class Lane implements LaneConn {
     if (!this.isOpen) return false
     try {
       this.media.send(data as Uint8Array<ArrayBuffer>)
-      this.bytesSent += data.byteLength
       return true
     } catch {
       // closed between the check and the send
@@ -102,9 +90,9 @@ export class Lane implements LaneConn {
 
   armTimeout(ms = CONNECT_TIMEOUT_MS): void {
     if (this.timeout !== null || this.state !== 'connecting') return
-    this.timeout = setTimeout(() => {
+    this.timeout = after(ms, () => {
       if (this.state === 'connecting') this.setState('failed')
-    }, ms)
+    })
   }
 
   async createOffer(): Promise<string> {
@@ -135,7 +123,7 @@ export class Lane implements LaneConn {
   private setState(state: LinkState): void {
     if (this.state === state || this.state === 'closed' || this.state === 'failed') return
     this.state = state
-    if (state !== 'connecting' && this.timeout !== null) clearTimeout(this.timeout)
+    if (state !== 'connecting') this.timeout?.()
     if (state === 'closed' || state === 'failed') {
       try {
         this.pc.close()

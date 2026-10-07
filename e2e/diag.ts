@@ -78,7 +78,7 @@ export function hostSampleExpr(viewerId: string): string {
       buf: conn.bufferedAmount,
       binBuf: conn.bin ? conn.bin.bufferedAmount : null,
       ctlBuf: conn.ctl ? conn.ctl.bufferedAmount : null,
-      sent: conn.bytesSent,
+      sent: pairs[i] ? pairs[i].bytesSent : null,
       q: p.uplink.queued(conn),
       ice: conn.pc ? conn.pc.iceConnectionState : null,
     }))
@@ -106,11 +106,18 @@ export function hostSampleExpr(viewerId: string): string {
 
 /** One viewer sample (page-side expression), for its link from `hostId`. */
 export function viewerSampleExpr(hostId: string): string {
-  return `(() => {
+  return `(async () => {
     const p = window.__p2p
     const d = p.debugViewer()
     const sub = p.stageSub
-    const lanes = p.mesh.connectionsOf(${JSON.stringify(hostId)}).map(({ lane, conn }) => ({ lane, recv: conn.bytesReceived }))
+    const recvOf = async (pc) => {
+      let out = null
+      ;(await pc.getStats()).forEach((r) => {
+        if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') out = r.bytesReceived
+      })
+      return out
+    }
+    const lanes = await Promise.all(p.mesh.connectionsOf(${JSON.stringify(hostId)}).map(async ({ lane, conn }) => ({ lane, recv: conn.pc ? await recvOf(conn.pc).catch(() => null) : null })))
     return { fps: d.fps, latencyMs: d.latencyMs, bufferMs: d.bufferMs, decoded: d.decoded, dropped: d.dropped, loss: sub ? sub.loss : null, lanes, now: performance.now(), lag: ${TAKE_LAG} }
   })()`
 }
