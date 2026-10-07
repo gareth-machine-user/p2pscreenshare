@@ -49,6 +49,7 @@ function relay() {
       const h = decodeFragment(data)!.header
       sent.push({ to: link.peer, seq: h.frameSeq, gop: h.gopId, replay: h.replay })
     },
+    isStalled: () => false,
   } as unknown as Uplink
   const node = new RelayNode(uplink, (peer) => ({ isOpen: true, peer }) as unknown as MediaLink)
   node.verifier = async () => true
@@ -267,6 +268,7 @@ describe('relay node: media lanes', () => {
         const h = decodeFragment(data)!.header
         sent.push({ link: link.name, stripe: h.stripe, channel: h.channel, replay: h.replay })
       },
+      isStalled: () => false,
     } as unknown as Uplink
     const node = new RelayNode(uplink, (peer, index) => ({ isOpen: true, name: `${peer}/${index}` }) as unknown as MediaLink)
     node.verifier = async () => true
@@ -316,5 +318,47 @@ describe('relay node: media lanes', () => {
     node.removeChild(CH, 0, 'c')
     await feed(node, [frag({ seq: 2, key: true, stripe: 2 })])
     expect(sent.map((x) => x.link)).toEqual(['c/0'])
+  })
+
+  it('moves a stalled connection’s trees to another of the pair’s, with what waits for it, until it drains', async () => {
+    const sent: string[] = []
+    const stalled = new Set<string>()
+    const moves: string[][] = []
+    type Named = MediaLink & { name: string }
+    const conns = [0, 1, 2].map((i) => ({ isOpen: true, name: `c/${i}` }) as unknown as Named)
+    const uplink = {
+      send: (link: Named, data: Uint8Array) => sent.push(`${decodeFragment(data)!.header.stripe}@${link.name}`),
+      isStalled: (l: Named) => stalled.has(l.name),
+      moveQueued: (from: Named, to: Named) => moves.push([from.name, to.name]),
+    } as unknown as Uplink
+    const node = new RelayNode(
+      uplink,
+      (_peer, index) => conns[index % 3],
+      () => conns,
+    )
+    node.verifier = async () => true
+    for (const s of [0, 1, 2]) node.addChild(CH, s, 'c')
+    let seq = 0
+    const round = async () => {
+      sent.length = 0
+      seq++
+      await feed(node, [0, 1, 2].map((s) => frag({ seq, key: true, stripe: s })))
+      return [...sent]
+    }
+    expect(await round()).toEqual(['0@c/0', '1@c/1', '2@c/2'])
+    // Lane 1 stalls: its stripe goes over the first connection that isn't (the mesh link)...
+    stalled.add('c/1')
+    expect(await round()).toEqual(['0@c/0', '1@c/0', '2@c/2'])
+    // ...and what already waited for lane 1 follows it.
+    expect(moves).toEqual([['c/1', 'c/0']])
+    // The mesh link stalls too: the next one that drains.
+    stalled.add('c/0')
+    expect(await round()).toEqual(['0@c/2', '1@c/2', '2@c/2'])
+    // All of them stalled: each keeps its own (nowhere better to go).
+    stalled.add('c/2')
+    expect(await round()).toEqual(['0@c/0', '1@c/1', '2@c/2'])
+    // Drained again: back to the usual mapping.
+    stalled.clear()
+    expect(await round()).toEqual(['0@c/0', '1@c/1', '2@c/2'])
   })
 })

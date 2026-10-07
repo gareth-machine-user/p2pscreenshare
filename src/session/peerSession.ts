@@ -14,8 +14,8 @@ import { Mesh } from '../mesh/mesh'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { fromBase64Url } from '../net/lobby'
 import { Uplink } from '../net/uplink'
-import type { MediaLink, ProbeLink } from '../net/link'
-import { LinkStatsTracker, parseLinkStats, pathInflation, type LinkStats } from '../net/linkStats'
+import type { PairConn } from '../mesh/dataConn'
+import { LinkStatsTracker, parseLinkStats, pathInflation } from '../net/linkStats'
 import { isTopologyReport, parsePeerMsg, type EncoderRates, type PeerMsg, type TopologyReport, type UplinkRates } from '../proto/messages'
 import { RateWindow, round1 } from './rates'
 import { verifyFragment } from '../proto/signing'
@@ -125,14 +125,25 @@ const STAGE_LOG_MS = 100
 const STAGE_LOG_MAX = 100
 
 /** One connection's figures over the last window (Peers panel, Topology). */
+/** One connection's last capacity window (session/capacity.ts linkWindow), rounded for display. */
 interface LaneRate {
-  peer: string
   mediaKbps: number
   deliveredKbps: number
   drops: number
   queueMs: number
   backlogged: boolean
   stalled: boolean
+}
+
+/** What the session keeps per open connection (a mesh link or a lane), in one place. */
+interface ConnRecord {
+  peer: string
+  lane: number
+  /** Its getStats() history (net/linkStats.ts): path RTT, wire rates. */
+  tracker: LinkStatsTracker
+  /** The snapshot the last capacity window ended with, and that window's figures. */
+  last: LinkSnap | null
+  rate: LaneRate | null
 }
 
 export class PeerSession implements PublisherContext, SubscriptionContext {
@@ -204,12 +215,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
    * thread busy; such windows don't count towards capacity) or the encoder dropped frames.
    */
   localLoad: { stallMs: number; encoderDroppedFps: number } | null = null
-  /** Per connection (mesh link or lane): its getStats() history (see net/linkStats.ts). */
-  private linkTrackers = new Map<object, { peer: string; lane: number; tracker: LinkStatsTracker }>()
+  /** Per open connection (mesh link or lane), refreshed by openConns(). */
+  private connRecs = new Map<PairConn, ConnRecord>()
   private pollingStats = false
-  /** Per connection: the last window's figures, and the snapshot it ended with. */
-  private laneRates = new Map<object, LaneRate>()
-  private linkLast = new Map<object, LinkSnap>()
   private lastAutoRestart = -Infinity
   private stallSince: number | null = null
   private smoothSince: number | null = null
@@ -232,7 +240,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       lanes: opts.lanes,
     })
     // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
-    this.relay = new RelayNode(this.uplink, (id, index) => this.mesh.mediaLinkFor(id, index))
+    this.relay = new RelayNode(
+      this.uplink,
+      (id, index) => this.mesh.connFor(id, index),
+      (id) => this.mesh.connectionsOf(id).map((c) => c.conn),
+    )
     this.relay.verifier = (raw, ch) => this.verify(raw, ch)
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
     this.headroom = new HeadroomProbe(this.uplink)
@@ -240,9 +252,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const m = this.mesh
     m.onMedia = (data, from) => this.relay.receive(data, from)
     m.onBufferLow = () => this.uplink.kick()
-    // A connection whose send buffer stopped draining hands its stripes to another of the pair's.
-    m.isStalled = (link) => this.uplink.isStalled(link)
-    m.onReroute = (from, to) => this.uplink.moveQueued(from, to)
+    // Gossiped RTTs: the mesh link's path RTT from the getStats polling below.
+    m.pathRttMs = (id) => {
+      for (const r of this.connRecs.values()) if (r.peer === id && r.lane === 0) return r.tracker.current(performance.now())?.rttMs ?? null
+      return null
+    }
     m.onApp = (raw, from) => {
       const msg = parsePeerMsg(raw)
       if (msg) this.handle(msg, from)
@@ -722,7 +736,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       uplinkKbps: this.capacity.uplinkKbps === null ? null : Math.round(this.capacity.uplinkKbps),
       medianPeerKbps: t?.medianPeerKbps == null ? null : Math.round(t.medianPeerKbps),
       feasibleKbps: full.limited?.feasibleKbps ?? null,
-      stalledLanes: [...this.laneRates.values()].filter((r) => r.stalled).length,
+      stalledLanes: [...this.connRecs.values()].filter((r) => r.rate?.stalled).length,
     }
   }
 
@@ -846,33 +860,25 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.updateOffers()
   }
 
-  /** Every open connection (the mesh link and lanes of each peer). */
-  private openConnections(): { peer: string; conn: MediaLink & { readonly probeLink: ProbeLink } }[] {
-    const out: { peer: string; conn: MediaLink & { readonly probeLink: ProbeLink } }[] = []
-    for (const peer of [...this.mesh.conns.keys()]) for (const { conn } of this.mesh.connectionsOf(peer)) if (conn.isOpen) out.push({ peer, conn })
-    return out
-  }
-
-  /** One connection's counters now: its media channel and its bin channel (headroom probes) together. */
-  private snapLink(conn: MediaLink & { readonly probeLink: ProbeLink }, now: number): LinkSnap {
-    const u = this.uplink
-    const probe = conn.probeLink
-    u.stalledMs(conn, now)
-    const c = u.perLink.get(conn)
-    const b = u.perLink.get(probe)
-    return {
-      at: now,
-      handed: (c?.handedBytes ?? 0) + (b?.handedBytes ?? 0),
-      buffered: (conn.isOpen ? conn.bufferedAmount : 0) + (probe.isOpen ? probe.bufferedAmount : 0),
-      busyMs: u.busyMs(conn, now),
-      items: c?.sentItems ?? 0,
-      mediaBytes: c?.sentBytes ?? 0,
-      drops: c?.drops ?? 0,
-      qSum: c?.queueDelaySum ?? 0,
-      qN: c?.queueDelayN ?? 0,
-      lastStallAt: c?.lastStallAt ?? -Infinity,
-      headAgeMs: u.headAgeMs(conn, now),
+  /**
+   * Every open connection (the mesh link and lanes of each peer) with its record. Records of
+   * connections that are no longer open are dropped here, so this is the one place they are pruned.
+   */
+  private openConns(): [PairConn, ConnRecord][] {
+    const out: [PairConn, ConnRecord][] = []
+    const seen = new Set<PairConn>()
+    for (const peer of [...this.mesh.conns.keys()]) {
+      for (const { lane, conn } of this.mesh.connectionsOf(peer)) {
+        if (!conn.isOpen) continue
+        seen.add(conn)
+        let r = this.connRecs.get(conn)
+        if (!r) this.connRecs.set(conn, (r = { peer, lane, tracker: new LinkStatsTracker(), last: null, rate: null }))
+        out.push([conn, r])
+      }
     }
+    for (const conn of this.connRecs.keys()) if (!seen.has(conn)) this.connRecs.delete(conn)
+    this.capacity.retain(seen)
+    return out
   }
 
   /**
@@ -882,29 +888,24 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
    */
   private sampleLinks(now: number, lagMs: number): void {
     const windows: ConnWindow[] = []
-    const seen = new Set<object>()
-    this.laneRates.clear()
-    for (const { peer, conn } of this.openConnections()) {
-      seen.add(conn)
-      const snap = this.snapLink(conn, now)
-      const last = this.linkLast.get(conn)
-      this.linkLast.set(conn, snap)
+    for (const [conn, rec] of this.openConns()) {
+      const snap = this.uplink.snapshot(conn, conn.probeLink, now)
+      const last = rec.last
+      rec.last = snap
+      rec.rate = null
       // A connection's counters restart if the uplink forgot it (closed and reopened).
       if (!last || snap.handed < last.handed || snap.items < last.items) continue
-      const w = linkWindow(conn, peer, last, snap)
+      const w = linkWindow(conn, rec.peer, last, snap)
       windows.push(w)
-      this.laneRates.set(conn, {
-        peer,
+      rec.rate = {
         mediaKbps: Math.round(w.mediaKbps),
         deliveredKbps: Math.round(w.kbps),
         drops: Math.round(w.dropsPerS * 10) / 10,
         queueMs: Math.round(w.queueMs),
         backlogged: w.backlogged,
         stalled: w.stalled,
-      })
+      }
     }
-    for (const link of this.linkLast.keys()) if (!seen.has(link)) this.linkLast.delete(link)
-    this.capacity.retain(seen)
     this.capacity.update(now, windows, { frozen: lagMs >= FROZEN_LAG_MS })
     this.backloggedNow = windows.some((w) => w.active && w.backlogged)
     const encoderDroppedFps = this.encoderStatsNow?.droppedFps ?? 0
@@ -933,15 +934,15 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
    * no probe ran.
    */
   async discover(): Promise<number | null> {
-    const conns = this.openConnections()
-    const snap = () => new Map(conns.map(({ conn }) => [conn, this.snapLink(conn, performance.now())]))
+    const conns = this.openConns()
+    const snap = () => new Map(conns.map(([conn]) => [conn, this.uplink.snapshot(conn, conn.probeLink)]))
     const r = await this.headroom.run(
-      conns.map(({ conn }) => conn.probeLink),
+      conns.map(([conn]) => conn.probeLink),
       snap,
     )
     if (!r) return null
     const windows: ConnWindow[] = []
-    for (const { peer, conn } of conns) {
+    for (const [conn, { peer }] of conns) {
       const a = r.start.get(conn)
       const b = r.end.get(conn)
       if (!a || !b || !conn.isOpen) continue
@@ -958,35 +959,21 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     if (this.pollingStats) return
     this.pollingStats = true
     try {
-      const seen = new Set<object>()
-      const polls: Promise<void>[] = []
-      for (const peer of [...this.mesh.conns.keys()]) {
-        for (const { lane, conn } of this.mesh.connectionsOf(peer)) {
-          if (!conn.stats) continue
-          seen.add(conn)
-          let t = this.linkTrackers.get(conn)
-          if (!t) this.linkTrackers.set(conn, (t = { peer, lane, tracker: new LinkStatsTracker() }))
-          const { tracker } = t
-          polls.push(
-            conn.stats().then((report) => {
-              const r = report && parseLinkStats(report)
-              if (r) tracker.update(r, performance.now())
-            }),
-          )
-        }
-      }
-      for (const conn of this.linkTrackers.keys()) if (!seen.has(conn)) this.linkTrackers.delete(conn)
-      await Promise.all(polls)
+      await Promise.all(
+        this.openConns().map(async ([conn, { tracker }]) => {
+          const report = await conn.stats?.()
+          const r = report && parseLinkStats(report)
+          if (r) tracker.update(r, performance.now())
+        }),
+      )
     } finally {
       this.pollingStats = false
     }
   }
 
-  /** Each open connection to `peer` with its latest getStats()-derived stats, by lane. */
-  private connStats(peer: string, now = performance.now()): { lane: number; link: object; stats: LinkStats | null }[] {
-    const out: { lane: number; link: object; stats: LinkStats | null }[] = []
-    for (const [link, t] of this.linkTrackers) if (t.peer === peer) out.push({ lane: t.lane, link, stats: t.tracker.current(now) })
-    return out.sort((a, b) => a.lane - b.lane)
+  /** The records of the open connections to `peer`, by lane. */
+  private recsOf(peer: string): [PairConn, ConnRecord][] {
+    return [...this.connRecs].filter(([, r]) => r.peer === peer).sort((a, b) => a[1].lane - b[1].lane)
   }
 
   /**
@@ -997,11 +984,13 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   linkStatsFor(peer: string): LinkRow[] {
     const kbps = (v: number | null | undefined) => (v === null || v === undefined ? null : Math.round(v))
     const ms = (v: number | null | undefined) => (v === null || v === undefined ? null : Math.round(v * 10) / 10)
-    return this.connStats(peer).map(({ lane, link, stats: s }) => {
-      const r = this.laneRates.get(link)
-      const cap = this.capacity.conn(link)
+    const now = performance.now()
+    return this.recsOf(peer).map(([conn, rec]) => {
+      const s = rec.tracker.current(now)
+      const r = rec.rate
+      const cap = this.capacity.conn(conn)
       return {
-        lane,
+        lane: rec.lane,
         sendKbps: kbps(s?.sendKbps),
         recvKbps: kbps(s?.recvKbps),
         mediaKbps: r?.mediaKbps ?? null,
@@ -1029,8 +1018,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const now = performance.now()
     let send: number | null = null
     let recv: number | null = null
-    for (const t of this.linkTrackers.values()) {
-      const s = t.tracker.current(now)
+    for (const rec of this.connRecs.values()) {
+      const s = rec.tracker.current(now)
       if (s?.sendKbps != null) send = (send ?? 0) + s.sendKbps
       if (s?.recvKbps != null) recv = (recv ?? 0) + s.recvKbps
     }
@@ -1039,7 +1028,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   /** The link from this peer to `peer` over the last window, all its connections together (Topology). */
   linkRate(peer: string): { drops: number; queueMs: number; backlogged: boolean; capKbps: number | null } | null {
-    const rs = [...this.laneRates.values()].filter((r) => r.peer === peer)
+    const rs = this.recsOf(peer).flatMap(([, r]) => (r.rate ? [r.rate] : []))
     if (!rs.length) return null
     const cap = this.capacity.peer(peer).kbps
     return {
@@ -1058,7 +1047,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   /** Path RTT inflation to `peer` over its baseline (display only: the Peers panel's "+N ms"). */
   pathQueueFor(peer: string): { inflationMs: number; queued: boolean } | null {
     const p = pathInflation(
-      this.connStats(peer).map((l) => l.stats),
+      this.recsOf(peer).map(([, r]) => r.tracker.current(performance.now())),
       RTT_QUEUE_SHOWN_MS,
     )
     return p ? { inflationMs: Math.round(p.inflationMs), queued: p.inflated } : null

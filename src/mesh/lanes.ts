@@ -15,10 +15,10 @@
 // the lanes that are open, connecting or waiting for a retry; a slot whose lane isn't open falls
 // back to lane 0. So the mapping only changes when a lane is given up for good (or declined), or
 // the pair's trees change, not while one reconnects.
-import type { MediaLink } from '../net/link'
 import { after } from '../net/ticker'
 import type { LaneConn, LaneFactory } from './lane'
 import type { PeerConn } from './meshConn'
+import type { PairConn } from './dataConn'
 
 export const MAX_LANES = 4
 /** Connections per pair unless the page says otherwise (`lanes=N`). */
@@ -112,21 +112,26 @@ export class Lanes {
     for (const pair of [...this.pairs.values()]) this.teardown(pair)
   }
 
-  /** The link for the pair's `index`-th tree: one of its lanes, or the mesh link itself. */
-  linkFor(primary: PeerConn, index: number): MediaLink {
+  /**
+   * The connection for the pair's `index`-th tree: slot `index` mod K of [the mesh link, then each
+   * lane slot by index], K counting slots whose lane is still connecting or waiting for a retry, so
+   * the mapping holds while one reconnects. A slot whose lane isn't open falls back to the mesh link.
+   */
+  linkFor(primary: PeerConn, index: number): PairConn {
     const pair = this.pairs.get(primary.remoteId)
-    if (!pair || pair.primary !== primary || !pair.slots.size) return primary
-    const ids = [...pair.slots.keys()].sort((a, b) => a - b)
-    const slot = (((index | 0) % (ids.length + 1)) + ids.length + 1) % (ids.length + 1)
-    if (slot === 0) return primary
-    const lane = pair.slots.get(ids[slot - 1])?.lane
+    if (!pair || pair.primary !== primary) return primary
+    const slots = [0, ...[...pair.slots.keys()].sort((a, b) => a - b)]
+    const slot = slots[(((index | 0) % slots.length) + slots.length) % slots.length]
+    const lane = slot === 0 ? null : pair.slots.get(slot)?.lane
     return lane?.isOpen ? lane : primary
   }
 
-  /** Open lanes to a peer (not counting the mesh link). */
-  openLanes(id: string): LaneConn[] {
-    const out: LaneConn[] = []
-    for (const s of this.pairs.get(id)?.slots.values() ?? []) if (s.lane?.isOpen) out.push(s.lane)
+  /** The pair's open connections: the mesh link (lane 0), then each open lane by index. */
+  connections(primary: PeerConn): { lane: number; conn: PairConn }[] {
+    const out: { lane: number; conn: PairConn }[] = [{ lane: 0, conn: primary }]
+    const pair = this.pairs.get(primary.remoteId)
+    if (pair?.primary !== primary) return out
+    for (const [i, s] of [...pair.slots].sort((a, b) => a[0] - b[0])) if (s.lane?.isOpen) out.push({ lane: i, conn: s.lane })
     return out
   }
 

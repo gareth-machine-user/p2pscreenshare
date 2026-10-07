@@ -52,6 +52,42 @@ export interface LinkCounters {
   lastStallAt: number
 }
 
+/**
+ * One connection's counters at one moment: its media channel and its bin channel (headroom probes)
+ * together. Two of them make a capacity window (session/capacity.ts linkWindow).
+ */
+export interface LinkSnap {
+  at: number
+  /** Bytes handed to the connection's channels (LinkCounters.handedBytes). */
+  handed: number
+  /** Their bufferedAmount. */
+  buffered: number
+  /** How long the media link's uplink queue has held something (Uplink.busyMs). */
+  busyMs: number
+  /** Live media items and bytes sent, drops, queueing sum and count. */
+  items: number
+  mediaBytes: number
+  drops: number
+  qSum: number
+  qN: number
+  /** When the connection was last seen stalled (STALL_MS), or -Infinity. */
+  lastStallAt: number
+  /** How long the oldest item waiting for it has waited (ms). */
+  headAgeMs: number
+}
+
+/** Everything the uplink keeps for one link. */
+interface LinkEntry {
+  queue: Item[]
+  /** Only spare upload (a headroom probe's `bin` channel): see setBackground. */
+  background: boolean
+  /** Frames that already lost a fragment here (until when to remember them). */
+  dead: Map<string, number>
+  counters: LinkCounters
+  /** Its send buffer as last seen (plus what was sent into it since), and when it last drained. */
+  progress: { buffered: number; at: number } | null
+}
+
 export interface UplinkStats {
   sentBytes: number
   droppedItems: number
@@ -78,7 +114,8 @@ export interface UplinkStats {
  * backpressure, and layer-aware deadline dropping.
  */
 export class Uplink {
-  private queues = new Map<MediaLink, Item[]>()
+  /** Every link the uplink has seen, until it closes (session/capacity.ts reads their counters). */
+  private links = new Map<MediaLink, LinkEntry>()
   private tokens = 0
   private lastRefill = performance.now()
   private timer: ReturnType<typeof setTimeout> | null = null
@@ -107,25 +144,24 @@ export class Uplink {
     return this.capKbps === null ? Infinity : this.capKbps / 8
   }
 
-  /**
-   * Links whose traffic only uses spare upload (headroom probes): served when no media is waiting,
-   * and only while their send buffer holds at most BACKGROUND_BUFFER_MAX.
-   */
-  private background = new Set<MediaLink>()
-  /** Per link: frames that already lost a fragment there (until when to remember them). */
-  private deadFrames = new Map<MediaLink, Map<string, number>>()
-  /** Per-link counters (session/capacity.ts measures each connection's delivered rate from them). */
-  readonly perLink = new Map<MediaLink, LinkCounters>()
-  /** Per link: its send buffer as last seen (plus what was sent into it since), and when it last drained. */
-  private progress = new Map<MediaLink, { buffered: number; at: number }>()
-
-  private counters(link: MediaLink): LinkCounters {
-    let c = this.perLink.get(link)
-    if (!c) {
-      c = { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, lastStallAt: -Infinity }
-      this.perLink.set(link, c)
+  private entry(link: MediaLink): LinkEntry {
+    let e = this.links.get(link)
+    if (!e) {
+      e = {
+        queue: [],
+        background: false,
+        dead: new Map(),
+        counters: { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, lastStallAt: -Infinity },
+        progress: null,
+      }
+      this.links.set(link, e)
     }
-    return c
+    return e
+  }
+
+  /** A link's cumulative counters, if the uplink has seen it. */
+  countersOf(link: MediaLink): Readonly<LinkCounters> | undefined {
+    return this.links.get(link)?.counters
   }
 
   /**
@@ -135,17 +171,16 @@ export class Uplink {
    */
   stalledMs(link: MediaLink, now = performance.now()): number {
     const b = link.isOpen ? link.bufferedAmount : 0
-    const p = this.progress.get(link)
+    const e = this.entry(link)
+    const p = e.progress
     if (!p) {
-      this.progress.set(link, { buffered: b, at: now })
+      e.progress = { buffered: b, at: now }
       return 0
     }
-    if (b <= LINK_BUFFER_LOW || b < p.buffered) {
-      p.at = now
-    }
+    if (b <= LINK_BUFFER_LOW || b < p.buffered) p.at = now
     p.buffered = b
     const ms = now - p.at
-    if (ms >= STALL_MS) this.counters(link).lastStallAt = now
+    if (ms >= STALL_MS) e.counters.lastStallAt = now
     return ms
   }
 
@@ -156,23 +191,45 @@ export class Uplink {
 
   /** How long `link`'s queue has held something in total (ms), up to `now`. */
   busyMs(link: MediaLink, now = performance.now()): number {
-    const c = this.perLink.get(link)
+    const c = this.links.get(link)?.counters
     if (!c) return 0
     return c.busyMs + (c.busySince !== null ? now - c.busySince : 0)
   }
 
   /** How long the oldest item waiting for `link` has waited (ms); 0 when nothing waits. */
   headAgeMs(link: MediaLink, now = performance.now()): number {
-    const q = this.queues.get(link)
+    const q = this.links.get(link)?.queue
     if (!q?.length) return 0
     let oldest = q[0].enqueuedAt
     for (const it of q) if (it.enqueuedAt < oldest) oldest = it.enqueuedAt
     return now - oldest
   }
 
+  /**
+   * One connection's counters now (see LinkSnap): its media link and its probe link together. Also
+   * an observation of whether the media link is stalled (stalledMs).
+   */
+  snapshot(media: MediaLink, probe: MediaLink, now = performance.now()): LinkSnap {
+    this.stalledMs(media, now)
+    const c = this.links.get(media)?.counters
+    const b = this.links.get(probe)?.counters
+    return {
+      at: now,
+      handed: (c?.handedBytes ?? 0) + (b?.handedBytes ?? 0),
+      buffered: (media.isOpen ? media.bufferedAmount : 0) + (probe.isOpen ? probe.bufferedAmount : 0),
+      busyMs: this.busyMs(media, now),
+      items: c?.sentItems ?? 0,
+      mediaBytes: c?.sentBytes ?? 0,
+      drops: c?.drops ?? 0,
+      qSum: c?.queueDelaySum ?? 0,
+      qN: c?.queueDelayN ?? 0,
+      lastStallAt: c?.lastStallAt ?? -Infinity,
+      headAgeMs: this.headAgeMs(media, now),
+    }
+  }
+
   /** Keeps the link's busy clock in step with whether its queue holds anything. */
-  private markBusy(link: MediaLink, busy: boolean, now: number): void {
-    const c = this.counters(link)
+  private markBusy(c: LinkCounters, busy: boolean, now: number): void {
     if (busy && c.busySince === null) c.busySince = now
     else if (!busy && c.busySince !== null) {
       c.busyMs += now - c.busySince
@@ -180,10 +237,13 @@ export class Uplink {
     }
   }
 
-  /** Marks a link as background (a headroom probe's `bin` channel). */
+  /**
+   * Marks a link as background (a headroom probe's `bin` channel): its traffic only uses spare
+   * upload, served when no media is waiting and only while its send buffer holds at most
+   * BACKGROUND_BUFFER_MAX.
+   */
   setBackground(link: MediaLink, on = true): void {
-    if (on) this.background.add(link)
-    else this.background.delete(link)
+    this.entry(link).background = on
   }
 
   /**
@@ -191,24 +251,21 @@ export class Uplink {
    * child's live frames then arrive on time and its jitter buffer isn't inflated by the backlog.
    */
   send(link: MediaLink, data: Uint8Array, layer: number, maxAgeMs?: number, replay = false, frame?: string): void {
+    const e = this.entry(link)
     // The rest of a frame that already lost a fragment on this link would only waste upload.
-    if (frame && this.deadFrames.get(link)?.has(frame)) {
+    if (frame && e.dead.has(frame)) {
       this.stats.droppedItems++
       this.stats.droppedByLayer[Math.min(3, layer)]++
-      if (!replay) this.counters(link).drops++
+      if (!replay) e.counters.drops++
       return
     }
-    let q = this.queues.get(link)
-    if (!q) {
-      q = []
-      this.queues.set(link, q)
-    }
+    const q = e.queue
     const item: Item = { data, layer, replay, frame, enqueuedAt: performance.now(), maxAge: maxAgeMs ?? maxAgeForLayer(layer) }
     const firstReplay = replay ? -1 : q.findIndex((it) => it.replay)
     if (firstReplay >= 0) q.splice(firstReplay, 0, item)
     else q.push(item)
     this.stats.queuedBytes += data.byteLength
-    this.markBusy(link, true, item.enqueuedAt)
+    this.markBusy(e.counters, true, item.enqueuedAt)
     this.drain()
   }
 
@@ -217,44 +274,39 @@ export class Uplink {
    * time: `from` stalled, and its stripes now go over `to`.
    */
   moveQueued(from: MediaLink, to: MediaLink): void {
-    const src = this.queues.get(from)
-    if (!src?.length || from === to || this.background.has(from) || this.background.has(to)) return
-    const dst = this.queues.get(to) ?? []
-    this.queues.set(to, dst)
+    const src = this.links.get(from)
+    if (!src?.queue.length || from === to || src.background) return
+    const dst = this.entry(to)
+    if (dst.background) return
     // Live before replays, each in queueing order (as send() keeps them).
-    const merged = [...dst, ...src].sort((a, b) => Number(a.replay) - Number(b.replay) || a.enqueuedAt - b.enqueuedAt)
-    dst.length = 0
-    dst.push(...merged)
-    src.length = 0
+    const merged = [...dst.queue, ...src.queue].sort((a, b) => Number(a.replay) - Number(b.replay) || a.enqueuedAt - b.enqueuedAt)
+    dst.queue = merged
+    src.queue = []
     const now = performance.now()
-    this.markBusy(from, false, now)
-    this.markBusy(to, true, now)
+    this.markBusy(src.counters, false, now)
+    this.markBusy(dst.counters, true, now)
     this.drain()
   }
 
   /** Items waiting for one link. */
   queued(link: MediaLink): number {
-    return this.queues.get(link)?.length ?? 0
+    return this.links.get(link)?.queue.length ?? 0
   }
 
   /** Drops everything waiting for `link` (a probe that ended), keeping its counters. */
   discard(link: MediaLink): void {
-    const q = this.queues.get(link)
-    if (!q) return
-    const bg = this.background.has(link)
-    for (const it of q) this.drop(it, bg)
-    q.length = 0
-    this.markBusy(link, false, performance.now())
+    const e = this.links.get(link)
+    if (!e) return
+    for (const it of e.queue) this.drop(it, e.background)
+    e.queue = []
+    this.markBusy(e.counters, false, performance.now())
   }
 
+  /** Forgets a link (it closed): what waits for it, and its counters. */
   forget(link: MediaLink): void {
-    const q = this.queues.get(link)
-    if (q) for (const it of q) this.stats.queuedBytes -= it.data.byteLength
-    this.queues.delete(link)
-    this.background.delete(link)
-    this.deadFrames.delete(link)
-    this.perLink.delete(link)
-    this.progress.delete(link)
+    const e = this.links.get(link)
+    if (e) for (const it of e.queue) this.stats.queuedBytes -= it.data.byteLength
+    this.links.delete(link)
   }
 
   /** Called when a link's send buffer drains. */
@@ -277,22 +329,17 @@ export class Uplink {
       this.refill(now)
       // Expired items go once per drain (not once per pass: that made a congested drain quadratic).
       // A frame that loses one fragment loses all of them on that link (frame-aware dropping).
-      for (const [link, q] of this.queues) {
+      for (const [link, e] of this.links) {
+        const q = e.queue
         if (!q.length) continue
-        const bg = this.background.has(link)
-        let dead = this.deadFrames.get(link)
-        if (dead) for (const [f, until] of dead) if (now > until) dead.delete(f)
-        for (const it of q) {
-          if (it.frame && now - it.enqueuedAt > it.maxAge) {
-            if (!dead) this.deadFrames.set(link, (dead = new Map()))
-            dead.set(it.frame, now + 2000)
-          }
-        }
+        const { background: bg, dead } = e
+        for (const [f, until] of dead) if (now > until) dead.delete(f)
+        for (const it of q) if (it.frame && now - it.enqueuedAt > it.maxAge) dead.set(it.frame, now + 2000)
         let kept = 0
         for (const it of q) {
-          if (now - it.enqueuedAt > it.maxAge || (it.frame && dead?.has(it.frame))) {
+          if (now - it.enqueuedAt > it.maxAge || (it.frame && dead.has(it.frame))) {
             this.drop(it, bg)
-            if (!bg && !it.replay) this.counters(link).drops++
+            if (!bg && !it.replay) e.counters.drops++
           } else q[kept++] = it
         }
         q.length = kept
@@ -309,28 +356,28 @@ export class Uplink {
       while (progress) {
         progress = false
         // Background links only get a turn when no media link has anything it could send.
-        const mediaWaiting = [...this.queues].some(
-          ([l, q]) => q.length > 0 && !this.background.has(l) && l.isOpen && l.bufferedAmount <= LINK_BUFFER_HIGH,
+        const mediaWaiting = [...this.links].some(
+          ([l, e]) => e.queue.length > 0 && !e.background && l.isOpen && l.bufferedAmount <= LINK_BUFFER_HIGH,
         )
-        const links = [...this.queues.keys()].filter((l) => !mediaWaiting || !this.background.has(l))
+        const links = [...this.links].filter(([, e]) => !mediaWaiting || !e.background)
         const n = links.length
         // Fixed for the pass (the cursor moves as links are served; reading it here would skip some).
         const start = this.cursor
         for (let i = 0; i < n; i++) {
           const idx = (start + i) % n
-          const link = links[idx]
-          const q = this.queues.get(link)!
+          const [link, e] = links[idx]
+          const q = e.queue
           if (!link.isOpen) {
             if (link.state === 'closed' || link.state === 'failed') this.forget(link)
             continue
           }
           // Background links (probes) are bounded below, by BACKGROUND_BUFFER_MAX.
-          if (!q.length || (!this.background.has(link) && link.bufferedAmount > LINK_BUFFER_HIGH)) continue
+          if (!q.length || (!e.background && link.bufferedAmount > LINK_BUFFER_HIGH)) continue
           const it = q[0]
           // Catch-up replays and probes only go out while the channel's send buffer is nearly
           // empty: a mesh link's channels share one connection, so a deep backlog of either would
           // hold up live media (audio especially) inside it.
-          if ((it.replay || this.background.has(link)) && link.bufferedAmount > BACKGROUND_BUFFER_MAX) continue
+          if ((it.replay || e.background) && link.bufferedAmount > BACKGROUND_BUFFER_MAX) continue
           // Tokens may go negative (debt), so messages larger than the burst still get through.
           if (this.capKbps !== null && this.tokens <= 0) {
             waitingOnTokens = true
@@ -340,17 +387,16 @@ export class Uplink {
           this.stats.queuedBytes -= it.data.byteLength
           if (link.send(it.data)) {
             // What went into the buffer isn't drained by the next look at it.
-            const p = this.progress.get(link)
-            if (p) p.buffered += it.data.byteLength
-            this.counters(link).handedBytes += it.data.byteLength
+            if (e.progress) e.progress.buffered += it.data.byteLength
+            const c = e.counters
+            c.handedBytes += it.data.byteLength
             this.tokens -= it.data.byteLength
             this.stats.sentBytes += it.data.byteLength
             this.stats.sentItems++
             // Live media only: replays to a new child are meant to wait behind it.
-            if (!this.background.has(link) && !it.replay) {
+            if (!e.background && !it.replay) {
               this.stats.queueDelaySum += now - it.enqueuedAt
               this.stats.queueDelayN++
-              const c = this.counters(link)
               c.sentItems++
               c.sentBytes += it.data.byteLength
               c.queueDelaySum += now - it.enqueuedAt
@@ -365,7 +411,7 @@ export class Uplink {
         }
         if (waitingOnTokens) break
       }
-      for (const [link, q] of this.queues) if (!q.length) this.markBusy(link, false, now)
+      for (const e of this.links.values()) if (!e.queue.length) this.markBusy(e.counters, false, now)
       if (waitingOnTokens && this.timer === null) {
         this.timer = setTimeout(() => {
           this.timer = null

@@ -545,7 +545,7 @@ Rate control, in both profiles:
     (≥ ~400 ms, doubling), typically after a burst overflowed the connection's 64 KB UDP socket
     buffer in Chromium; the whole association delivers nothing meanwhile. Its stripes, and what
     already waits for it, move to another of the pair's connections until it drains again
-    (`Mesh.mediaLinkFor`), and its windows say nothing about capacity (the Peers panel and Stats
+    (`RelayNode.linkFor`), and its windows say nothing about capacity (the Peers panel and Stats
     mark it *stalled*). Media channels buffer at most 64 KiB (`LINK_BUFFER_HIGH`) so bursts stay
     small enough not to cause such stalls (`e2e/diag-sctp.spec.ts` measures it).
   - Path RTTs (below) are shown, never used for decisions. Changes apply in place, with no new

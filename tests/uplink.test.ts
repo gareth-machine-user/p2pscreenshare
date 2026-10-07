@@ -264,7 +264,7 @@ describe('Uplink stall detection', () => {
     expect(u.isStalled(a)).toBe(false)
     vi.advanceTimersByTime(20)
     expect(u.isStalled(a)).toBe(true)
-    expect(u.perLink.get(a)).toMatchObject({ lastStallAt: performance.now() })
+    expect(u.countersOf(a)).toMatchObject({ lastStallAt: performance.now() })
     // One byte drained: it moves again.
     a.bufferedAmount--
     expect(u.isStalled(a)).toBe(false)
@@ -272,7 +272,7 @@ describe('Uplink stall detection', () => {
     // Stalls again later.
     vi.advanceTimersByTime(STALL_MS + 10)
     expect(u.isStalled(a)).toBe(true)
-    expect(u.perLink.get(a)).toMatchObject({ lastStallAt: performance.now() })
+    expect(u.countersOf(a)).toMatchObject({ lastStallAt: performance.now() })
   })
 
   it('does not count what was just sent into the buffer as draining', () => {
@@ -367,6 +367,40 @@ describe('Uplink cap', () => {
 })
 
 describe('Uplink capacity counters', () => {
+  it('snapshots a connection: its media and probe channels together, its queue and stalls', () => {
+    const u = new Uplink()
+    const media = new StubLink('m')
+    const probe = new StubLink('p')
+    u.setBackground(probe)
+    u.send(media, msg(1, 100), 0)
+    u.send(probe, msg(2, 30), 0)
+    media.bufferedAmount = LINK_BUFFER_HIGH + 1
+    u.send(media, msg(3, 40), 0)
+    probe.bufferedAmount = 500
+    vi.advanceTimersByTime(100)
+    const a = u.snapshot(media, probe)
+    expect(a).toMatchObject({ handed: 130, buffered: LINK_BUFFER_HIGH + 1 + 500, items: 1, mediaBytes: 100, drops: 0, lastStallAt: -Infinity })
+    expect(a.busyMs).toBe(100)
+    expect(a.headAgeMs).toBe(100)
+    // The media channel stops draining: the snapshot sees the stall.
+    vi.advanceTimersByTime(STALL_MS)
+    const b = u.snapshot(media, probe)
+    expect(b.lastStallAt).toBe(b.at)
+  })
+
+  it('forgets a closed link entirely, counters included, even one that never queued anything', () => {
+    const u = new Uplink()
+    const a = new StubLink('a')
+    const watched = new StubLink('w')
+    u.stalledMs(watched)
+    u.send(a, msg(1), 0)
+    expect(u.countersOf(watched)).toBeDefined()
+    watched.isOpen = false
+    watched.state = 'closed'
+    u.send(a, msg(2), 0)
+    expect(u.countersOf(watched)).toBeUndefined()
+  })
+
   it('counts every byte handed to a link, background and replays included', () => {
     const u = new Uplink()
     const a = new StubLink('a')
@@ -375,8 +409,8 @@ describe('Uplink capacity counters', () => {
     u.send(a, msg(1, 100), 0)
     u.send(a, msg(2, 50), 0, undefined, true)
     u.send(bg, msg(3, 30), 0)
-    expect(u.perLink.get(a)).toMatchObject({ handedBytes: 150, sentBytes: 100 })
-    expect(u.perLink.get(bg)?.handedBytes).toBe(30)
+    expect(u.countersOf(a)).toMatchObject({ handedBytes: 150, sentBytes: 100 })
+    expect(u.countersOf(bg)?.handedBytes).toBe(30)
   })
 
   it("keeps a busy clock: how long a link's queue held something", () => {
@@ -411,7 +445,7 @@ describe('Uplink capacity counters', () => {
     expect(u.queued(bg)).toBe(0)
     expect(u.stats.queuedBytes).toBe(0)
     expect(u.stats.droppedBackground).toBe(2)
-    expect(u.perLink.get(bg)?.handedBytes).toBe(20)
+    expect(u.countersOf(bg)?.handedBytes).toBe(20)
     expect(u.busyMs(bg)).toBe(100)
   })
 })

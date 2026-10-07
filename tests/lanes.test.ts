@@ -103,7 +103,7 @@ describe('lane signaling', () => {
     expect(laneMsgsBy(lobby.net, lobby.ids[0].id)).toHaveLength(0)
     const [a, b] = lobby.meshes
     expect(a.laneCount(b.selfId)).toBe(1)
-    expect(a.mediaLinkFor(b.selfId, 1)).toBe(a.linkFor(b.selfId))
+    expect(a.connFor(b.selfId, 1)).toBe(a.linkFor(b.selfId))
   })
 
   it('uses the smaller setting of the pair (an answerer with lanes=1 declines, never retried)', async () => {
@@ -117,7 +117,7 @@ describe('lane signaling', () => {
     expect(lobby.net.lanes.filter((l) => l.localId === b.selfId)).toHaveLength(0)
     expect(laneMsgsBy(lobby.net, b.selfId)).toEqual([1, 2, 3].map((i) => ({ t: 'lane-close', i, d: true })))
     // Declined slots don't reserve stripes: everything goes over the mesh link.
-    for (let s = 0; s < 4; s++) expect(a.mediaLinkFor(b.selfId, s)).toBe(a.linkFor(b.selfId))
+    for (let s = 0; s < 4; s++) expect(a.connFor(b.selfId, s)).toBe(a.linkFor(b.selfId))
 
     // An offerer with fewer lanes than the answerer: the offerer's setting wins.
     const two = await makeLobby([2, 4])
@@ -170,48 +170,20 @@ describe('stripe to lane mapping', () => {
     await until(() => a.laneCount(b.selfId) === 3, 5000, 'lanes open')
     const primary = a.linkFor(b.selfId)!
     const [l1, l2] = lobby.net.openLanes(a.selfId, b.selfId).sort((x, y) => x.index - y.index)
-    expect([0, 1, 2, 3, 4, 5].map((s) => a.mediaLinkFor(b.selfId, s))).toEqual([primary, l1, l2, primary, l1, l2])
+    expect([0, 1, 2, 3, 4, 5].map((s) => a.connFor(b.selfId, s))).toEqual([primary, l1, l2, primary, l1, l2])
 
     // Lane 1 fails: its stripes fall back to the mesh link, lane 2 keeps its own.
     l1.fail()
     await advance(10)
     expect(a.laneCount(b.selfId)).toBe(2)
-    expect([0, 1, 2, 3].map((s) => a.mediaLinkFor(b.selfId, s))).toEqual([primary, primary, l2, primary])
+    expect([0, 1, 2, 3].map((s) => a.connFor(b.selfId, s))).toEqual([primary, primary, l2, primary])
     // It is re-opened after a backoff, and takes its stripes back.
     await until(() => a.laneCount(b.selfId) === 3, 20_000, 'lane re-opened')
     const again = lobby.net.openLanes(a.selfId, b.selfId).find((l) => l.index === 1)!
     expect(again).not.toBe(l1)
-    expect([1, 2].map((s) => a.mediaLinkFor(b.selfId, s))).toEqual([again, l2])
+    expect([1, 2].map((s) => a.connFor(b.selfId, s))).toEqual([again, l2])
     // The answering side maps the same way.
     await until(() => b.laneCount(a.selfId) === 3, 1000, 'answerer lanes')
-  })
-
-  it('moves a stalled connection’s stripes to another of the pair’s until it drains', async () => {
-    const lobby = await makeLobby([3, 3])
-    await startAll(lobby)
-    const [a, b] = lobby.meshes
-    await until(() => a.laneCount(b.selfId) === 3, 5000, 'lanes open')
-    const primary = a.linkFor(b.selfId)!
-    const [l1, l2] = lobby.net.openLanes(a.selfId, b.selfId).sort((x, y) => x.index - y.index)
-    const stalled = new Set<unknown>()
-    a.isStalled = (l) => stalled.has(l)
-    const moves: unknown[][] = []
-    a.onReroute = (from, to) => moves.push([from, to])
-    const map = () => [0, 1, 2].map((s) => a.mediaLinkFor(b.selfId, s))
-    // Lane 1 stalls: its stripe goes over the first connection that isn't (the mesh link).
-    stalled.add(l1)
-    expect(map()).toEqual([primary, primary, l2])
-    // What already waited for lane 1 follows its stripe.
-    expect(moves).toEqual([[l1, primary]])
-    // The mesh link stalls too: the next one that drains.
-    stalled.add(primary)
-    expect(map()).toEqual([l2, l2, l2])
-    // All of them stalled: each keeps its own (nowhere better to go).
-    stalled.add(l2)
-    expect(map()).toEqual([primary, l1, l2])
-    // Drained again: back to the usual mapping.
-    stalled.clear()
-    expect(map()).toEqual([primary, l1, l2])
   })
 
   it('gives up on a pair whose lanes keep failing, after a few attempts with backoff', async () => {
@@ -225,7 +197,7 @@ describe('stripe to lane mapping', () => {
     expect(made).toBe(LANE_MAX_FAILURES)
     expect(lobby.net.lanes.every((l) => l.state === 'failed' || l.state === 'closed')).toBe(true)
     // Given up: the slot no longer reserves stripes.
-    expect(a.mediaLinkFor(b.selfId, 1)).toBe(a.linkFor(b.selfId))
+    expect(a.connFor(b.selfId, 1)).toBe(a.linkFor(b.selfId))
   })
 })
 
@@ -279,7 +251,7 @@ describe('lane throughput', () => {
     await until(() => a.laneCount(b.selfId) === lanes && b.laneCount(a.selfId) === lanes, 5000, 'lanes open')
     // The sender: an uplink and a relay forwarding k+m = 4 stripes to b over its lanes.
     const uplink = new Uplink()
-    const relay = new RelayNode(uplink, (id, stripe) => a.mediaLinkFor(id, stripe))
+    const relay = new RelayNode(uplink, (id, stripe) => a.connFor(id, stripe))
     a.onBufferLow = () => uplink.kick()
     for (let s = 0; s < 4; s++) relay.addChild(1, s, b.selfId)
     let received = 0

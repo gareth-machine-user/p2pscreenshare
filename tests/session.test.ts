@@ -127,7 +127,7 @@ describe('headroom probe', () => {
     const uplink = new Uplink()
     const links = bytesPerMs.map(() => new StubProbeLink())
     const probe = new HeadroomProbe(uplink)
-    const snap = () => ({ at: performance.now(), links: links.map((l) => ({ handed: uplink.perLink.get(l)?.handedBytes ?? 0, buffered: l.bufferedAmount })) })
+    const snap = () => ({ at: performance.now(), links: links.map((l) => ({ handed: uplink.countersOf(l)?.handedBytes ?? 0, buffered: l.bufferedAmount })) })
     const result = probe.run(links, snap)
     for (let t = 0; t < PROBE_DURATION_MS + 100; t++) {
       during?.(t, links)

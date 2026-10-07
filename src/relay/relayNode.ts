@@ -88,11 +88,30 @@ export class RelayNode {
   constructor(
     private uplink: Uplink,
     /**
-     * The link for a peer's `index`-th tree (see laneIndex): with media lanes (mesh/lanes.ts), the
-     * trees of one pair spread over several connections. Undefined while there is no open link.
+     * The connection for a peer's `index`-th tree (see laneIndex): with media lanes
+     * (mesh/lanes.ts), the trees of one pair spread over several connections. Undefined while
+     * there is no open link.
      */
-    private linkFor: (peerId: string, index: number) => MediaLink | undefined,
+    private connFor: (peerId: string, index: number) => MediaLink | undefined,
+    /** All of a peer's open connections (stalled ones' trees move to another). */
+    private connectionsOf: (peerId: string) => MediaLink[] = () => [],
   ) {}
+
+  /**
+   * The connection a tree's fragments go over to `peer`: its lane by rank, unless that connection
+   * is stalled (its send buffer stopped draining: net/uplink.ts stalledMs). Then another of the
+   * pair's that isn't, taking along what already waits for the stalled one, until it drains again.
+   */
+  private linkFor(peer: string, key: string, stripe: number): MediaLink | undefined {
+    const link = this.connFor(peer, this.laneIndex(peer, key, stripe))
+    if (!link || !this.uplink.isStalled(link)) return link
+    for (const conn of this.connectionsOf(peer)) {
+      if (conn === link || !conn.isOpen || this.uplink.isStalled(conn)) continue
+      this.uplink.moveQueued(link, conn)
+      return conn
+    }
+    return link
+  }
 
   childrenOf(channel: number, stripe: number): string[] {
     return [...(this.children.get(treeKey(channel, stripe)) ?? [])]
@@ -147,7 +166,7 @@ export class RelayNode {
   requestReplay(channel: number, stripes: number[], child: string): void {
     for (const stripe of new Set(stripes)) {
       const key = treeKey(channel, stripe)
-      const link = this.linkFor(child, this.laneIndex(child, key, stripe))
+      const link = this.linkFor(child, key, stripe)
       if (!link?.isOpen) continue
       if (!this.children.get(key)?.has(child) || this.replayedRecently(key, child)) continue
       this.noteReplay(key, child)
@@ -202,7 +221,7 @@ export class RelayNode {
 
   /** Replays the cached GOP once the link to `child` is open. */
   private replayTo(key: string, stripe: number, child: string, attempt = 0): void {
-    const link = this.linkFor(child, this.laneIndex(child, key, stripe))
+    const link = this.linkFor(child, key, stripe)
     if (!link || !link.isOpen) {
       if (attempt < 60 && this.children.get(key)?.has(child)) {
         after(200, () => this.replayTo(key, stripe, child, attempt + 1))
@@ -293,7 +312,7 @@ export class RelayNode {
       const frame = h.fragCount > 1 ? `${h.channel >>> 0}:${h.stripe}:${h.epoch}:${h.frameSeq}` : undefined
       for (const child of kids) {
         if (child === from) continue
-        const link = this.linkFor(child, this.laneIndex(child, key, h.stripe))
+        const link = this.linkFor(child, key, h.stripe)
         if (link) this.uplink.send(link, frag.raw, layer, maxAge, false, frame)
       }
     }
