@@ -790,6 +790,9 @@ button.scroll-cue:hover {
   max-height: none;
 }
 .stage-card {
+  /* Above the absolutely positioned canvas, which would otherwise take its clicks. */
+  position: relative;
+  z-index: 1;
   width: 100%;
   display: flex;
   align-items: center;
@@ -799,6 +802,7 @@ button.scroll-cue:hover {
 .stage.has-card canvas {
   position: absolute;
   inset: 0;
+  pointer-events: none;
 }
 .stage-chip {
   position: absolute;
