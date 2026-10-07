@@ -74,6 +74,16 @@ async function pickConfig(width: number, height: number, o: VideoEncoderOptions)
 }
 
 /**
+ * The codec string viewers configure their decoder with. Annex B H.264 carries its parameter sets
+ * in band, and a hardware encoder may report a different level after a bitrate change: announcing
+ * that would make every viewer rebuild its decoder and wait for a keyframe. The configured string
+ * (High profile, level 5.2) decodes anything the encoder produces.
+ */
+function streamCodec(dc: VideoDecoderConfig, config: VideoEncoderConfig): string {
+  return dc.codec.startsWith('avc1') && !dc.description && config.codec.startsWith('avc1') ? config.codec : dc.codec
+}
+
+/**
  * Captures frames from a track and encodes them once (WebCodecs). Emits EncodedFrames with
  * temporal-layer and reference metadata, and StreamInfo whenever the decoder config changes.
  */
@@ -145,13 +155,17 @@ export class VideoPipeline {
     this.keyRequested = true
   }
 
+  /**
+   * Changes the bitrate in place, without a keyframe: the decoder needs none, and at high bitrates
+   * (a GPU H.264 keyframe at 60 fps) the burst would overflow the relay queues, break viewers' decode
+   * chains and set off the keyframe requests and further bitrate cuts that cause more of the same.
+   */
   setBitrate(kbps: number): void {
     this.opts.bitrateKbps = kbps
     if (this.encoder && this.config) {
       this.config = { ...this.config, bitrate: kbps * 1000 }
       if (this.encoder.state !== 'configured') return
       this.encoder.configure(this.config)
-      this.keyRequested = true
     }
   }
 
@@ -326,7 +340,7 @@ export class VideoPipeline {
       const dc = meta.decoderConfig
       const info: StreamInfo = {
         epoch: this.epoch,
-        codec: dc.codec,
+        codec: streamCodec(dc, this.config!),
         codedWidth: dc.codedWidth ?? this.config!.width,
         codedHeight: dc.codedHeight ?? this.config!.height,
         description: dc.description ? toBase64(toBytes(dc.description)) : undefined,
