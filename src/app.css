@@ -1016,12 +1016,18 @@ button.scroll-cue:hover {
   max-height: calc(100vh - 92px);
   min-height: 360px;
 }
+/* Hidden, the panel is just its toggle: a small button pinned at the top, beside the stage. */
 .side.collapsed {
   flex: none;
+  align-self: flex-start;
   max-width: none;
   min-height: 0;
   background: none;
   border: none;
+  border-radius: 0;
+  overflow: visible;
+  position: sticky;
+  top: 16px;
 }
 /* Beside the stage, the panel runs the height of the window. */
 @media (min-width: 1001px) {
@@ -1080,10 +1086,20 @@ button.scroll-cue:hover {
   color: var(--muted);
 }
 .side.collapsed .collapse {
-  border: 1px solid var(--border-strong);
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.side.collapsed .collapse:hover {
   background: var(--raised);
-  width: auto;
-  padding: 0 12px;
+  color: var(--text);
+}
+.side.collapsed .collapse .unread {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  box-shadow: 0 0 0 2px var(--panel);
 }
 .side.collapsed .side-tabs {
   padding: 0;

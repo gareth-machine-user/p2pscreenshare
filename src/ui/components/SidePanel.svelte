@@ -37,8 +37,15 @@
         People <span class="count">{count}</span>
       </button>
     {/if}
-    <button class="collapse" data-testid="chat-toggle" aria-expanded={open} title={open ? 'Hide the side panel' : 'Show chat and people'} onclick={() => (open = !open)}>
-      <Icon name={open ? 'sidebar' : 'chat'} />{#if !open}Chat{#if unread}<span class="unread" aria-label="New messages"></span>{/if}{/if}
+    <button
+      class="collapse"
+      data-testid="chat-toggle"
+      aria-expanded={open}
+      aria-label={open ? 'Hide the side panel' : 'Show chat and people'}
+      title={open ? 'Hide the side panel' : 'Show chat and people'}
+      onclick={() => (open = !open)}
+    >
+      <Icon name={open ? 'sidebar' : 'chat'} />{#if !open && unread}<span class="unread" aria-label="New messages"></span>{/if}
     </button>
   </div>
   {#if open}
