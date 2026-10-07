@@ -20,7 +20,12 @@ test('home and share settings persist across reloads; the creator stays owner', 
   await page.getByTestId('share-screen').click()
   const dialog = page.getByTestId('share-dialog')
   await expect(dialog).toBeVisible()
-  await page.getByTestId('quality-preset').selectOption('720p')
+  // Quality is a one-line summary until "Change" opens the picker.
+  await page.getByTestId('quality-change').click()
+  await page.getByTestId('quality-resolution').selectOption('720')
+  await page.getByTestId('quality-fps').selectOption('60')
+  await page.getByTestId('quality-level').selectOption('high')
+  await page.getByTestId('quality-auto-lower').uncheck()
   if (!(await page.getByTestId('k').isVisible())) await dialog.locator('summary').click()
   await page.getByTestId('k').fill('2')
   await page.getByTestId('m').fill('2')
@@ -30,11 +35,35 @@ test('home and share settings persist across reloads; the creator stays owner', 
   await expect(page.getByTestId('local-preview')).toBeVisible()
   await expect(page.getByTestId('stop-share')).toBeVisible()
 
+  // The presenter bar shows the live quality, and changes in its panel apply to the running stream.
+  type Pub = { publishing: { ceilingKbps: number; opts: { fps?: number; maxSize?: [number, number] } } | null }
+  const pub = () => page.evaluate(() => {
+    const p = (window.__p2p as unknown as Pub).publishing
+    return p ? { kbps: p.ceilingKbps, fps: p.opts.fps, maxSize: p.opts.maxSize } : null
+  })
+  await expect(page.getByTestId('presenter-quality')).toContainText('720p60 · High')
+  const before = await pub()
+  expect(before).toMatchObject({ fps: 60, maxSize: [1280, 720] })
+  await page.getByTestId('presenter-quality').click()
+  await page.getByTestId('quality-level').selectOption('low')
+  await page.getByTestId('quality-fps').selectOption('30')
+  await expect.poll(async () => (await pub())?.fps).toBe(30)
+  const after = await pub()
+  expect(after!.kbps).toBeLessThan(before!.kbps)
+  await expect(page.getByTestId('presenter-quality')).toContainText('720p30 · Low')
+  // A custom bitrate overrides the level.
+  await page.getByTestId('quality-level').selectOption('custom')
+  await expect(page.getByTestId('quality-custom')).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByTestId('presenter-quality-panel')).toHaveCount(0)
+  await expect(page.getByTestId('presenter-quality')).toContainText('720p30 · Custom')
+
   // Reload: still the owner (the seed stays on this device), and the dialog remembers the choices.
   await page.reload()
   await expect(page.getByTestId('share-screen')).toBeVisible()
   await page.getByTestId('share-screen').click()
-  await expect(page.getByTestId('quality-preset')).toHaveValue('720p')
+  await expect(page.getByTestId('quality-summary')).toHaveText(/^720p30 · Custom · /)
+  await expect(page.getByTestId('quality-summary')).not.toContainText('lowers automatically')
   await expect(page.getByTestId('k')).toHaveValue('2')
   await expect(page.getByTestId('m')).toHaveValue('2')
   await expect(page.getByTestId('test-pattern')).toBeChecked()

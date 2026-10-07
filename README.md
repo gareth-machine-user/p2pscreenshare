@@ -9,8 +9,10 @@ only to find the lobby; no media server is involved.
   other peer, carrying a reliable `ctl` channel (gossip, chat, tree commands, stats) and an
   unreliable `media` channel (fragments). A tree edge is just "forward channel X stripe s on this
   pair's media channel", so joining a tree or switching parents never needs new ICE or DTLS setup.
-- **Encode once, forward bytes.** The publisher encodes with WebCodecs (VP9 with temporal SVC
-  `L1T3` when available). Relays forward encoded fragments without decoding them, so every viewer
+- **Encode once, forward bytes.** The publisher encodes with WebCodecs: VP9 with temporal SVC
+  `L1T3` when available, or, at High quality and above, a hardware H.264 High-profile encoder with
+  temporal layers if the machine has one (software VP9 in real-time mode stops turning extra bits
+  into quality well before near-lossless). Relays forward encoded fragments without decoding them, so every viewer
   gets identical frames and relaying costs almost no CPU.
 - **Striped multi-tree + erasure coding (SplitStream-style).** Each frame is split into `k` data
   and `m` parity pieces, and stripe *i* carries piece *i*. A viewer needs any `k` of the `k+m`
@@ -62,13 +64,23 @@ npm run tracker             # ws://localhost:8000
   toast with **Allow**, **Allow all**, **Deny** and **Deny all**, and the requester sees "Waiting
   for the owner…" (or "Owner is away"). The lobby settings (gear in the top bar, owner only) set
   who may share: ask each time, anyone, or only the owner. The share dialog picks the source
-  (screen, window or tab), system audio and microphone, a quality preset, and under **Advanced**
-  the stripe layout and a test pattern. All of it is remembered.
+  (screen, window or tab), system audio and microphone, and under **Advanced** the stripe layout
+  and a test pattern. Video quality shows as one line ("1080p30 · Standard · 5 Mbps") with a
+  **Change** link. All of it is remembered.
+- **Video quality.** Resolution (Native, 2160p, 1440p, 1080p, 720p, 540p), frame rate (30 or 60)
+  and a quality level, each level a density of bits per pixel, so it means the same picture
+  quality at any size: at 1080p30 Low is 2.5 Mbps, Standard 5, High 9, Very high 15 and
+  Near-lossless 25; bigger and smoother frames scale a little less than linearly (pixels^0.75,
+  frame rate^0.7: 1080p60 High is 14.5 Mbps, 2160p60 Near-lossless about 115). **Custom bitrate**
+  sets any rate from 0.5 to 150 Mbps instead. **Lower automatically if viewers can't keep up** lets
+  the stream go below the chosen rate (never above it) when the audience can't carry it.
 - **Presenting.** You see a preview of what you share while the lobby tab is focused; it hides
   when you switch away (so sharing the whole screen doesn't film the preview). A presenter bar
-  mutes the mic or the stream audio, switches the source, changes the quality and stops, and shows
+  mutes the mic or the stream audio, switches the source, changes the quality (a button showing the
+  live choice opens the same picker; changes apply at once, with a brief blur while the encoder
+  restarts at a new resolution or frame rate) and stops, and shows
   what you are uploading right now ("Uploading 4.2 Mbps", amber with the reason on hover while
-  the bitrate is held below the chosen quality, e.g. "limited by your upload: ~8.0 Mbps"). With the **Auto** preset the stream drops
+  the bitrate is held below the chosen quality, e.g. "limited by your upload: ~8.0 Mbps"). With **Lower automatically** the stream drops
   its bitrate if the audience can't upload enough to carry it ("Audience upload is limited" shows
   either way).
 - **Watching.** With two or more streams live, a tile rail shows live previews; click one to put it
@@ -97,7 +109,7 @@ Useful URL parameters (put them in the page query or the hash query):
 | `priority=latency` | Low-latency tuning instead of the default quality profile (see [Quality versus latency](#quality-versus-latency)) |
 | `up=800` | Debug upload cap in kbps (token-bucket shaper) to emulate a weak peer; applies to presenters too |
 | `share=1` | Share right away (asking the owner first if needed) with the overrides below; used by the e2e tests |
-| `k`, `m`, `bitrate`, `quality=auto` | With `share=1`: data and parity stripes, video kbps, Auto quality |
+| `k`, `m`, `bitrate`, `fps`, `quality=auto` | With `share=1`: data and parity stripes, video kbps, frame rate, lower automatically |
 | `source=test&res=640x360&audio=1&mic=1` | With `share=1`: animated test pattern (prints the clock), a test tone, the microphone |
 | `block=name1,name2` | Debug: refuse mesh links with these members, as if ICE failed |
 | `lanes=2` | Connections per peer pair, 1–4 (default 2; `1` = a single connection). See [Lanes](#lanes-experimental) |
@@ -200,14 +212,14 @@ needs about 21.6 Mbps on that one connection. So each mesh pair opens **media la
   lanes; a page creates at most 200 lanes in its lifetime.
 
 **Comparing.** Open the same lobby with `lanes=1`, the default, and `lanes=4` on both presenter
-and viewer (e.g. `…/#/lobby/<code>?lanes=4`; reload the page after changing it), share with the
-**1080p Ultra-Hi** (16 Mbps) or **4K** (20 Mbps) preset, and compare: the **Peers** panel shows
+and viewer (e.g. `…/#/lobby/<code>?lanes=4`; reload the page after changing it), share at 1080p
+**Very high** (15 Mbps) or **Near-lossless** (25 Mbps), and compare: the **Peers** panel shows
 "N lanes" next to each open link (or "TURN" when lanes were skipped), the live send rate to each
 peer and what its connections carry (expand it for each lane's delivered rate, capacity, RTT and
 queueing); the presenter's **Stats** show **Upload capacity**, **Bitrate** (what limits it),
 **Your uplink** (send rate, dropped T0/T1/T2 fragments) and **Queueing delay**; the viewer's Stats
 show incomplete and late frames. With one connection at its ceiling, it stays backlogged and the
-bitrate settles at 85% of what it carries; with lanes the same stream should hold the preset.
+bitrate settles at 85% of what it carries; with lanes the same stream should hold the chosen quality.
 
 ### Security
 
@@ -511,7 +523,7 @@ Rate control, in both profiles:
     stripe overhead of `stripeKbpsFor`), never above the chosen quality or what the audience's
     relay slots carry. Down at once (at most every 4 s), up by at most 25% per 10 s, changes
     under 5% ignored. On loopback the probe measures 100–300 Mbps and a 16 or 20 Mbps stream
-    keeps its preset; under the `up=` debug cap (the token bucket backs up every queue at once)
+    keeps its chosen bitrate; under the `up=` debug cap (the token bucket backs up every queue at once)
     it settles at 85% of what the cap carries per child.
   - *Stalls.* A connection whose send buffer stopped draining for 750 ms (`STALL_MS` in
     `net/uplink.ts`) is an SCTP association stuck in loss recovery by retransmission timeout
@@ -544,7 +556,7 @@ Rate control, in both profiles:
 - **Why it's clamped.** The presenter bar (while below the chosen quality) and Stats say what
   sets the bitrate in plain words: "limited by your upload: ~X Mbps", "limited by viewers'
   connections: median ~Y Mbps", "limited by audience relay capacity" or "at chosen quality", and
-  how many connections stalled. A lower quality preset or fewer parity stripes then usually looks
+  how many connections stalled. A lower quality level or fewer parity stripes then usually looks
   sharper than a starved stream.
 
 Every place a frame can go missing is counted and shown in **Stats** (and per viewer in
@@ -556,7 +568,7 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | Knob | Where | Default | Effect |
 |---|---|---|---|
 | `k`, `m` | Share dialog (Advanced) | 4, 1 | See above |
-| Quality preset | Share dialog | Auto (2.5 Mbps, adapts) | Lower bitrate → more relay slots per peer → shallower, more robust trees |
+| Video quality | Share dialog, presenter bar | 1080p30 Standard (5 Mbps), lowers automatically | Lower bitrate → more relay slots per peer → shallower, more robust trees |
 | `HEADROOM` | `session/capacity.ts` | 0.75 | Share of measured upload a peer offers. Lower is safer against bad estimates and leaves room for keyframe bursts. |
 | `MAX_FANOUT` | `session/capacity.ts` | 16 | Children per relay. Higher uses strong peers fully but enlarges each failure's blast radius. |
 | `MIN_UPTIME_MS_FOR_RELAY` | `topology/policy.ts` | 4000 | Newcomers stay leaves this long. Raising it filters out viewers who join briefly and leave, at the cost of slower ramp-up. |

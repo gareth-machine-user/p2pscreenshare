@@ -2,11 +2,22 @@
 // when storage is unavailable (private windows, blocked site data).
 import type { ViewQuality } from '../session/peerSession'
 import { BUFFERINGS, type Buffering } from '../media/jitterBuffer'
+import {
+  clampKbps,
+  DEFAULT_QUALITY,
+  FPS_OPTIONS,
+  fromLegacyPreset,
+  LEVELS,
+  RESOLUTIONS,
+  type QualityLevel,
+  type Resolution,
+  type VideoQuality,
+} from '../media/quality'
 import { storageGet, storageSet } from '../util/storage'
 
 export type { Buffering, ViewQuality }
 export type SourceKind = 'screen' | 'window' | 'tab' | 'test'
-export type QualityPreset = 'auto' | '4k' | '2k' | '1080p-ultra' | '1080p-hi' | '1080p' | '720p' | 'low'
+export type { VideoQuality }
 
 export interface ShareSettings {
   source: SourceKind
@@ -14,7 +25,10 @@ export interface ShareSettings {
   systemAudio: boolean
   /** Mix in the microphone. */
   mic: boolean
-  quality: QualityPreset
+  /** Resolution, frame rate and quality level (or a custom bitrate). */
+  video: VideoQuality
+  /** Let the stream go below the chosen bitrate when the audience can't carry it. */
+  autoLower: boolean
   /** Advanced: data and parity stripes. */
   k: number
   m: number
@@ -30,20 +44,8 @@ const KEY = 'p2pss:settings'
 
 export const DEFAULT_SETTINGS: Settings = {
   name: '',
-  share: { source: 'screen', systemAudio: true, mic: false, quality: 'auto', k: 4, m: 1 },
+  share: { source: 'screen', systemAudio: true, mic: false, video: DEFAULT_QUALITY, autoLower: true, k: 4, m: 1 },
   view: { quality: 'auto', buffering: 'auto', chatOpen: true },
-}
-
-/** Bitrate and capture size for each quality preset. */
-export const QUALITY_PRESETS: Record<QualityPreset, { label: string; kbps: number; maxWidth: number; maxHeight: number }> = {
-  auto: { label: 'Auto', kbps: 2500, maxWidth: 1920, maxHeight: 1080 },
-  '4k': { label: '4K (2160p)', kbps: 20000, maxWidth: 3840, maxHeight: 2160 },
-  '2k': { label: '2K (1440p)', kbps: 12000, maxWidth: 2560, maxHeight: 1440 },
-  '1080p-ultra': { label: '1080p Ultra-Hi', kbps: 16000, maxWidth: 1920, maxHeight: 1080 },
-  '1080p-hi': { label: '1080p High', kbps: 8000, maxWidth: 1920, maxHeight: 1080 },
-  '1080p': { label: '1080p', kbps: 4500, maxWidth: 1920, maxHeight: 1080 },
-  '720p': { label: '720p', kbps: 2500, maxWidth: 1280, maxHeight: 720 },
-  low: { label: 'Low', kbps: 900, maxWidth: 960, maxHeight: 540 },
 }
 
 /** Bounds of the advanced stripe settings (data stripes k, parity stripes m). */
@@ -94,7 +96,7 @@ export function parseSettings(raw: string | null): Settings {
       source: oneOf(share.source, SOURCES, d.share.source),
       systemAudio: bool(share.systemAudio, d.share.systemAudio),
       mic: bool(share.mic, d.share.mic),
-      quality: Object.hasOwn(QUALITY_PRESETS, share.quality as string) ? (share.quality as QualityPreset) : d.share.quality,
+      ...parseVideo(share),
       k: int(share.k, STRIPE_LIMITS.k.min, STRIPE_LIMITS.k.max, d.share.k),
       m: int(share.m, STRIPE_LIMITS.m.min, STRIPE_LIMITS.m.max, d.share.m),
     },
@@ -103,6 +105,32 @@ export function parseSettings(raw: string | null): Settings {
       buffering: oneOf(view.buffering, BUFFERINGS, d.view.buffering),
       chatOpen: bool(view.chatOpen, d.view.chatOpen),
     },
+  }
+}
+
+const RESOLUTION_VALUES = RESOLUTIONS.map((r) => r.value)
+const LEVEL_VALUES = LEVELS.map((l) => l.value)
+
+/**
+ * The video quality and auto-lower setting. Settings saved before resolution and bitrate were
+ * separate hold a single `quality` preset instead: mapped to the nearest new choice.
+ */
+function parseVideo(share: Record<string, unknown>): { video: VideoQuality; autoLower: boolean } {
+  const d = DEFAULT_SETTINGS.share
+  if (share.video === undefined) {
+    const legacy = fromLegacyPreset(share.quality)
+    if (legacy) return { video: legacy.quality, autoLower: legacy.autoLower }
+  }
+  const v = obj(share.video)
+  const custom = v.customKbps
+  return {
+    video: {
+      resolution: oneOf<Resolution>(v.resolution, RESOLUTION_VALUES, d.video.resolution),
+      fps: oneOf(v.fps, FPS_OPTIONS, d.video.fps),
+      level: oneOf<QualityLevel>(v.level, LEVEL_VALUES, d.video.level),
+      customKbps: typeof custom === 'number' && Number.isFinite(custom) ? clampKbps(custom) : null,
+    },
+    autoLower: bool(share.autoLower, d.autoLower),
   }
 }
 

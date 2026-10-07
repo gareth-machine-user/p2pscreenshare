@@ -1,14 +1,9 @@
 <script lang="ts">
   import { fmtKbps } from '../route'
-  import {
-    clampStripes,
-    DEFAULT_SETTINGS,
-    QUALITY_PRESETS,
-    saveSettings,
-    settings,
-    STRIPE_LIMITS,
-    type SourceKind,
-  } from '../settings.svelte'
+  import { describeQuality, targetKbps } from '../../media/quality'
+  import { nativeScreenSize } from '../screen'
+  import { clampStripes, DEFAULT_SETTINGS, saveSettings, settings, STRIPE_LIMITS, type SourceKind } from '../settings.svelte'
+  import QualityPicker from './QualityPicker.svelte'
 
   let {
     onstart,
@@ -22,6 +17,9 @@
   const s = settings.share
   let advanced = $state(s.source === 'test' || s.k !== DEFAULT_SETTINGS.share.k || s.m !== DEFAULT_SETTINGS.share.m)
   let dialog: HTMLDialogElement | undefined = $state()
+  /** The quality picker is folded into a one-line summary until asked for. */
+  let pickQuality = $state(false)
+  const native = nativeScreenSize()
 
   $effect(() => {
     dialog?.showModal()
@@ -67,14 +65,15 @@
     {#if micSupported}
       <label class="check"><input type="checkbox" data-testid="mic" bind:checked={s.mic} /> Include microphone</label>
     {/if}
-    <label>
-      Quality
-      <select data-testid="quality-preset" bind:value={s.quality}>
-        {#each Object.entries(QUALITY_PRESETS) as [value, p]}
-          <option {value}>{p.label}{value === 'auto' ? '' : ` (${fmtKbps(p.kbps)})`}</option>
-        {/each}
-      </select>
-    </label>
+    {#if pickQuality}
+      <QualityPicker bind:quality={s.video} bind:autoLower={s.autoLower} nativeSize={native} />
+    {:else}
+      <div class="quality-summary">
+        <span class="hint">Quality</span>
+        <span data-testid="quality-summary">{describeQuality(s.video, native)}{s.autoLower ? ' · lowers automatically' : ''}</span>
+        <button type="button" class="link" data-testid="quality-change" onclick={() => (pickQuality = true)}>Change</button>
+      </div>
+    {/if}
 
     <details bind:open={advanced}>
       <summary>Advanced</summary>
@@ -92,7 +91,7 @@
         Use a test pattern instead of capturing
       </label>
       <p class="hint">
-        Viewers receive {s.k + s.m} stripes of ~{Math.round(QUALITY_PRESETS[s.quality].kbps / s.k)} kbps
+        Viewers receive {s.k + s.m} stripes of ~{fmtKbps(Math.round(targetKbps(s.video, native) / s.k))}
         and need any {s.k} to decode. Parity stripes hide a relay leaving.
       </p>
     </details>

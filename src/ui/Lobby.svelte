@@ -7,7 +7,9 @@
   import type { ShareOptions } from '../session/publishedStream'
   import { fmtKbps, fmtMs, iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
   import { applyAutoQuality, resolveShareOptions, stageMessage } from './lobbyView'
-  import { ownerSeed, QUALITY_PRESETS, saveSettings, settings, type QualityPreset } from './settings.svelte'
+  import { ownerSeed, saveSettings, settings } from './settings.svelte'
+  import { maxSizeFor, targetKbps } from '../media/quality'
+  import { nativeScreenSize } from './screen'
   import Stage from './components/Stage.svelte'
   import ShareDialog from './components/ShareDialog.svelte'
   import ChatPanel from './components/ChatPanel.svelte'
@@ -137,7 +139,7 @@
 
   /** The options to share with: the settings (or URL overrides), with auto quality applied to the session. */
   function shareOptions(): ShareOptions {
-    return applyAutoQuality(resolveShareOptions(settings.share, params, urlOverrides), session)
+    return applyAutoQuality(resolveShareOptions(settings.share, params, urlOverrides, nativeScreenSize()), session)
   }
 
   /** Starts (or restarts, with the current settings: a brief blip) this peer's stream. */
@@ -172,13 +174,13 @@
     return true
   }
 
-  function changeQuality(q: QualityPreset) {
-    settings.share.quality = q
+  /** Saves the (already bound) video quality and applies it to the running stream. */
+  function applyQuality() {
     saveSettings()
-    const preset = QUALITY_PRESETS[q]
-    if (session) session.autoBitrate = q === 'auto'
-    // Applied to the running stream: no new capture, no screen picker.
-    void session?.publishing?.setQuality(preset.kbps, [preset.maxWidth, preset.maxHeight]).then(onChange)
+    const v = settings.share.video
+    if (session) session.autoBitrate = settings.share.autoLower
+    // No new capture, no screen picker: the encoder is rebuilt in place.
+    void session?.publishing?.setQuality(targetKbps(v, nativeScreenSize()), maxSizeFor(v.resolution), v.fps).then(onChange)
   }
 
   // --- view state --------------------------------------------------------------------------------
@@ -508,7 +510,9 @@
             clamp={lobby.clamp}
             uploading={lobby.uploading}
             auto={session?.autoBitrate ?? false}
-            quality={settings.share.quality}
+            bind:quality={settings.share.video}
+            bind:autoLower={settings.share.autoLower}
+            nativeSize={nativeScreenSize()}
             onmic={(m) => {
               session?.publishing?.setMicMuted(m)
               onChange()
@@ -521,7 +525,7 @@
               switching = true
               dialogOpen = true
             }}
-            onquality={changeQuality}
+            onquality={applyQuality}
             onstop={stopSharing}
           />
         {/if}

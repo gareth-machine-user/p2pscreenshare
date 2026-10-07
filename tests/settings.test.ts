@@ -2,7 +2,8 @@
 /// <reference types="vite/client" />
 // (tsconfig.tools.json lacks the app types these src/ui modules use: runes, import.meta.env.)
 import { describe, expect, it } from 'vitest'
-import { clampStripes, DEFAULT_SETTINGS, QUALITY_PRESETS, parseSettings, STRIPE_LIMITS } from '../src/ui/settings.svelte'
+import { clampStripes, DEFAULT_SETTINGS, parseSettings, STRIPE_LIMITS } from '../src/ui/settings.svelte'
+import { CUSTOM_KBPS } from '../src/media/quality'
 
 describe('parseSettings', () => {
   it('returns the defaults when nothing is stored or the JSON is corrupted', () => {
@@ -20,17 +21,37 @@ describe('parseSettings', () => {
   it('keeps valid stored values', () => {
     const stored = {
       name: 'Ann',
-      share: { source: 'tab', systemAudio: false, mic: true, quality: '1080p-ultra', k: 6, m: 0 },
+      share: {
+        source: 'tab',
+        systemAudio: false,
+        mic: true,
+        video: { resolution: '1440', fps: 60, level: 'very-high', customKbps: null },
+        autoLower: false,
+        k: 6,
+        m: 0,
+      },
       view: { quality: 'preview', buffering: 'extra', chatOpen: false },
     }
     expect(parseSettings(JSON.stringify(stored))).toEqual(stored)
+    // A custom bitrate is kept, clamped to the allowed range.
+    const custom = { ...stored, share: { ...stored.share, video: { ...stored.share.video, customKbps: 1e9 } } }
+    expect(parseSettings(JSON.stringify(custom)).share.video.customKbps).toBe(CUSTOM_KBPS.max)
+  })
+
+  it('migrates a quality preset saved by an older version', () => {
+    const old = (quality: string) => parseSettings(JSON.stringify({ share: { quality } })).share
+    expect(old('auto')).toMatchObject({ video: { resolution: '1080', fps: 30, level: 'standard', customKbps: null }, autoLower: true })
+    expect(old('1080p-ultra')).toMatchObject({ video: { resolution: '1080', level: 'very-high' }, autoLower: false })
+    expect(old('low')).toMatchObject({ video: { resolution: '540', level: 'low' }, autoLower: false })
+    // Unknown presets fall back to the defaults.
+    expect(old('8k')).toMatchObject({ video: DEFAULT_SETTINGS.share.video, autoLower: DEFAULT_SETTINGS.share.autoLower })
   })
 
   it('falls back field by field on stale or invalid values', () => {
     const s = parseSettings(
       JSON.stringify({
         name: 5,
-        share: { source: 'camera', systemAudio: 'yes', mic: true, quality: '8k', k: 0, m: 2.5 },
+        share: { source: 'camera', systemAudio: 'yes', mic: true, video: { resolution: '8k', fps: 24, level: 'ultra', customKbps: 'x' }, autoLower: 1, k: 0, m: 2.5 },
         view: { quality: 'ultra', buffering: 'huge', chatOpen: false },
       }),
     )
@@ -39,11 +60,10 @@ describe('parseSettings', () => {
       share: { ...DEFAULT_SETTINGS.share, mic: true },
       view: { quality: 'auto', buffering: 'auto', chatOpen: false },
     })
-    expect(QUALITY_PRESETS[s.share.quality]).toBeDefined()
   })
 
   it('rejects inherited keys and non-object sections', () => {
-    expect(parseSettings(JSON.stringify({ share: { quality: 'toString' } })).share.quality).toBe('auto')
+    expect(parseSettings(JSON.stringify({ share: { quality: 'toString' } })).share.video).toEqual(DEFAULT_SETTINGS.share.video)
     expect(parseSettings(JSON.stringify({ share: null, view: 'x' }))).toEqual(DEFAULT_SETTINGS)
   })
 })

@@ -14,6 +14,8 @@ export interface ShareOptions {
   k: number
   m: number
   bitrateKbps: number
+  /** Capture and encoding frame rate of the full channel (default 30). */
+  fps?: number
   source: 'screen' | 'test'
   /** Picker hint for screen capture. */
   surface?: 'monitor' | 'window' | 'browser'
@@ -28,8 +30,8 @@ export interface ShareOptions {
   testPattern?: TestPatternKind
 }
 
-/** Capture and encoding frame rate of the full channel. */
-const CAPTURE_FPS = 30
+/** Capture and encoding frame rate of the full channel when the options give none. */
+const DEFAULT_FPS = 30
 /** Congestion control never takes the encoder below this, and moves it in these steps (kbps). */
 const MIN_ADAPTIVE_KBPS = 300
 const BITRATE_STEP_KBPS = 50
@@ -88,11 +90,11 @@ export class PublishedStream {
     let stream: MediaStream
     if (o.source === 'test') {
       const [w, h] = o.testSize ?? DEFAULT_TEST_SIZE
-      const tp = testPattern(w, h, CAPTURE_FPS, o.audio, o.testPattern)
+      const tp = testPattern(w, h, o.fps ?? DEFAULT_FPS, o.audio, o.testPattern)
       stream = tp.stream
       this.stopSource = tp.stop
     } else {
-      stream = await captureScreen({ surface: o.surface, audio: o.audio, maxWidth: o.maxSize?.[0], maxHeight: o.maxSize?.[1] })
+      stream = await captureScreen({ surface: o.surface, audio: o.audio, maxWidth: o.maxSize?.[0], maxHeight: o.maxSize?.[1], fps: o.fps ?? DEFAULT_FPS })
       this.stopSource = () => stream.getTracks().forEach((t) => t.stop())
     }
     this.localStream = stream
@@ -113,7 +115,7 @@ export class PublishedStream {
     this.channels.push(full, preview)
 
     const vt = stream.getVideoTracks()[0]
-    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: CAPTURE_FPS, keyframeIntervalMs: tuning.keyframeIntervalMs })
+    this.video = new VideoPipeline(vt, { bitrateKbps: o.bitrateKbps, fps: o.fps ?? DEFAULT_FPS, keyframeIntervalMs: tuning.keyframeIntervalMs })
     this.video.onFrame = (f) => full.emit(f)
     this.video.onStreamInfo = (info) => full.setStream({ ...info, audio: this.audioPipe?.info ?? undefined })
     this.video.onRawFrame = (frame) => this.feedPreview(frame)
@@ -154,23 +156,30 @@ export class PublishedStream {
   }
 
   /**
-   * Changes bitrate (and the capture size cap) in place: the encoder reconfigures and sends a
-   * keyframe, with no new capture (which would need the user to pick a screen again) and no new
-   * channel.
+   * Changes bitrate, capture size cap and frame rate in place: the encoder is rebuilt (choosing
+   * the codec again for the new bits per pixel) and sends a keyframe, with no new capture (which
+   * would need the user to pick a screen again) and no new channel.
    */
-  async setQuality(bitrateKbps: number, maxSize?: [number, number]): Promise<void> {
+  async setQuality(bitrateKbps: number, maxSize?: [number, number], fps?: number): Promise<void> {
     const full = this.full
     if (!full || !this.video) return
+    const o = this.opts as { bitrateKbps: number; maxSize?: [number, number]; fps?: number }
+    const rate = fps ?? o.fps ?? DEFAULT_FPS
     this.ceilingKbps = bitrateKbps
     full.kbps = bitrateKbps
-    ;(this.opts as { bitrateKbps: number }).bitrateKbps = bitrateKbps
-    this.video.setBitrate(bitrateKbps)
+    o.bitrateKbps = bitrateKbps
+    o.fps = rate
+    this.video.setTarget(bitrateKbps, rate)
     const track = this.localStream?.getVideoTracks()[0]
-    if (maxSize && track && this.opts.source !== 'test') {
+    if (track && this.opts.source !== 'test') {
+      const size = maxSize ?? o.maxSize
       await track
-        .applyConstraints({ width: { max: maxSize[0] }, height: { max: maxSize[1] }, frameRate: { ideal: CAPTURE_FPS, max: CAPTURE_FPS } })
-        .catch((e) => console.warn('capture size change failed', e))
-      ;(this.opts as { maxSize?: [number, number] }).maxSize = maxSize
+        .applyConstraints({
+          ...(size ? { width: { max: size[0] }, height: { max: size[1] } } : {}),
+          frameRate: { ideal: rate, max: rate },
+        })
+        .catch((e) => console.warn('capture change failed', e))
+      if (maxSize) o.maxSize = maxSize
     }
     full.limited = null
     this.ctx.announce()

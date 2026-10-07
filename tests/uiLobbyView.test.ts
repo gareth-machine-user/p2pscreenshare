@@ -3,22 +3,28 @@
 // (tsconfig.tools.json lacks the app types these src/ui modules use: runes, import.meta.env.)
 import { describe, expect, it } from 'vitest'
 import { applyAutoQuality, resolveShareOptions, stageMessage, type StageState } from '../src/ui/lobbyView'
-import { DEFAULT_SETTINGS, QUALITY_PRESETS, type ShareSettings } from '../src/ui/settings.svelte'
+import { DEFAULT_SETTINGS, type ShareSettings } from '../src/ui/settings.svelte'
+import { maxSizeFor, targetKbps, type VideoQuality } from '../src/media/quality'
 
 const share = (over: Partial<ShareSettings> = {}): ShareSettings => ({ ...DEFAULT_SETTINGS.share, ...over })
 const q = (s: string) => new URLSearchParams(s)
 
 describe('resolveShareOptions', () => {
   it('uses the settings without URL overrides', () => {
-    const r = resolveShareOptions(share({ quality: '1080p', k: 3, m: 2, systemAudio: false, mic: true, source: 'tab' }), q('k=9&m=0&audio=1&quality=auto'), false)
-    const p = QUALITY_PRESETS['1080p']
+    const video: VideoQuality = { resolution: '1440', fps: 60, level: 'high', customKbps: null }
+    const r = resolveShareOptions(
+      share({ video, autoLower: false, k: 3, m: 2, systemAudio: false, mic: true, source: 'tab' }),
+      q('k=9&m=0&audio=1&quality=auto&fps=30'),
+      false,
+    )
     expect(r.options).toEqual({
       k: 3,
       m: 2,
-      bitrateKbps: p.kbps,
+      bitrateKbps: targetKbps(video),
+      fps: 60,
       source: 'screen',
       surface: 'browser',
-      maxSize: [p.maxWidth, p.maxHeight],
+      maxSize: maxSizeFor('1440'),
       audio: false,
       mic: true,
       testSize: undefined,
@@ -28,24 +34,31 @@ describe('resolveShareOptions', () => {
   })
 
   it('auto quality from the settings may add parity', () => {
-    const r = resolveShareOptions(share({ quality: 'auto' }), q(''), false)
+    const r = resolveShareOptions(share({ autoLower: true }), q(''), false)
     expect(r.auto).toBe(true)
     expect(r.autoParity).toBe(true)
   })
 
   it('takes the URL values under overrides, falling back to the settings for bad numbers', () => {
-    const r = resolveShareOptions(share({ k: 4, m: 1 }), q('source=test&k=2&m=x&bitrate=1234&audio=1&mic=0&quality=auto&res=640x360'), true)
-    expect(r.options).toMatchObject({ k: 2, m: 1, bitrateKbps: 1234, source: 'test', audio: true, mic: false, testSize: [640, 360] })
+    const r = resolveShareOptions(share({ k: 4, m: 1 }), q('source=test&k=2&m=x&bitrate=1234&fps=60&audio=1&mic=0&quality=auto&res=640x360'), true)
+    expect(r.options).toMatchObject({ k: 2, m: 1, bitrateKbps: 1234, fps: 60, source: 'test', audio: true, mic: false, testSize: [640, 360] })
     expect(r.auto).toBe(true)
     // URL overrides pin the parity.
     expect(r.autoParity).toBe(false)
   })
 
   it('URL overrides without quality=auto turn auto off and default audio off', () => {
-    const r = resolveShareOptions(share({ quality: 'auto', systemAudio: true }), q('share=1'), true)
+    const r = resolveShareOptions(share({ autoLower: true, systemAudio: true }), q('share=1'), true)
     expect(r.auto).toBe(false)
     expect(r.options.audio).toBe(false)
-    expect(r.options.bitrateKbps).toBe(QUALITY_PRESETS.auto.kbps)
+    expect(r.options.bitrateKbps).toBe(targetKbps(DEFAULT_SETTINGS.share.video))
+    expect(r.options.fps).toBe(30)
+  })
+
+  it('a Native resolution takes its bitrate from the screen size', () => {
+    const video: VideoQuality = { resolution: 'native', fps: 30, level: 'standard', customKbps: null }
+    const at = (size: [number, number]) => resolveShareOptions(share({ video }), q(''), false, size).options.bitrateKbps
+    expect(at([3840, 2160])).toBeGreaterThan(at([1920, 1080]))
   })
 
   it('clamps k and m to their minimums', () => {
@@ -66,7 +79,7 @@ describe('applyAutoQuality', () => {
 
   it('sets auto bitrate and lets the session pick parity', () => {
     const t = target()
-    const r = resolveShareOptions(share({ quality: 'auto', m: 1 }), q(''), false)
+    const r = resolveShareOptions(share({ autoLower: true, m: 1 }), q(''), false)
     expect(applyAutoQuality(r, t).m).toBe(2)
     expect(t.autoBitrate).toBe(true)
     // The resolved options are left alone.
@@ -75,13 +88,13 @@ describe('applyAutoQuality', () => {
 
   it('keeps the parity when not auto, and clears auto bitrate', () => {
     const t = { ...target(), autoBitrate: true }
-    const r = resolveShareOptions(share({ quality: '720p', m: 1 }), q(''), false)
+    const r = resolveShareOptions(share({ autoLower: false, m: 1 }), q(''), false)
     expect(applyAutoQuality(r, t).m).toBe(1)
     expect(t.autoBitrate).toBe(false)
   })
 
   it('returns the options as is without a session', () => {
-    const r = resolveShareOptions(share({ quality: 'auto' }), q(''), false)
+    const r = resolveShareOptions(share({ autoLower: true }), q(''), false)
     expect(applyAutoQuality(r, null)).toBe(r.options)
   })
 })

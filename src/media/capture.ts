@@ -7,12 +7,14 @@ export interface CaptureOptions {
   audio: boolean
   maxWidth?: number
   maxHeight?: number
+  /** Capture frame rate (default 30). */
+  fps?: number
 }
 
 export async function captureScreen(o: CaptureOptions): Promise<MediaStream> {
   const stream = await navigator.mediaDevices.getDisplayMedia({
     video: {
-      frameRate: { ideal: 30, max: 30 },
+      frameRate: { ideal: o.fps ?? 30, max: o.fps ?? 30 },
       width: { max: o.maxWidth ?? 1920 },
       height: { max: o.maxHeight ?? 1080 },
       ...(o.surface ? { displaySurface: o.surface } : {}),
@@ -130,7 +132,9 @@ function noiseTile(size: number): HTMLCanvasElement {
 }
 
 /** Yields VideoFrames from a track (MediaStreamTrackProcessor, or a <video>+canvas fallback). */
-export function frameReader(track: MediaStreamTrack, fps = 30): { next: () => Promise<VideoFrame | null>; stop: () => void } {
+/** `fps` paces the fallback reader (a function: the frame rate can change mid-stream). */
+export function frameReader(track: MediaStreamTrack, fps: number | (() => number) = 30): { next: () => Promise<VideoFrame | null>; stop: () => void } {
+  const rate = typeof fps === 'function' ? fps : () => fps
   if (typeof MediaStreamTrackProcessor !== 'undefined') {
     const reader = new MediaStreamTrackProcessor({ track }).readable.getReader()
     return {
@@ -152,7 +156,7 @@ export function frameReader(track: MediaStreamTrack, fps = 30): { next: () => Pr
     next: async () => {
       // Paced off the worker ticker as well as a main-thread timer: a presenter's tab is usually
       // hidden, where main-thread timers alone would capture about one frame a second.
-      await sleepPrecise(1000 / fps)
+      await sleepPrecise(1000 / rate())
       while (!stopped && video.readyState < 2) await sleep(50)
       if (stopped) return null
       return new VideoFrame(video, { timestamp: Math.round(performance.now() * 1000) })

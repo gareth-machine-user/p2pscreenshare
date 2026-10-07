@@ -2,7 +2,8 @@
 import type { TestPatternKind } from '../media/capture'
 import type { ShareOptions } from '../session/publishedStream'
 import { numParam, sizeParam } from './route'
-import { QUALITY_PRESETS, type ShareSettings } from './settings.svelte'
+import { maxSizeFor, targetKbps } from '../media/quality'
+import type { ShareSettings } from './settings.svelte'
 
 export interface ResolvedShare {
   options: ShareOptions
@@ -14,23 +15,26 @@ export interface ResolvedShare {
 
 /**
  * The stream options for the saved share settings. With `urlOverrides` (tests/debug:
- * `share=1&source=test&k=…`), the URL's `quality`, `k`, `m`, `bitrate`, `audio` and `mic` replace
- * the settings. `res=WxH` sets the test pattern size either way, `pattern=busy|bursty` its high-entropy variants.
+ * `share=1&source=test&k=…`), the URL's `quality=auto` (lower automatically), `k`, `m`,
+ * `bitrate`, `fps`, `audio` and `mic` replace the settings. `res=WxH` sets the test pattern size
+ * either way, `pattern=busy|bursty` its high-entropy variants. `nativeSize` is the screen in
+ * device pixels, for the bitrate of the Native resolution.
  */
-export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, urlOverrides: boolean): ResolvedShare {
-  const preset = QUALITY_PRESETS[sh.quality]
+export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, urlOverrides: boolean, nativeSize?: [number, number]): ResolvedShare {
+  const kbps = targetKbps(sh.video, nativeSize)
   /** The URL's value under overrides, else the setting's. */
   const pick = <T>(fromUrl: () => T, setting: T): T => (urlOverrides ? fromUrl() : setting)
   const test = sh.source === 'test' || (urlOverrides && params.get('source') === 'test')
-  const auto = pick(() => params.get('quality') === 'auto', sh.quality === 'auto')
+  const auto = pick(() => params.get('quality') === 'auto', sh.autoLower)
   return {
     options: {
       k: Math.max(1, pick(() => numParam(params, 'k', sh.k), sh.k)),
       m: Math.max(0, pick(() => numParam(params, 'm', sh.m), sh.m)),
-      bitrateKbps: pick(() => numParam(params, 'bitrate', preset.kbps), preset.kbps),
+      bitrateKbps: pick(() => numParam(params, 'bitrate', kbps), kbps),
+      fps: pick(() => numParam(params, 'fps', sh.video.fps), sh.video.fps),
       source: test ? 'test' : 'screen',
       surface: sh.source === 'window' ? 'window' : sh.source === 'tab' ? 'browser' : 'monitor',
-      maxSize: [preset.maxWidth, preset.maxHeight],
+      maxSize: maxSizeFor(sh.video.resolution),
       audio: pick(() => params.get('audio') === '1', sh.systemAudio),
       mic: pick(() => params.get('mic') === '1', sh.mic),
       testSize: sizeParam(params, 'res'),

@@ -4,6 +4,7 @@ import { NO_REF } from '../proto/framing'
 import { toBase64, type StreamInfo } from '../proto/messages'
 import { frameReader } from './capture'
 import type { EncodedFrame } from './packetizer'
+import { bitsPerPixel, HIGH_BPP } from './quality'
 
 const IDLE_REFRESH_MS = 400
 const ERROR_RETRY_MS = 1000
@@ -18,7 +19,20 @@ interface Candidate {
   codec: string
   scalabilityMode?: string
   avc?: AvcEncoderConfig
+  hardwareAcceleration?: HardwareAcceleration
 }
+
+/**
+ * At high bitrates per pixel: a hardware H.264 High-profile encoder (level 5.2: up to 4K60). In
+ * real-time mode, software VP9 stops turning extra bits into quality well before "near-lossless";
+ * GPU encoders keep up at 1080p60 and beyond. Temporal layers are required: without them a frame
+ * dropped under congestion would break decoding until the next keyframe. Chrome treats
+ * prefer-hardware as hardware only, so machines without such an encoder fall through to VP9.
+ */
+const HIGH_BITRATE_CANDIDATES: Candidate[] = [
+  { codec: 'avc1.640034', scalabilityMode: 'L1T3', avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware' },
+  { codec: 'avc1.640034', scalabilityMode: 'L1T2', avc: { format: 'annexb' }, hardwareAcceleration: 'prefer-hardware' },
+]
 
 // Prefer codecs with temporal scalability (lets relays shed frame rate under pressure).
 const CANDIDATES: Candidate[] = [
@@ -30,10 +44,12 @@ const CANDIDATES: Candidate[] = [
 ]
 
 async function pickConfig(width: number, height: number, o: VideoEncoderOptions): Promise<VideoEncoderConfig> {
+  const high = bitsPerPixel(o.bitrateKbps, width, height, o.fps) >= HIGH_BPP
+  const candidates = high ? [...HIGH_BITRATE_CANDIDATES, ...CANDIDATES] : CANDIDATES
   // Constant bitrate first: fast motion then costs quality instead of making frames several times
   // the average size, which would overflow the uplinks the relay trees were planned for.
   for (const bitrateMode of ['constant', 'variable'] as const) {
-    for (const c of CANDIDATES) {
+    for (const c of candidates) {
       const config: VideoEncoderConfig = {
         codec: c.codec,
         width,
@@ -44,6 +60,7 @@ async function pickConfig(width: number, height: number, o: VideoEncoderOptions)
         bitrateMode,
         ...(c.scalabilityMode ? { scalabilityMode: c.scalabilityMode } : {}),
         ...(c.avc ? { avc: c.avc } : {}),
+        ...(c.hardwareAcceleration ? { hardwareAcceleration: c.hardwareAcceleration } : {}),
       }
       try {
         const res = await VideoEncoder.isConfigSupported(config)
@@ -74,6 +91,8 @@ export class VideoPipeline {
   private lastSeqByLayer: number[] = []
   private lastKeyAt = -Infinity
   private keyRequested = true
+  /** Set by setTarget: the next frame picks the codec and config afresh. */
+  private repick = false
   private stopped = false
   private reader: ReturnType<typeof frameReader> | null = null
   private captureTimes = new Map<number, number>()
@@ -136,9 +155,21 @@ export class VideoPipeline {
     }
   }
 
+  /**
+   * A deliberate quality change (bitrate and frame rate): the next frame rebuilds the encoder,
+   * choosing the codec again for the new bits per pixel. Congestion control uses setBitrate
+   * instead, which keeps the codec, so it never flips between codecs.
+   */
+  setTarget(kbps: number, fps: number): void {
+    if (kbps === this.opts.bitrateKbps && fps === this.opts.fps) return
+    this.opts.bitrateKbps = kbps
+    this.opts.fps = fps
+    this.repick = true
+  }
+
   async start(): Promise<void> {
     if (!this.track) return
-    this.reader = frameReader(this.track, this.opts.fps)
+    this.reader = frameReader(this.track, () => this.opts.fps)
     // Screen capture only delivers frames when pixels change. Re-encode the last frame while idle so
     // stripes stay alive (silence means "dead parent" to viewers) and keyframes keep flowing.
     let last: VideoFrame | null = null
@@ -177,7 +208,7 @@ export class VideoPipeline {
   private async encodeFrame(frame: VideoFrame): Promise<void> {
     const width = frame.displayWidth & ~1
     const height = frame.displayHeight & ~1
-    if (!this.encoder || !this.config || this.config.width !== width || this.config.height !== height) {
+    if (this.repick || !this.encoder || !this.config || this.config.width !== width || this.config.height !== height) {
       // After an encoder error, wait a little before building a new one (avoids a hot loop).
       if (!this.encoder && wallClock() - this.failedAt < ERROR_RETRY_MS) {
         this.framesDropped++
@@ -216,6 +247,7 @@ export class VideoPipeline {
         // Closing is best effort: the old encoder is being replaced either way.
       }
     }
+    this.repick = false
     const config = await pickConfig(width, height, this.opts)
     if (this.stopped) return
     this.config = config
