@@ -130,8 +130,15 @@ export function feasibleBitrate(currentKbps: number, ratio: number, floorKbps = 
 export const CAPACITY_WINDOW_MS = 10_000
 /** A backlogged window queueing longer than this (ms) sets the capacity at once (no max filter). */
 export const FAST_DROP_QUEUE_MS = 1000
-/** A link is backlogged when its uplink queue held something for this share of a window. */
+/** A link is backlogged when its uplink queue held something for this share of a window... */
 export const BACKLOGGED_SHARE = 0.9
+/**
+ * ...and what waited there shows it: live media queued this long on average (ms), or frames were
+ * dropped. A queue that is merely never empty (a busy, fast link fed fragment by fragment) is not a
+ * full uplink, and taking what it delivered as capacity cut the bitrate, which cut what was
+ * delivered, down to the floor.
+ */
+export const CONGESTED_QUEUE_MS = 150
 /** The page froze in a window when the main thread lagged this long (ms): the window is ignored. */
 export const FROZEN_LAG_MS = 400
 
@@ -174,7 +181,7 @@ export interface ConnWindow {
   kbps: number
   /** It carried live media (or had some waiting). */
   active: boolean
-  /** Its uplink queue held something for essentially the whole window. */
+  /** Its uplink queue held something for essentially the whole window, and media queued or dropped. */
   backlogged: boolean
   /** It stalled in the window (its send buffer stopped draining). */
   stalled: boolean
@@ -189,14 +196,15 @@ export function linkWindow(id: unknown, peer: string, a: LinkSnap, b: LinkSnap):
   const drops = b.drops - a.drops
   const busy = b.busyMs - a.busyMs
   const qN = b.qN - a.qN
+  const queueMs = Math.max(qN > 0 ? (b.qSum - a.qSum) / qN : 0, b.headAgeMs)
   return {
     id,
     peer,
     kbps: deliveredKbps(b.handed - a.handed, a.buffered, b.buffered, ms),
     active: items > 0 || drops > 0 || busy > 0,
-    backlogged: ms > 0 && busy >= BACKLOGGED_SHARE * ms,
+    backlogged: ms > 0 && busy >= BACKLOGGED_SHARE * ms && (queueMs >= CONGESTED_QUEUE_MS || drops > 0),
     stalled: b.lastStallAt > a.at,
-    queueMs: Math.max(qN > 0 ? (b.qSum - a.qSum) / qN : 0, b.headAgeMs),
+    queueMs,
     mediaKbps: ms > 0 ? ((b.mediaBytes - a.mediaBytes) * 8) / ms : 0,
     dropsPerS: ms > 0 ? (drops * 1000) / ms : 0,
   }

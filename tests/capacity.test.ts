@@ -105,7 +105,7 @@ describe('delivered rate', () => {
     expect(deliveredKbps(1000, 0, 0, 0)).toBe(0)
   })
 
-  it('a window between two snapshots: backlogged when the queue never emptied, stalled when it stalled', () => {
+  it('a window between two snapshots: backlogged when the queue never emptied with media queueing or dropped, stalled when it stalled', () => {
     const a: LinkSnap = { at: 0, handed: 0, buffered: 0, busyMs: 0, items: 0, mediaBytes: 0, drops: 0, qSum: 0, qN: 0, lastStallAt: -Infinity, headAgeMs: 0 }
     const b: LinkSnap = { ...a, at: 2000, handed: 2_000_000, buffered: 64_000, busyMs: 1900, items: 1500, mediaBytes: 1_500_000, drops: 10, qSum: 1500 * 300, qN: 1500, headAgeMs: 100 }
     const w = linkWindow('l', 'p', a, b)
@@ -114,6 +114,10 @@ describe('delivered rate', () => {
     // Busy for less than 90% of the window: not backlogged. The oldest waiting item counts as queueing.
     expect(linkWindow('l', 'p', a, { ...b, busyMs: 1700, headAgeMs: 1200 })).toMatchObject({ backlogged: false, queueMs: 1200 })
     expect(linkWindow('l', 'p', a, { ...b, lastStallAt: 500 }).stalled).toBe(true)
+    // A queue that never emptied but held nothing long and dropped nothing: a busy link, not a full one.
+    expect(linkWindow('l', 'p', a, { ...b, drops: 0, qSum: 1500 * 5, headAgeMs: 3 }).backlogged).toBe(false)
+    expect(linkWindow('l', 'p', a, { ...b, drops: 0, qSum: 1500 * 200 }).backlogged).toBe(true)
+    expect(linkWindow('l', 'p', a, { ...b, qSum: 1500 * 5, headAgeMs: 3 }).backlogged).toBe(true)
     // Idle: no media, nothing waiting.
     expect(linkWindow('l', 'p', a, { ...a, at: 2000 }).active).toBe(false)
   })

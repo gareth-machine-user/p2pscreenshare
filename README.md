@@ -163,7 +163,8 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    watch.
 5. **Capacity** (`src/session/capacity.ts`). One measured quantity: what each connection
    *delivered* (bytes handed to its channels, less what its send buffers grew by) per 2 s window,
-   and whether it was *backlogged* (its uplink queue never emptied: it carried all it could). The
+   and whether it was *backlogged* (its uplink queue never emptied and live media queued ≥ 150 ms or
+   was dropped: it carried all it could). The
    uplink's capacity is the most delivered over the last 10 s in windows where most connections
    were backlogged at once; a connection's own is the most it delivered while it alone was
    backlogged (see [Rate control](#rate-control)). 75% of the uplink's capacity is split into relay
@@ -296,7 +297,7 @@ membership layer handles everything else.
 | A relay is consistently late | Every viewer measures how far behind the first piece of each frame each stripe arrives; the publisher attributes the excess to the parent | Lateness counts as a parent-choice penalty; a parent late by more than 150 ms for 10 s loses its children there for 30 s | 10 s |
 | Several publishers compete for relays | Channel announcements carry the latest plan's `deficit` | Every 10 s each peer moves 10% of its budget weight from channels without a deficit to those with one | a few rounds |
 | The audience can't upload enough | Offered slots below 90% of the N × S needed for 10 s | The presenter sees "Audience upload is limited: about X Mbps will play smoothly"; with Auto quality the encoder drops to that bitrate (in place, no new capture) | ~10 s |
-| Upload capacity changes | Backlogged windows (any time), or a headroom probe every 30 s while nothing is backlogged | Capacity follows (max over 10 s; at once when queueing passes 1 s) | 2–30 s |
+| Upload capacity changes | Backlogged windows (any time), or a headroom probe every 30 s (5 s while limited) while nothing is backlogged | Capacity follows (max over 10 s; at once when queueing passes 1 s) | 2–30 s |
 
 Measured in the e2e tests on one machine:
 - **With parity (`m ≥ 1`):** a relay leaving is invisible (minimum 31–34 fps during failover).
@@ -502,7 +503,9 @@ Rate control, in both profiles:
   - *Windows.* Every 2 s, per connection (a mesh link or a lane): delivered = bytes handed to its
     channels (media and `bin`) minus the growth of their `bufferedAmount`, per second. The window
     is *backlogged* if the connection's uplink queue held something for ≥ 90% of it (data waits
-    in the app only while the 64 KiB send buffer is full), *stalled* if the connection stalled in
+    in the app only while the 64 KiB send buffer is full) and live media queued 150 ms on average
+    or was dropped (`CONGESTED_QUEUE_MS`: a queue that is merely never empty is a busy link, not a
+    full one, and measuring it as capacity spiralled the bitrate down to the floor), *stalled* if the connection stalled in
     it (`STALL_MS`, below), and the whole window is ignored if the page *froze* (the main thread
     lagged ≥ 400 ms: what queued then is this computer's doing).
   - *Uplink capacity* (what a peer gossips as `capacityKbps`): the most delivered in total over
@@ -516,7 +519,8 @@ Rate control, in both profiles:
     one's share only says how the uplink was split, so it only raises the estimate. A peer's
     capacity is the sum over its connections.
   - *Headroom discovery*, the only probing (`session/headroom.ts`): once 1 s after the first link
-    opens, then every 30 s while no media connection is backlogged, the uplink's background slot
+    opens, then every 30 s (5 s while a capacity estimate holds the bitrate below the chosen quality)
+    while no media connection is backlogged, the uplink's background slot
     pushes bytes onto every open connection's `bin` channel for 1.5 s (64 KB buffered at most per
     channel, refilled from buffer-low events, so it measures in a hidden tab too; a starved probe
     is discarded), after all live media. Those windows count as backlogged. Nobody replies: the

@@ -99,6 +99,8 @@ const REBALANCE_MS = 10_000
 const AUTO_RESTART_GAP_MS = 30_000
 /** Headroom discovery (session/headroom.ts) runs this often while no media connection is backlogged... */
 const HEADROOM_EVERY_MS = 30_000
+/** ...or this often while the measured capacity holds the bitrate below the chosen quality. */
+const HEADROOM_LIMITED_MS = 5000
 /** ...and first this long after the first link opens. */
 const HEADROOM_FIRST_MS = 1000
 /** How often to consider running it. */
@@ -924,12 +926,17 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   /**
    * Headroom discovery, the only probing: once shortly after the first link opens, then every 30 s
-   * while no media connection is backlogged (a backlogged one already shows what it carries).
+   * (5 s while a capacity estimate limits the bitrate) while no media connection is backlogged (a
+   * backlogged one already shows what it carries).
    */
   private maybeDiscover(): void {
     if (this.headroom.running || this.firstLinkAt === null) return
     const now = performance.now()
-    const due = this.headroom.lastAt === -Infinity ? now - this.firstLinkAt >= HEADROOM_FIRST_MS : now - this.headroom.lastAt >= HEADROOM_EVERY_MS
+    // Held below the chosen quality by a capacity estimate, with nothing backlogged to show it: the
+    // estimate may be stale or low, and only a probe raises it.
+    const limited = this.rate !== null && (this.rate.limit === 'uplink' || this.rate.limit === 'viewers')
+    const every = limited ? HEADROOM_LIMITED_MS : HEADROOM_EVERY_MS
+    const due = this.headroom.lastAt === -Infinity ? now - this.firstLinkAt >= HEADROOM_FIRST_MS : now - this.headroom.lastAt >= every
     if (due && !this.backloggedNow) void this.discover()
   }
 
