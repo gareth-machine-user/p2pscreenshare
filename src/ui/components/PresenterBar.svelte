@@ -13,6 +13,8 @@
     quality = $bindable(),
     autoLower = $bindable(),
     nativeSize,
+    facing = null,
+    onflip,
     onmic,
     onsystem,
     onswitch,
@@ -31,6 +33,9 @@
     quality: VideoQuality
     autoLower: boolean
     nativeSize?: [number, number]
+    /** The camera in use, when sharing a camera (null for a screen). */
+    facing?: 'user' | 'environment' | null
+    onflip?: () => void
     onmic: (muted: boolean) => void
     onsystem: (muted: boolean) => void
     onswitch: () => void
@@ -68,8 +73,13 @@
     <button data-testid="mute-system" aria-pressed={audio.systemMuted} onclick={() => onsystem(!audio.systemMuted)}>
       <Icon name={audio.systemMuted ? 'muted' : 'volume'} />{audio.systemMuted ? 'Unmute audio' : 'Mute audio'}
     </button>
-  {:else}
+  {:else if !facing}
     <span class="hint" data-testid="no-system-audio" title="The browser gave no audio for this source (common for windows, and on macOS and Linux)">No system audio</span>
+  {/if}
+  {#if facing && onflip}
+    <button data-testid="flip-camera" onclick={onflip} title="Switch between the front and back cameras">
+      <Icon name="flip" />{facing === 'user' ? 'Back camera' : 'Front camera'}
+    </button>
   {/if}
   <button data-testid="switch-source" onclick={onswitch}><Icon name="swap" />Switch source</button>
   <div class="quality-wrap" bind:this={wrap}>

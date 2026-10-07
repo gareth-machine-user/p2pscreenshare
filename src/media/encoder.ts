@@ -167,27 +167,58 @@ export class VideoPipeline {
     this.repick = true
   }
 
+  /**
+   * Captures from another track from now on (e.g. the other camera), with no new channel: the
+   * encoder rebuilds only if the frame size changes, and the next frame is a keyframe either way.
+   */
+  replaceTrack(track: MediaStreamTrack): void {
+    if (this.stopped) return
+    const old = this.reader
+    this.track = track
+    this.reader = frameReader(track, () => this.opts.fps)
+    this.keyRequested = true
+    // Ends the old reader (if its track hasn't already): start() moves on to the new one.
+    old?.stop()
+  }
+
   async start(): Promise<void> {
     if (!this.track) return
     this.reader = frameReader(this.track, () => this.opts.fps)
     // Screen capture only delivers frames when pixels change. Re-encode the last frame while idle so
     // stripes stay alive (silence means "dead parent" to viewers) and keyframes keep flowing.
     let last: VideoFrame | null = null
-    let pending = this.reader.next()
+    let reader = this.reader
+    let pending = reader.next()
     for (;;) {
       const res = await Promise.race([
         pending.then((f) => ({ f })),
         // Worker-driven: a presenter's backgrounded tab keeps refreshing (timers there are throttled).
         sleep(IDLE_REFRESH_MS).then(() => null),
       ])
-      if (this.stopped) break
+      if (this.stopped) {
+        if (res?.f) res.f.close()
+        break
+      }
+      if (this.reader !== reader) {
+        // The track was replaced: drop what the old reader had in flight, read the new one.
+        if (res?.f) res.f.close()
+        else if (!res) void pending.then((f) => f?.close())
+        reader = this.reader!
+        pending = reader.next()
+        continue
+      }
       let frame: VideoFrame
       if (res === null) {
         if (!last) continue
         frame = new VideoFrame(last, { timestamp: Math.round(performance.now() * 1000) })
       } else {
-        if (!res.f) break
-        pending = this.reader.next()
+        if (!res.f) {
+          // The track ended. Either a new one is on its way (replaceTrack, e.g. between cameras),
+          // or the stream is stopping: meanwhile keep re-sending the last frame.
+          pending = new Promise(() => {})
+          continue
+        }
+        pending = reader.next()
         frame = res.f
         last?.close()
         last = frame.clone()

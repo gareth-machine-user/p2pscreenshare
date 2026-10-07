@@ -25,6 +25,38 @@ export async function captureScreen(o: CaptureOptions): Promise<MediaStream> {
   return stream
 }
 
+/** Whether this browser can capture the screen (phones can't: they share a camera instead). */
+export function canCaptureScreen(): boolean {
+  return typeof navigator.mediaDevices?.getDisplayMedia === 'function'
+}
+
+export function canCaptureCamera(): boolean {
+  return typeof navigator.mediaDevices?.getUserMedia === 'function'
+}
+
+/** Which camera: the front (selfie) one or the back one. */
+export type CameraFacing = 'user' | 'environment'
+
+/**
+ * A camera's video, sized as `ideal` constraints rather than maxima: a phone held upright delivers
+ * portrait frames, which a landscape maximum would reject or crop. The encoder follows whatever
+ * size (and rotation) arrives.
+ */
+export async function captureCamera(o: { facing: CameraFacing; width?: number; height?: number; fps?: number }): Promise<MediaStream> {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints(o), audio: false })
+  for (const t of stream.getVideoTracks()) t.contentHint = 'motion'
+  return stream
+}
+
+export function cameraConstraints(o: { facing?: CameraFacing; width?: number; height?: number; fps?: number }): MediaTrackConstraints {
+  return {
+    ...(o.facing ? { facingMode: { ideal: o.facing } } : {}),
+    width: { ideal: o.width ?? 1280 },
+    height: { ideal: o.height ?? 720 },
+    frameRate: { ideal: o.fps ?? 30, max: o.fps ?? 30 },
+  }
+}
+
 /**
  * Synthetic source for testing: an animated canvas that prints the host wall clock, so latency is
  * visible by eye when the host and a viewer are side by side. Variants: `busy`, a rotating, zooming
@@ -149,6 +181,7 @@ export function frameReader(track: MediaStreamTrack, fps: number | (() => number
   const video = document.createElement('video')
   video.muted = true
   video.playsInline = true
+  video.autoplay = true
   video.srcObject = new MediaStream([track])
   void video.play()
   let stopped = false

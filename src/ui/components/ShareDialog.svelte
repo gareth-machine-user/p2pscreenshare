@@ -1,8 +1,18 @@
 <script lang="ts">
+  import { canCaptureCamera, canCaptureScreen } from '../../media/capture'
   import { fmtKbps } from '../route'
   import { describeQuality, targetKbps } from '../../media/quality'
   import { nativeScreenSize } from '../screen'
-  import { clampStripes, DEFAULT_SETTINGS, saveSettings, settings, STRIPE_LIMITS, type SourceKind } from '../settings.svelte'
+  import {
+    clampStripes,
+    DEFAULT_SETTINGS,
+    saveSettings,
+    settings,
+    STRIPE_LIMITS,
+    supportedSource,
+    type CameraFacing,
+    type SourceKind,
+  } from '../settings.svelte'
   import QualityPicker from './QualityPicker.svelte'
 
   let {
@@ -15,6 +25,8 @@
   }: { onstart: () => void; oncancel: () => void; micSupported?: boolean; title?: string; action?: string } = $props()
 
   const s = settings.share
+  const can = { screen: canCaptureScreen(), camera: canCaptureCamera() }
+  s.source = supportedSource(s.source, can)
   let advanced = $state(s.source === 'test' || s.k !== DEFAULT_SETTINGS.share.k || s.m !== DEFAULT_SETTINGS.share.m)
   let dialog: HTMLDialogElement | undefined = $state()
   /** The quality picker is folded into a one-line summary until asked for. */
@@ -26,9 +38,18 @@
   })
 
   const SOURCES: { value: Exclude<SourceKind, 'test'>; label: string }[] = [
-    { value: 'screen', label: 'Entire screen' },
-    { value: 'window', label: 'Window' },
-    { value: 'tab', label: 'Browser tab' },
+    ...(can.screen
+      ? [
+          { value: 'screen', label: 'Entire screen' },
+          { value: 'window', label: 'Window' },
+          { value: 'tab', label: 'Browser tab' },
+        ] as const
+      : []),
+    ...(can.camera ? [{ value: 'camera', label: 'Camera' }] as const : []),
+  ]
+  const FACINGS: { value: CameraFacing; label: string }[] = [
+    { value: 'user', label: 'Front' },
+    { value: 'environment', label: 'Back' },
   ]
 
   function start(e: SubmitEvent) {
@@ -49,19 +70,30 @@
 <dialog bind:this={dialog} class="share-dialog" data-testid="share-dialog" oncancel={cancel}>
   <form onsubmit={start}>
     <h3>{title}</h3>
-    {#if s.source !== 'test'}
+    {#if s.source !== 'test' && SOURCES.length > 1}
       <fieldset class="segmented">
         <legend>Source</legend>
         {#each SOURCES as src}
-          <label class:active={s.source === src.value}>
+          <label class:active={s.source === src.value} data-testid="source-{src.value}">
             <input type="radio" name="source" value={src.value} bind:group={s.source} />{src.label}
           </label>
         {/each}
       </fieldset>
     {/if}
-    <label class="check">
-      <input type="checkbox" data-testid="system-audio" bind:checked={s.systemAudio} /> Share system/tab audio
-    </label>
+    {#if s.source === 'camera'}
+      <fieldset class="segmented">
+        <legend>Camera</legend>
+        {#each FACINGS as f}
+          <label class:active={s.facing === f.value} data-testid="facing-{f.value}">
+            <input type="radio" name="facing" value={f.value} bind:group={s.facing} />{f.label}
+          </label>
+        {/each}
+      </fieldset>
+    {:else}
+      <label class="check">
+        <input type="checkbox" data-testid="system-audio" bind:checked={s.systemAudio} /> Share system/tab audio
+      </label>
+    {/if}
     {#if micSupported}
       <label class="check"><input type="checkbox" data-testid="mic" bind:checked={s.mic} /> Include microphone</label>
     {/if}
@@ -86,7 +118,7 @@
           type="checkbox"
           data-testid="test-pattern"
           checked={s.source === 'test'}
-          onchange={(e) => (s.source = (e.currentTarget as HTMLInputElement).checked ? 'test' : 'screen')}
+          onchange={(e) => (s.source = (e.currentTarget as HTMLInputElement).checked ? 'test' : supportedSource('screen', can))}
         />
         Use a test pattern instead of capturing
       </label>

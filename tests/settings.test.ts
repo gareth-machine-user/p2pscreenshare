@@ -2,7 +2,7 @@
 /// <reference types="vite/client" />
 // (tsconfig.tools.json lacks the app types these src/ui modules use: runes, import.meta.env.)
 import { describe, expect, it } from 'vitest'
-import { clampStripes, DEFAULT_SETTINGS, parseSettings, STRIPE_LIMITS } from '../src/ui/settings.svelte'
+import { clampStripes, DEFAULT_SETTINGS, parseSettings, STRIPE_LIMITS, supportedSource } from '../src/ui/settings.svelte'
 import { CUSTOM_KBPS } from '../src/media/quality'
 
 describe('parseSettings', () => {
@@ -23,6 +23,7 @@ describe('parseSettings', () => {
       name: 'Ann',
       share: {
         source: 'tab',
+        facing: 'environment',
         systemAudio: false,
         mic: true,
         video: { resolution: '1440', fps: 60, level: 'very-high', customKbps: null },
@@ -51,7 +52,7 @@ describe('parseSettings', () => {
     const s = parseSettings(
       JSON.stringify({
         name: 5,
-        share: { source: 'camera', systemAudio: 'yes', mic: true, video: { resolution: '8k', fps: 24, level: 'ultra', customKbps: 'x' }, autoLower: 1, k: 0, m: 2.5 },
+        share: { source: 'projector', systemAudio: 'yes', mic: true, video: { resolution: '8k', fps: 24, level: 'ultra', customKbps: 'x' }, autoLower: 1, k: 0, m: 2.5 },
         view: { quality: 'ultra', buffering: 'huge', chatOpen: false },
       }),
     )
@@ -84,5 +85,30 @@ describe('stripe limits', () => {
     const { k, m } = DEFAULT_SETTINGS.share
     expect(clampStripes(k, STRIPE_LIMITS.k)).toBe(k)
     expect(clampStripes(m, STRIPE_LIMITS.m)).toBe(m)
+  })
+})
+
+describe('supportedSource', () => {
+  const desktop = { screen: true, camera: true }
+  const phone = { screen: false, camera: true }
+
+  it('keeps any source the device can capture', () => {
+    for (const src of ['screen', 'window', 'tab', 'camera', 'test'] as const) expect(supportedSource(src, desktop)).toBe(src)
+  })
+
+  it('switches a phone from a screen source to its camera', () => {
+    for (const src of ['screen', 'window', 'tab'] as const) expect(supportedSource(src, phone)).toBe('camera')
+    expect(supportedSource('test', phone)).toBe('test')
+  })
+
+  it('falls back to the screen without a camera API, and keeps the saved choice when neither works', () => {
+    expect(supportedSource('camera', { screen: true, camera: false })).toBe('screen')
+    expect(supportedSource('camera', { screen: false, camera: false })).toBe('camera')
+    expect(supportedSource('tab', { screen: false, camera: false })).toBe('tab')
+  })
+
+  it('reads a stored camera facing, defaulting to the front camera', () => {
+    expect(parseSettings(JSON.stringify({ share: { source: 'camera', facing: 'environment' } })).share).toMatchObject({ source: 'camera', facing: 'environment' })
+    expect(parseSettings(JSON.stringify({ share: { facing: 'sideways' } })).share.facing).toBe('user')
   })
 })

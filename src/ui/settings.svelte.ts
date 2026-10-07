@@ -13,14 +13,17 @@ import {
   type Resolution,
   type VideoQuality,
 } from '../media/quality'
+import type { CameraFacing } from '../media/capture'
 import { storageGet, storageSet } from '../util/storage'
 
-export type { Buffering, ViewQuality }
-export type SourceKind = 'screen' | 'window' | 'tab' | 'test'
+export type { Buffering, CameraFacing, ViewQuality }
+export type SourceKind = 'screen' | 'window' | 'tab' | 'camera' | 'test'
 export type { VideoQuality }
 
 export interface ShareSettings {
   source: SourceKind
+  /** Which camera, for the camera source. */
+  facing: CameraFacing
   /** Share system or tab audio, when the browser offers it. */
   systemAudio: boolean
   /** Mix in the microphone. */
@@ -44,7 +47,7 @@ const KEY = 'p2pss:settings'
 
 export const DEFAULT_SETTINGS: Settings = {
   name: '',
-  share: { source: 'screen', systemAudio: true, mic: false, video: DEFAULT_QUALITY, autoLower: true, k: 4, m: 1 },
+  share: { source: 'screen', facing: 'user', systemAudio: true, mic: false, video: DEFAULT_QUALITY, autoLower: true, k: 4, m: 1 },
   view: { quality: 'auto', buffering: 'auto', chatOpen: true },
 }
 
@@ -55,7 +58,8 @@ export const STRIPE_LIMITS = { k: { min: 1, max: 16 }, m: { min: 0, max: 8 } } a
 export function clampStripes(v: number, limits: { min: number; max: number }): number {
   return Math.min(limits.max, Math.max(limits.min, Math.round(v)))
 }
-const SOURCES: readonly SourceKind[] = ['screen', 'window', 'tab', 'test']
+const SOURCES: readonly SourceKind[] = ['screen', 'window', 'tab', 'camera', 'test']
+const FACINGS: readonly CameraFacing[] = ['user', 'environment']
 const VIEW_QUALITIES: readonly ViewQuality[] = ['auto', 'full', 'preview']
 
 /** `v` if it is one of `allowed`, else `fallback`. */
@@ -94,6 +98,7 @@ export function parseSettings(raw: string | null): Settings {
     name: typeof s.name === 'string' ? s.name : d.name,
     share: {
       source: oneOf(share.source, SOURCES, d.share.source),
+      facing: oneOf(share.facing, FACINGS, d.share.facing),
       systemAudio: bool(share.systemAudio, d.share.systemAudio),
       mic: bool(share.mic, d.share.mic),
       ...parseVideo(share),
@@ -135,6 +140,16 @@ function parseVideo(share: Record<string, unknown>): { video: VideoQuality; auto
 }
 
 export const settings: Settings = $state(parseSettings(storageGet(KEY)))
+
+/**
+ * The source to offer: a device that can't capture its screen (a phone) shares its camera, and one
+ * with no camera API falls back to the screen.
+ */
+export function supportedSource(source: SourceKind, can: { screen: boolean; camera: boolean }): SourceKind {
+  if (source === 'test') return source
+  if (source === 'camera') return can.camera || !can.screen ? source : 'screen'
+  return can.screen || !can.camera ? source : 'camera'
+}
 
 export function saveSettings(): void {
   storageSet(KEY, JSON.stringify($state.snapshot(settings)))

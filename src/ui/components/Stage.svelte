@@ -7,6 +7,7 @@
   let {
     player = null,
     localStream = null,
+    mirror = false,
     message = null,
     hasAudio = false,
     muted = $bindable(true),
@@ -19,6 +20,8 @@
     player?: Player | null
     /** The presenter's own capture, shown instead of a remote stream. */
     localStream?: MediaStream | null
+    /** Mirror the local preview (a front camera, so it moves like a mirror). */
+    mirror?: boolean
     message?: string | null
     hasAudio?: boolean
     muted?: boolean
@@ -96,7 +99,7 @@
   }}
 >
   {#if localStream}
-    <video bind:this={video} autoplay muted playsinline data-testid="local-preview"></video>
+    <video bind:this={video} class:mirror autoplay muted playsinline data-testid="local-preview"></video>
   {:else}
     <canvas bind:this={canvas} data-testid="video"></canvas>
   {/if}

@@ -15,16 +15,18 @@ export interface ResolvedShare {
 
 /**
  * The stream options for the saved share settings. With `urlOverrides` (tests/debug:
- * `share=1&source=test&k=…`), the URL's `quality=auto` (lower automatically), `k`, `m`,
- * `bitrate`, `fps`, `audio` and `mic` replace the settings. `res=WxH` sets the test pattern size
- * either way, `pattern=busy|bursty` its high-entropy variants. `nativeSize` is the screen in
- * device pixels, for the bitrate of the Native resolution.
+ * `share=1&source=test&k=…`, or `source=camera&facing=…`), the URL's `quality=auto` (lower
+ * automatically), `k`, `m`, `bitrate`, `fps`, `audio` and `mic` replace the settings. `res=WxH`
+ * sets the test pattern size either way, `pattern=busy|bursty` its high-entropy variants.
+ * `nativeSize` is the screen in device pixels, for the bitrate of the Native resolution.
  */
 export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, urlOverrides: boolean, nativeSize?: [number, number]): ResolvedShare {
   const kbps = targetKbps(sh.video, nativeSize)
   /** The URL's value under overrides, else the setting's. */
   const pick = <T>(fromUrl: () => T, setting: T): T => (urlOverrides ? fromUrl() : setting)
-  const test = sh.source === 'test' || (urlOverrides && params.get('source') === 'test')
+  const fromUrl = urlOverrides ? params.get('source') : null
+  const test = sh.source === 'test' || fromUrl === 'test'
+  const camera = !test && (fromUrl === 'camera' || (fromUrl === null && sh.source === 'camera'))
   const auto = pick(() => params.get('quality') === 'auto', sh.autoLower)
   return {
     options: {
@@ -32,7 +34,8 @@ export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, 
       m: Math.max(0, pick(() => numParam(params, 'm', sh.m), sh.m)),
       bitrateKbps: pick(() => numParam(params, 'bitrate', kbps), kbps),
       fps: pick(() => numParam(params, 'fps', sh.video.fps), sh.video.fps),
-      source: test ? 'test' : 'screen',
+      source: test ? 'test' : camera ? 'camera' : 'screen',
+      ...(camera ? { facing: fromUrl === 'camera' ? (params.get('facing') === 'environment' ? 'environment' : 'user') : sh.facing } : {}),
       surface: sh.source === 'window' ? 'window' : sh.source === 'tab' ? 'browser' : 'monitor',
       maxSize: maxSizeFor(sh.video.resolution),
       audio: pick(() => params.get('audio') === '1', sh.systemAudio),
@@ -76,6 +79,8 @@ export interface StageState {
   stage: { name: string; decoding: boolean } | null
   shareError: string | null
   canShare: boolean
+  /** This device shares a camera (it can't capture its screen). */
+  cameraOnly?: boolean
   ownerAway: boolean
 }
 
@@ -88,7 +93,7 @@ export function stageMessage(s: StageState): string | null {
   if (s.presenting) return null
   if (!s.stage) {
     if (s.shareError) return `Couldn't start sharing: ${s.shareError}`
-    if (s.canShare) return 'Click Share screen to present to the lobby.'
+    if (s.canShare) return s.cameraOnly ? 'Tap Share camera to present to the lobby.' : 'Click Share screen to present to the lobby.'
     return s.ownerAway ? 'The owner is away. Nobody is sharing.' : 'Nobody is sharing yet.'
   }
   return s.stage.decoding ? null : `Connecting to ${s.stage.name}'s stream…`

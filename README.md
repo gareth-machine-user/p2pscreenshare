@@ -64,8 +64,8 @@ npm run tracker             # ws://localhost:8000
   toast with **Allow**, **Allow all**, **Deny** and **Deny all**, and the requester sees "Waiting
   for the owner…" (or "Owner is away"). The lobby settings (gear in the top bar, owner only) set
   who may share: ask each time, anyone, or only the owner. The share dialog picks the source
-  (screen, window or tab), system audio and microphone, and under **Advanced** the stripe layout
-  and a test pattern. Video quality shows as one line ("1080p30 · Standard · 5 Mbps") with a
+  (screen, window, tab or camera), system audio and microphone, and under **Advanced** the stripe
+  layout and a test pattern. Video quality shows as one line ("1080p30 · Standard · 5 Mbps") with a
   **Change** link. All of it is remembered.
 - **Video quality.** Resolution (Native, 2160p, 1440p, 1080p, 720p, 540p), frame rate (30 or 60)
   and a quality level, each level a density of bits per pixel, so it means the same picture
@@ -74,6 +74,12 @@ npm run tracker             # ws://localhost:8000
   frame rate^0.7: 1080p60 High is 14.5 Mbps, 2160p60 Near-lossless about 115). **Custom bitrate**
   sets any rate from 0.5 to 150 Mbps instead. **Lower automatically if viewers can't keep up** lets
   the stream go below the chosen rate (never above it) when the audience can't carry it.
+- **Phones.** Mobile browsers can't capture the screen, so a phone shares its camera: the button
+  reads **Share camera** and the dialog offers the front or back camera (plus the mic). While live,
+  the presenter bar flips cameras in place (same stream, a keyframe, no new share), and the screen
+  is kept awake, since a phone that locks stops its camera. The browser still suspends the camera
+  if you leave the page, so keep the lobby in front while sharing. Camera access needs HTTPS (or
+  localhost).
 - **Presenting.** You see a preview of what you share while the lobby tab is focused; it hides
   when you switch away (so sharing the whole screen doesn't film the preview). A presenter bar
   mutes the mic or the stream audio, switches the source, changes the quality (a button showing the
@@ -111,6 +117,7 @@ Useful URL parameters (put them in the page query or the hash query):
 | `share=1` | Share right away (asking the owner first if needed) with the overrides below; used by the e2e tests |
 | `k`, `m`, `bitrate`, `fps`, `quality=auto` | With `share=1`: data and parity stripes, video kbps, frame rate, lower automatically |
 | `source=test&res=640x360&audio=1&mic=1` | With `share=1`: animated test pattern (prints the clock), a test tone, the microphone |
+| `source=camera&facing=environment` | With `share=1`: share a camera (`user`, the default, is the front one) |
 | `block=name1,name2` | Debug: refuse mesh links with these members, as if ICE failed |
 | `lanes=2` | Connections per peer pair, 1–4 (default 2; `1` = a single connection). See [Lanes](#lanes-experimental) |
 

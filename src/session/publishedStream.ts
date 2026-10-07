@@ -1,8 +1,8 @@
-// A shared screen: capture and encoding (WebCodecs), the audio mixer, the preview channel's
+// A shared screen (or camera): capture and encoding (WebCodecs), the audio mixer, the preview channel's
 // downscaler, and quality/bitrate changes. Each encoded channel is handed to a ChannelPublisher
 // (channelPublisher.ts), which plans its trees.
 import { AudioPipeline } from '../media/audio'
-import { captureScreen, testPattern, type TestPatternKind } from '../media/capture'
+import { cameraConstraints, captureCamera, captureScreen, testPattern, type CameraFacing, type TestPatternKind } from '../media/capture'
 import { AudioMixer, captureMic } from '../media/mixer'
 import { VideoPipeline } from '../media/encoder'
 import type { EncoderRates } from '../proto/messages'
@@ -16,11 +16,13 @@ export interface ShareOptions {
   bitrateKbps: number
   /** Capture and encoding frame rate of the full channel (default 30). */
   fps?: number
-  source: 'screen' | 'test'
+  source: 'screen' | 'camera' | 'test'
   /** Picker hint for screen capture. */
   surface?: 'monitor' | 'window' | 'browser'
+  /** Which camera, for a camera source. */
+  facing?: CameraFacing
   maxSize?: [number, number]
-  /** Capture system/tab audio (or the test tone). */
+  /** Capture system/tab audio (or the test tone). A camera has none: its sound is the mic. */
   audio: boolean
   /** Mix in the microphone. */
   mic?: boolean
@@ -93,6 +95,9 @@ export class PublishedStream {
       const tp = testPattern(w, h, o.fps ?? DEFAULT_FPS, o.audio, o.testPattern)
       stream = tp.stream
       this.stopSource = tp.stop
+    } else if (o.source === 'camera') {
+      stream = await captureCamera({ facing: o.facing ?? 'user', width: o.maxSize?.[0], height: o.maxSize?.[1], fps: o.fps ?? DEFAULT_FPS })
+      this.stopSource = () => this.localStream?.getTracks().forEach((t) => t.stop())
     } else {
       stream = await captureScreen({ surface: o.surface, audio: o.audio, maxWidth: o.maxSize?.[0], maxHeight: o.maxSize?.[1], fps: o.fps ?? DEFAULT_FPS })
       this.stopSource = () => stream.getTracks().forEach((t) => t.stop())
@@ -102,7 +107,7 @@ export class PublishedStream {
     if (this.stopped) return this.stop()
 
     // System/tab audio and the microphone are mixed into one track.
-    const systemTrack = o.audio ? (stream.getAudioTracks()[0] ?? null) : null
+    const systemTrack = o.audio && o.source !== 'camera' ? (stream.getAudioTracks()[0] ?? null) : null
     this.micTrack = o.mic ? await captureMic() : null
     if (this.stopped) return this.stop()
     const canEncodeAudio = AudioPipeline.supported()
@@ -135,7 +140,53 @@ export class PublishedStream {
       this.audioPipe.start().catch((e) => console.warn('audio disabled', e))
     }
     // Ending the capture from the browser's own "Stop sharing" bar ends the stream too.
-    vt.addEventListener('ended', () => this.onEnded())
+    vt.addEventListener('ended', this.onTrackEnded)
+    this.ctx.announce()
+  }
+
+  private onTrackEnded = () => this.onEnded()
+
+  /** The camera in use, for a camera source. */
+  get facing(): CameraFacing | null {
+    return this.opts.source === 'camera' ? (this.opts.facing ?? 'user') : null
+  }
+
+  /**
+   * Switches to the other camera in place: the same channels carry on (a keyframe, maybe a new
+   * size), with no new share. The old camera is released first, since phones often can't open two.
+   */
+  async switchCamera(facing: CameraFacing): Promise<void> {
+    if (this.opts.source !== 'camera' || !this.video || this.stopped) return
+    const old = this.localStream?.getVideoTracks()[0]
+    old?.removeEventListener('ended', this.onTrackEnded)
+    old?.stop()
+    let stream: MediaStream
+    try {
+      stream = await captureCamera({ facing, width: this.opts.maxSize?.[0], height: this.opts.maxSize?.[1], fps: this.opts.fps ?? DEFAULT_FPS })
+    } catch (e) {
+      // Back to the camera we had, if it will open again; else the stream has no video left.
+      try {
+        stream = await captureCamera({ facing: this.facing ?? 'user', width: this.opts.maxSize?.[0], height: this.opts.maxSize?.[1], fps: this.opts.fps ?? DEFAULT_FPS })
+      } catch {
+        this.onEnded()
+        throw e
+      }
+      this.useCamera(stream)
+      throw e
+    }
+    ;(this.opts as { facing?: CameraFacing }).facing = facing
+    this.useCamera(stream)
+  }
+
+  private useCamera(stream: MediaStream): void {
+    if (this.stopped) {
+      stream.getTracks().forEach((t) => t.stop())
+      return
+    }
+    const vt = stream.getVideoTracks()[0]
+    vt.addEventListener('ended', this.onTrackEnded)
+    this.localStream = stream
+    this.video?.replaceTrack(vt)
     this.ctx.announce()
   }
 
@@ -173,12 +224,11 @@ export class PublishedStream {
     const track = this.localStream?.getVideoTracks()[0]
     if (track && this.opts.source !== 'test') {
       const size = maxSize ?? o.maxSize
-      await track
-        .applyConstraints({
-          ...(size ? { width: { max: size[0] }, height: { max: size[1] } } : {}),
-          frameRate: { ideal: rate, max: rate },
-        })
-        .catch((e) => console.warn('capture change failed', e))
+      const constraints =
+        this.opts.source === 'camera'
+          ? cameraConstraints({ facing: this.facing ?? undefined, width: size?.[0], height: size?.[1], fps: rate })
+          : { ...(size ? { width: { max: size[0] }, height: { max: size[1] } } : {}), frameRate: { ideal: rate, max: rate } }
+      await track.applyConstraints(constraints).catch((e) => console.warn('capture change failed', e))
       if (maxSize) o.maxSize = maxSize
     }
     full.limited = null

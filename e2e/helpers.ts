@@ -1,4 +1,4 @@
-import type { Browser, BrowserContext, Page } from '@playwright/test'
+import type { Browser, BrowserContext, BrowserContextOptions, Page } from '@playwright/test'
 import { TRACKER_URL } from '../playwright.config'
 import { hostIdentity } from '../src/net/lobby'
 
@@ -9,8 +9,8 @@ import { hostIdentity } from '../src/net/lobby'
  */
 const contexts = new Set<BrowserContext>()
 
-export async function newContext(browser: Browser): Promise<BrowserContext> {
-  const ctx = await browser.newContext()
+export async function newContext(browser: Browser, options?: BrowserContextOptions): Promise<BrowserContext> {
+  const ctx = await browser.newContext(options)
   contexts.add(ctx)
   ctx.on('close', () => contexts.delete(ctx))
   return ctx

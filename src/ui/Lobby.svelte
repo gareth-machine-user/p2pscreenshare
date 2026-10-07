@@ -2,6 +2,7 @@
   import { onDestroy, untrack } from 'svelte'
   import { loadIdentity, ownerIdentity, ownerIdFromCode } from '../mesh/identity'
   import type { PublishPolicy } from '../mesh/auth'
+  import { canCaptureScreen } from '../media/capture'
   import { DEFAULT_ICE } from '../net/bootstrap'
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publishedStream'
@@ -55,6 +56,8 @@
   }
   const link = lobbyUrl(joinCode, params)
   const iceServers = iceFrom(params) ?? DEFAULT_ICE
+  /** Phones can't capture their screen: they share a camera. */
+  const cameraOnly = !canCaptureScreen()
   /** Test/debug overrides from the URL (`share=1&source=test&k=…`); not persisted. */
   const urlOverrides = params.get('share') === '1'
 
@@ -160,11 +163,27 @@
   }
 
   function onShareClick() {
-    withName(session?.canShare ? 'before you share your screen' : 'before you ask to share', () => {
+    withName(session?.canShare ? `before you share your ${cameraOnly ? 'camera' : 'screen'}` : 'before you ask to share', () => {
       if (!session) return
       if (session.canShare) dialogOpen = true
       else session.requestPublish()
     })
+  }
+
+  /** Flips between the front and back cameras, keeping the stream. */
+  async function flipCamera() {
+    const pub = session?.publishing
+    const facing = pub?.facing
+    if (!pub || !facing) return
+    const next = facing === 'user' ? 'environment' : 'user'
+    try {
+      await pub.switchCamera(next)
+      settings.share.facing = next
+      saveSettings()
+    } catch (e) {
+      shareError = e instanceof Error ? e.message : String(e)
+    }
+    onChange()
   }
 
   function sendChat(text: string): boolean {
@@ -250,6 +269,32 @@
     }
   })
 
+  // A phone that sleeps stops its camera: keep the screen on while sharing one.
+  const sharingCamera = $derived(!!lobby?.sharing && !!session?.publishing?.facing)
+  $effect(() => {
+    if (!sharingCamera || !('wakeLock' in navigator)) return
+    let lock: WakeLockSentinel | null = null
+    let done = false
+    const acquire = () => {
+      if (done || document.hidden) return
+      navigator.wakeLock
+        .request('screen')
+        .then((l) => {
+          if (done) void l.release()
+          else lock = l
+        })
+        .catch(() => {})
+    }
+    acquire()
+    // The browser releases the lock when the page is hidden: take it again on return.
+    document.addEventListener('visibilitychange', acquire)
+    return () => {
+      done = true
+      document.removeEventListener('visibilitychange', acquire)
+      void lock?.release()
+    }
+  })
+
   /** Whether this tab has focus (the presenter's own preview only shows then, like Discord). */
   let focused = $state(document.hasFocus() && !document.hidden)
   $effect(() => {
@@ -268,8 +313,8 @@
     void tick
     const s = session
     if (!s) return null
-    // A test pattern can't film itself, so it always shows.
-    const showOwnPreview = focused || s.publishing?.opts.source === 'test'
+    // A test pattern or a camera can't film its own preview, so it always shows.
+    const showOwnPreview = focused || s.publishing?.opts.source === 'test' || s.publishing?.opts.source === 'camera'
     const stageView = s.stageView()
     const presenting = stageView.source === 'local'
     const sub = s.stageSub
@@ -284,6 +329,7 @@
       stage: stage ? { name: nameOf(stage.publisher), decoding: !!p && p.decodedFrames > 0 } : null,
       shareError,
       canShare: s.canShare,
+      cameraOnly,
       ownerAway: !!lobby?.ownerAway,
     })
     const pub = s.publishing?.full ?? null
@@ -306,6 +352,7 @@
       // The presenter sees what it shares while this tab is focused. Otherwise (it is probably in
       // the window it is sharing) a placeholder, so the capture doesn't film its own preview.
       localStream: presenting && showOwnPreview ? (s.publishing?.localStream ?? null) : null,
+      mirror: presenting && s.publishing?.facing === 'user',
       message,
       sub,
       stats: sub?.lastStats ?? null,
@@ -383,7 +430,7 @@
     {:else if lobby}
       {#if lobby.request === 'denied'}<span class="badge warn" data-testid="request-denied">The owner declined</span>{/if}
       <button class="primary" data-testid="share-screen" onclick={onShareClick}>
-        <Icon name="screen" />{lobby.canShare ? 'Share screen' : 'Ask to share'}
+        <Icon name={cameraOnly ? 'camera' : 'screen'} />{lobby.canShare ? (cameraOnly ? 'Share camera' : 'Share screen') : 'Ask to share'}
       </button>
     {/if}
     {#if isOwner && lobby}
@@ -427,6 +474,7 @@
           <Stage
             player={view.player}
             localStream={view.localStream}
+            mirror={view.mirror}
             message={view.message}
             hasAudio={view.hasAudio}
             qualityOptions={view.presenting || !view.sub ? null : ['auto', 'full', 'preview']}
@@ -513,6 +561,8 @@
             bind:quality={settings.share.video}
             bind:autoLower={settings.share.autoLower}
             nativeSize={nativeScreenSize()}
+            facing={session?.publishing?.facing ?? null}
+            onflip={() => void flipCamera()}
             onmic={(m) => {
               session?.publishing?.setMicMuted(m)
               onChange()
@@ -557,7 +607,7 @@
 {#if dialogOpen}
   <ShareDialog
     micSupported
-    title={switching ? 'Switch source' : 'Share your screen'}
+    title={switching ? 'Switch source' : cameraOnly ? 'Share your camera' : 'Share your screen'}
     action={switching ? 'Switch' : 'Share'}
     onstart={() => {
       dialogOpen = false

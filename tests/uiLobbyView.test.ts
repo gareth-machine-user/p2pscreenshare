@@ -72,6 +72,16 @@ describe('resolveShareOptions', () => {
     expect(resolveShareOptions(share({ source: 'screen' }), q(''), false).options.surface).toBe('monitor')
     expect(resolveShareOptions(share({ source: 'test' }), q(''), false).options.source).toBe('test')
   })
+
+  it('shares a camera with the saved facing, and takes a camera from the URL under overrides', () => {
+    expect(resolveShareOptions(share({ source: 'camera', facing: 'environment' }), q(''), false).options).toMatchObject({ source: 'camera', facing: 'environment' })
+    expect(resolveShareOptions(share({ source: 'camera', facing: 'environment' }), q('share=1'), true).options).toMatchObject({ source: 'camera', facing: 'environment' })
+    expect(resolveShareOptions(share(), q('source=camera&facing=environment'), true).options).toMatchObject({ source: 'camera', facing: 'environment' })
+    expect(resolveShareOptions(share({ facing: 'environment' }), q('source=camera'), true).options).toMatchObject({ source: 'camera', facing: 'user' })
+    // A URL test pattern wins over a saved camera.
+    expect(resolveShareOptions(share({ source: 'camera' }), q('source=test'), true).options.source).toBe('test')
+    expect(resolveShareOptions(share({ source: 'screen' }), q(''), false).options.facing).toBeUndefined()
+  })
 })
 
 describe('applyAutoQuality', () => {
@@ -117,6 +127,7 @@ describe('stageMessage', () => {
     expect(stageMessage({ ...base, presenting: true })).toBeNull()
     expect(stageMessage({ ...base, shareError: 'denied', canShare: true })).toBe("Couldn't start sharing: denied")
     expect(stageMessage({ ...base, canShare: true, ownerAway: true })).toBe('Click Share screen to present to the lobby.')
+    expect(stageMessage({ ...base, canShare: true, cameraOnly: true })).toBe('Tap Share camera to present to the lobby.')
     expect(stageMessage({ ...base, ownerAway: true })).toBe('The owner is away. Nobody is sharing.')
     expect(stageMessage(base)).toBe('Nobody is sharing yet.')
     expect(stageMessage({ ...base, stage: { name: 'ann', decoding: false } })).toBe("Connecting to ann's stream…")
