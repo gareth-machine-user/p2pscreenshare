@@ -145,7 +145,6 @@ describe('member record validation', () => {
       links: ['c'],
       rtt: { c: 20 },
       channels: [{ ...channel, stream } as MemberRecord['channels'][number]],
-      dropRate: 0.01,
       left: false,
     })
     expect(isMemberRecord(full)).toBe(true)
@@ -176,7 +175,6 @@ describe('member record validation', () => {
       { version: '9' },
       { joinedAt: null },
       { capacityKbps: 'fast' },
-      { dropRate: null },
       { left: 1 },
     ]
     for (const over of bad) expect(isMemberRecord({ ...rec('a', 1), ...over }), JSON.stringify(over)).toBe(false)

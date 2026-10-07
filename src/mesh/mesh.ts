@@ -16,17 +16,17 @@
 // pair stays in the lobby; planners just never make it a tree edge.
 //
 // Once a pair's mesh link is open, it may add media lanes: extra connections for its media only,
-// signaled over the link's ctl channel (lanes.ts). mediaLinkFor picks the one carrying a stripe.
+// signaled over the link's ctl channel (lanes.ts). connFor picks the one carrying a tree.
 import { Rendezvous, type RendezvousOptions, type RendezvousPort } from '../net/bootstrap'
 import { emptyAuth, isBanned, type AuthDoc } from './auth'
 import { open, seal, type Envelope, type Typed } from './envelope'
 import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn, type ConnFactory, type PeerConn } from './meshConn'
-import { Lane, type LaneConn, type LaneFactory } from './lane'
+import { Lane, type LaneFactory } from './lane'
+import type { PairConn } from './dataConn'
 import { clampLanes, isLaneMsg, Lanes, type LaneMsg } from './lanes'
-import type { MediaLink, ProbeLink } from '../net/link'
 import { doorPeers, FailureDetector, GONE_MS, isMemberRecord, linkSuspected, RecordStore, retryDelayMs, SUSPECT_MS, type Digest, type MemberRecord } from './records'
-import { every } from '../net/ticker'
+import { after, every } from '../net/ticker'
 import { storageGet, storageSet } from '../util/storage'
 
 const HEARTBEAT_MS = 2000
@@ -168,7 +168,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
   onRecord: (rec: MemberRecord) => void = () => {}
   onApp: (msg: unknown, from: string) => void = () => {}
   onMedia: (data: Uint8Array, from: string) => void = () => {}
-  onBinary: (data: Uint8Array, from: string) => void = () => {}
+  /**
+   * The path RTT of the mesh connection to a peer (ICE candidate pair, from the session's getStats
+   * polling), if known. Unlike the ctl pings', it doesn't queue behind the connection's own backlog.
+   */
+  pathRttMs: (id: string) => number | null = () => null
   onBufferLow: () => void = () => {}
   onChat: (m: ChatMessage) => void = () => {}
   /** The owner's decisions changed. */
@@ -250,7 +254,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
       wanted: clampLanes(opts.lanes),
       connect: connectLane,
       onMedia: (data, from) => this.onMedia(data, from),
-      onBinary: (data, from) => this.onBinary(data, from),
       onBufferLow: () => this.onBufferLow(),
       onChange: () => this.onChange(),
     })
@@ -273,7 +276,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
     this.timers.push(every(TICK_MS, () => this.tick()))
     this.timers.push(every(HEARTBEAT_MS, () => void this.publish()))
     this.timers.push(every(DIGEST_MS, () => this.exchangeDigest()))
-    this.timers.push(every(RTT_SAMPLE_MS, () => void this.sampleRtts()))
+    this.timers.push(every(RTT_SAMPLE_MS, () => this.sampleRtts()))
   }
 
   get record(): MemberRecord {
@@ -333,54 +336,24 @@ export class Mesh<C extends PeerConn = MeshConn> {
   }
 
   /**
-   * The link that carries `stripe` to `id`: one of the pair's media lanes when open, else the mesh
-   * link itself (see lanes.ts), unless that one is stalled. Undefined without an open mesh link.
+   * The connection for the `index`-th tree sent to `id` (relay/relayNode.ts ranks them): one of
+   * the pair's media lanes when open, else the mesh link itself (see lanes.ts). Undefined without
+   * an open mesh link.
    */
-  mediaLinkFor(id: string, stripe: number): MediaLink | undefined {
+  connFor(id: string, index: number): PairConn | undefined {
     const c = this.linkFor(id)
-    if (!c) return undefined
-    const link = this.lanes.linkFor(c, stripe)
-    if (!this.isStalled(link)) return link
-    // Its connection is stuck: another of the pair's that isn't (until it drains again).
-    for (const { conn } of this.connectionsOf(id)) {
-      if (conn === link || !conn.isOpen || this.isStalled(conn)) continue
-      this.onReroute(link, conn)
-      return conn
-    }
-    return link
+    return c && this.lanes.linkFor(c, index)
   }
 
-  /** A stripe's fragments moved from a stalled connection to `to` (the session moves what waits too). */
-  onReroute: (from: MediaLink, to: MediaLink) => void = () => {}
-
-  /**
-   * Whether a connection is stalled: its send buffer stopped draining (set by the session, from
-   * the uplink: net/uplink.ts stalledMs). A stalled connection's stripes go over another of the pair's.
-   */
-  isStalled: (link: MediaLink) => boolean = () => false
-
-  /** Probe links to `id`: the mesh link's and each open lane's (parallel flows). */
-  probeLinksFor(id: string): ProbeLink[] {
+  /** Open connections to `id`: the mesh link (lane 0) and each open media lane, by lane index. */
+  connectionsOf(id: string): { lane: number; conn: PairConn }[] {
     const c = this.linkFor(id)
-    return c ? [c.probeLink, ...this.lanes.probeLinks(id)] : []
+    return c ? this.lanes.connections(c) : []
   }
 
   /** Open connections to `id` (the mesh link plus open lanes; 0 without a mesh link). */
   laneCount(id: string): number {
-    return this.linkFor(id) ? 1 + this.lanes.openLanes(id).length : 0
-  }
-
-  /** Open connections to `id`: the mesh link (lane 0) and each open media lane, by lane index. */
-  connectionsOf(id: string): { lane: number; conn: C | LaneConn }[] {
-    const c = this.linkFor(id)
-    if (!c) return []
-    return [{ lane: 0, conn: c }, ...this.lanes.openLanes(id).map((l) => ({ lane: l.index, conn: l }))]
-  }
-
-  /** Whose link this is (a mesh link or a lane), if any. */
-  peerOfLink(link: unknown): string | undefined {
-    for (const c of this.conns.values()) if (c === link) return c.remoteId
-    return this.lanes.peerOf(link)
+    return this.connectionsOf(id).length
   }
 
   /** Whether the direct link to `id` is missing or its pings go unanswered. */
@@ -435,9 +408,9 @@ export class Mesh<C extends PeerConn = MeshConn> {
     if (this.selfId === this.ownerId) this.storage.setItem(this.authStoreKey, JSON.stringify(env))
     for (const c of this.conns.values()) c.sendCtl({ t: 'auth', env })
     // Kicked peers: close our links to them, once the news had time to reach them.
-    setTimeout(() => {
+    after(KICK_CLOSE_DELAY_MS, () => {
       for (const c of [...this.conns.values()]) if (this.isBannedPeer(c.remoteId)) c.close()
-    }, KICK_CLOSE_DELAY_MS)
+    })
     this.onAuth(this.auth)
     this.onChange()
   }
@@ -492,11 +465,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
       // closing anyway
     }
     this.rendezvous.close()
-    setTimeout(() => {
+    after(LEAVE_CLOSE_DELAY_MS, () => {
       this.lanes.closeAll()
       for (const c of this.conns.values()) c.close()
       this.conns.clear()
-    }, LEAVE_CLOSE_DELAY_MS)
+    })
   }
 
   // --- own record ------------------------------------------------------------------------------
@@ -545,7 +518,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
     this.conns.set(id, conn)
     conn.onCtl = (msg) => this.handle(msg as MeshMsg, id, conn)
     conn.onMedia = (data) => this.onMedia(data, id)
-    conn.onBin = (data) => this.onBinary(data, id)
     conn.onBufferLow = () => this.onBufferLow()
     conn.onStateChange = (state) => {
       if (state === 'open') {
@@ -875,16 +847,14 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
   }
 
-  private async sampleRtts(): Promise<void> {
+  /** Gossips the RTT to each linked peer: the path's (pathRttMs), else the ctl pings'. */
+  private sampleRtts(): void {
     const rtt: Record<string, number> = {}
-    await Promise.all(
-      [...this.conns.values()]
-        .filter((c) => c.isOpen)
-        .map(async (c) => {
-          const ms = (await c.statsRttMs()) ?? c.rttMs
-          if (ms !== null) rtt[c.remoteId] = Math.round(ms)
-        }),
-    )
+    for (const c of this.conns.values()) {
+      if (!c.isOpen) continue
+      const ms = this.pathRttMs(c.remoteId) ?? c.rttMs
+      if (ms !== null) rtt[c.remoteId] = Math.round(ms)
+    }
     this.updateRecord({ rtt })
   }
 

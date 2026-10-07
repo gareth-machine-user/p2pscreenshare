@@ -5,7 +5,9 @@ import { stripeCount } from './model'
  * Computes a striped multi-tree topology (SplitStream-style) for one channel. Its publisher runs it,
  * with itself as the root and the slots its subscribers offer for this channel as capacity.
  *
- * - Each peer with spare upload relays in exactly one "home" stripe and is a leaf in the others.
+ * - Each peer with spare upload relays in one "home" stripe and is a leaf in the others. While some
+ *   stripe has no relay (fewer relays than stripes), relays take it on as an extra home, up to m
+ *   homes each: a relay that fails then costs its children at most m stripes, which parity covers.
  * - Home stripes are balanced by total relay capacity.
  * - Within a stripe, stronger relays sit closer to the root; leaves fill the shallowest free slots.
  *   Among equally shallow parents, the closest (RTT plus lateness) wins.
@@ -23,7 +25,7 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
   const score = (p: PlannerPeer) => slots[p.id] / (1 + p.failures)
 
   // 2. Home stripes.
-  const home = assignHomes(peers, current, cfg, slots, score, now)
+  const homes = assignHomes(peers, current, cfg, slots, score, now)
 
   // 3. Root slots per stripe.
   const hostPerStripe = rootSlotsPerStripe(cfg)
@@ -35,7 +37,7 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     peers,
     byId: new Map(peers.map((p) => [p.id, p])),
     slots,
-    home,
+    homes,
     score,
     parents: {},
     depth: {},
@@ -54,7 +56,7 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
   // 6. Diff against the current topology.
   const changes = diffTopology(peers, current, ctx.parents, S)
 
-  return { topology: { parents: ctx.parents, home }, changes, depth: ctx.depth, overcommitted: ctx.overcommitted, slots }
+  return { topology: { parents: ctx.parents, homes }, changes, depth: ctx.depth, overcommitted: ctx.overcommitted, slots }
 }
 
 /** State shared by the planning steps. */
@@ -65,7 +67,7 @@ interface PlanContext {
   peers: PlannerPeer[]
   byId: Map<string, PlannerPeer>
   slots: Record<string, number>
-  home: Record<string, number | null>
+  homes: Record<string, number[]>
   score: (p: PlannerPeer) => number
   /** Output, filled stripe by stripe. */
   parents: Record<string, (string | null)[]>
@@ -78,7 +80,10 @@ interface PlanContext {
 
 /**
  * Home stripes: eligible relays (some slots, and either already relaying or subscribed long enough)
- * keep their existing assignment; new relays go to the stripe with least supply, strongest first.
+ * keep their existing first home; new relays go to the stripe with least supply, strongest first.
+ * Then each stripe nobody relays goes to a relay with room for another home (fewer than m homes,
+ * and at least one slot per home): preferably the one that had it, else the one with most slots
+ * per home. A relay's first home comes first in its list.
  */
 function assignHomes(
   peers: PlannerPeer[],
@@ -87,20 +92,20 @@ function assignHomes(
   slots: Record<string, number>,
   score: (p: PlannerPeer) => number,
   now: number,
-): Record<string, number | null> {
+): Record<string, number[]> {
   const S = stripeCount(cfg)
-  const wasRelay = (p: PlannerPeer) => current.home[p.id] != null && current.home[p.id]! < S
+  const before = (p: PlannerPeer) => (current.homes[p.id] ?? []).filter((h) => h < S)
   const eligible = peers.filter(
-    (p) => slots[p.id] >= 1 && (wasRelay(p) || now - p.joinedAt >= cfg.minUptimeMsForRelay),
+    (p) => slots[p.id] >= 1 && (before(p).length > 0 || now - p.joinedAt >= cfg.minUptimeMsForRelay),
   )
-  const home: Record<string, number | null> = {}
-  for (const p of peers) home[p.id] = null
+  const homes: Record<string, number[]> = {}
+  for (const p of peers) homes[p.id] = []
   const supply = new Array<number>(S).fill(0)
   const newRelays: PlannerPeer[] = []
   for (const p of eligible) {
-    const h = current.home[p.id]
+    const h = current.homes[p.id]?.[0]
     if (h != null && h < S) {
-      home[p.id] = h
+      homes[p.id] = [h]
       supply[h] += slots[p.id]
     } else {
       newRelays.push(p)
@@ -109,10 +114,36 @@ function assignHomes(
   newRelays.sort((a, b) => score(b) - score(a) || cmp(a.id, b.id))
   for (const p of newRelays) {
     const s = argmin(supply)
-    home[p.id] = s
+    homes[p.id] = [s]
     supply[s] += slots[p.id]
   }
-  return home
+
+  const maxHomes = Math.max(1, cfg.m)
+  for (let s = 0; s < S; s++) {
+    if (supply[s] > 0) continue
+    let best: PlannerPeer | null = null
+    let bestKey: [number, number] = [-1, -1]
+    for (const p of eligible) {
+      const n = homes[p.id].length
+      const perHome = Math.floor(slots[p.id] / (n + 1))
+      if (n >= maxHomes || perHome < 1) continue
+      const key: [number, number] = [before(p).includes(s) ? 1 : 0, perHome]
+      if (key[0] > bestKey[0] || (key[0] === bestKey[0] && key[1] > bestKey[1])) {
+        best = p
+        bestKey = key
+      }
+    }
+    if (best) homes[best.id].push(s)
+  }
+  return homes
+}
+
+/** A relay's slots in one of its home stripes: split evenly, the remainder to its lowest stripes. */
+function slotsIn(slots: number, homes: number[], s: number): number {
+  const n = homes.length
+  if (!n) return 0
+  const rank = [...homes].sort((a, b) => a - b).indexOf(s)
+  return Math.floor(slots / n) + (rank >= 0 && rank < slots % n ? 1 : 0)
 }
 
 /**
@@ -142,7 +173,7 @@ class StripeBuilder {
     private readonly s: number,
     hostSlots: number,
   ) {
-    const { cfg, current, peers, byId, home, score } = ctx
+    const { cfg, current, peers, byId, homes, score } = ctx
     this.remaining = new Map([[cfg.hostId, hostSlots]])
     this.capOf = new Map([[cfg.hostId, hostSlots]])
     this.load = new Map([[cfg.hostId, 0]])
@@ -151,9 +182,9 @@ class StripeBuilder {
 
     // Existing relays keep their level (shallowest first) so a newcomer doesn't displace a whole
     // subtree; new relays are then placed strongest-first.
-    const curDepth = currentDepths(current, s, cfg.hostId, (id) => byId.has(id) && home[id] === s)
+    const curDepth = currentDepths(current, s, cfg.hostId, (id) => byId.has(id) && homes[id].includes(s))
     this.relays = peers
-      .filter((p) => home[p.id] === s)
+      .filter((p) => homes[p.id].includes(s))
       .sort(
         (a, b) =>
           (curDepth.get(a.id) ?? Infinity) - (curDepth.get(b.id) ?? Infinity) ||
@@ -212,7 +243,7 @@ class StripeBuilder {
   }
 
   private attach(p: PlannerPeer, chosen: string | null): void {
-    const { parents, depth, slots } = this.ctx
+    const { parents, depth, slots, homes } = this.ctx
     parents[p.id][this.s] = chosen
     this.placed.add(p.id)
     if (chosen === null) return
@@ -222,8 +253,9 @@ class StripeBuilder {
     depth[p.id][this.s] = d
     if (this.relaySet.has(p.id)) {
       this.nodeDepth.set(p.id, d)
-      this.remaining.set(p.id, slots[p.id])
-      this.capOf.set(p.id, slots[p.id])
+      const own = slotsIn(slots[p.id], homes[p.id], this.s)
+      this.remaining.set(p.id, own)
+      this.capOf.set(p.id, own)
       this.load.set(p.id, 0)
       this.placedRelays.push(p.id)
     }
@@ -295,11 +327,11 @@ class StripeBuilder {
 /**
  * Sheds root overcommit where parity allows. The publisher's uplink carries every stripe, so
  * overloading it delays all of them for everyone; a peer that still gets k other stripes just
- * decodes from those. (Newest attachments go first.) A relay keeps its home stripe: its children
+ * decodes from those. (Newest attachments go first.) A relay keeps its home stripes: its children
  * there depend on it. Only stripes whose parent chain reaches the root count as received.
  */
 function shedRootOvercommit(ctx: PlanContext): void {
-  const { cfg, peers, parents, depth, home } = ctx
+  const { cfg, peers, parents, depth, homes } = ctx
   const S = stripeCount(cfg)
   const reachesRoot = (id: string, s: number): boolean => {
     let cur: string | null = id
@@ -310,7 +342,7 @@ function shedRootOvercommit(ctx: PlanContext): void {
     return false
   }
   for (const { peer, stripe } of [...ctx.rootOver].reverse()) {
-    if (home[peer] === stripe) continue
+    if (homes[peer].includes(stripe)) continue
     let live = 0
     for (let s = 0; s < S; s++) if (reachesRoot(peer, s)) live++
     if (live > cfg.k) {

@@ -13,9 +13,10 @@
 //
 // Everything is driven by timers, so tests run it under fake timers (see clock.ts).
 import type { RendezvousOptions, RendezvousPort } from '../../src/net/bootstrap'
-import { LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../../src/net/link'
+import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../../src/net/link'
 import type { LaneConn } from '../../src/mesh/lane'
 import type { Ctl, PeerConn } from '../../src/mesh/meshConn'
+import type { PairConn } from '../../src/mesh/dataConn'
 import { every } from '../../src/net/ticker'
 
 const CONNECT_TIMEOUT_MS = 15_000
@@ -39,8 +40,6 @@ export class FakeNetwork {
   private laneBlocked = new Set<string>()
   /** Pairs whose selected path is relayed by TURN (usesRelay() says so). */
   private relayedPairs = new Set<string>()
-  private laneOffers = new Map<string, FakeLane>()
-  private laneAnswers = new Map<string, FakeLane>()
   /** Every lane made, for assertions. */
   readonly lanes: FakeLane[] = []
   /** Pairs that can't connect (as if ICE failed); key from pairKey. */
@@ -49,8 +48,9 @@ export class FakeNetwork {
   private cutPairs = new Set<string>()
   /** Peers cut off from everyone. */
   private isolated = new Set<string>()
-  private offers = new Map<string, FakeConn>()
-  private answers = new Map<string, FakeConn>()
+  /** Pending offers and answers of mesh links and lanes alike, by token. */
+  private offers = new Map<string, object>()
+  private answers = new Map<string, object>()
   private rendezvous: FakeRendezvous[] = []
   private seq = 0
   /** Every connection made, for assertions. */
@@ -87,26 +87,6 @@ export class FakeNetwork {
 
   canConnectLane(a: string, b: string): boolean {
     return this.canConnect(a, b) && !this.laneBlocked.has(pairKey(a, b))
-  }
-
-  registerLaneOffer(token: string, lane: FakeLane): void {
-    this.laneOffers.set(token, lane)
-  }
-
-  takeLaneOffer(token: string): FakeLane | undefined {
-    const l = this.laneOffers.get(token)
-    this.laneOffers.delete(token)
-    return l
-  }
-
-  registerLaneAnswer(token: string, lane: FakeLane): void {
-    this.laneAnswers.set(token, lane)
-  }
-
-  takeLaneAnswer(token: string): FakeLane | undefined {
-    const l = this.laneAnswers.get(token)
-    this.laneAnswers.delete(token)
-    return l
   }
 
   /** Open lanes `localId` holds towards `remoteId`. */
@@ -189,21 +169,21 @@ export class FakeNetwork {
     return !this.canTalk(from, to) || (this.loss > 0 && Math.random() < this.loss)
   }
 
-  registerOffer(token: string, conn: FakeConn): void {
+  registerOffer(token: string, conn: object): void {
     this.offers.set(token, conn)
   }
 
-  takeOffer(token: string): FakeConn | undefined {
+  takeOffer(token: string): object | undefined {
     const c = this.offers.get(token)
     this.offers.delete(token)
     return c
   }
 
-  registerAnswer(token: string, conn: FakeConn): void {
+  registerAnswer(token: string, conn: object): void {
     this.answers.set(token, conn)
   }
 
-  takeAnswer(token: string): FakeConn | undefined {
+  takeAnswer(token: string): object | undefined {
     const c = this.answers.get(token)
     this.answers.delete(token)
     return c
@@ -284,35 +264,28 @@ export class FakeChannel implements ProbeLink {
   }
 }
 
-export class FakeConn implements PeerConn, FakeEnd {
-  offerer = ''
-  readonly createdAt = performance.now()
+/**
+ * What a FakeConn and a FakeLane share, as DataConn (src/mesh/dataConn.ts) does for the real ones:
+ * a media and a bin channel and the offer/answer handshake. An "SDP" is a token naming the
+ * connection; the pair opens a round trip after the offerer accepts the answer, unless the network
+ * keeps them apart (then both sides fail at their deadlines, as ICE would).
+ */
+abstract class FakeDataConn<P extends FakeDataConn<P>> implements PairConn, FakeEnd {
   state: LinkState = 'connecting'
   wasOpen = false
   haveRemote = false
-  pingSentAt: number | null = null
-  lastHeardAt = performance.now()
-  rttMs: number | null = null
-
-  onCtl: (msg: Ctl) => void = () => {}
-  onMedia: (data: Uint8Array) => void = () => {}
-  onBin: (data: Uint8Array) => void = () => {}
-  onStateChange: (state: LinkState) => void = () => {}
-  onBufferLow: () => void = () => {}
-
   /** The other end, once the handshake paired them. */
-  peer: FakeConn | null = null
-  /** Ctl messages sent, for assertions. */
-  readonly sent: Ctl[] = []
+  peer: P | null = null
   wireFreeAt = 0
   readonly media: FakeChannel
   readonly bin: FakeChannel
+  onMedia: (data: Uint8Array) => void = () => {}
+  onStateChange: (state: LinkState) => void = () => {}
+  onBufferLow: () => void = () => {}
   private timeout: ReturnType<typeof setTimeout> | null = null
-  private pingSeq = 0
-  private pongWaiters = new Map<number, { sentAt: number; resolve: (remoteClock: number) => void }>()
 
   constructor(
-    private net: FakeNetwork,
+    protected net: FakeNetwork,
     readonly localId: string,
     public remoteId: string,
     readonly token: string,
@@ -321,7 +294,11 @@ export class FakeConn implements PeerConn, FakeEnd {
     this.media.bufferLowThreshold = LINK_BUFFER_LOW
     this.media.onBufferLow = () => this.onBufferLow()
     this.bin = new FakeChannel(net, this, 'bin')
+    this.bin.bufferLowThreshold = BACKGROUND_BUFFER_MAX / 2
   }
+
+  /** Whether the network lets the pair open (lanes can be blocked on their own). */
+  protected abstract canOpen(a: string, b: string): boolean
 
   get isOpen(): boolean {
     return this.state === 'open'
@@ -344,12 +321,8 @@ export class FakeConn implements PeerConn, FakeEnd {
   }
 
   receiveData(kind: 'media' | 'bin', data: Uint8Array): void {
+    // The bin channel's bytes are dropped, as in the real connections.
     if (kind === 'media') this.onMedia(data)
-    else this.onBin(data)
-  }
-
-  async usesRelay(): Promise<boolean | null> {
-    return this.net.isRelayed(this.localId, this.remoteId)
   }
 
   armTimeout(ms = CONNECT_TIMEOUT_MS): void {
@@ -365,7 +338,7 @@ export class FakeConn implements PeerConn, FakeEnd {
   }
 
   async acceptOffer(sdp: string): Promise<string> {
-    const offerer = this.net.takeOffer(sdp)
+    const offerer = this.net.takeOffer(sdp) as P | undefined
     if (!offerer) throw new Error(`unknown offer ${sdp}`)
     this.peer = offerer
     this.haveRemote = true
@@ -375,20 +348,57 @@ export class FakeConn implements PeerConn, FakeEnd {
   }
 
   async acceptAnswer(sdp: string): Promise<void> {
-    const answerer = this.net.takeAnswer(sdp)
-    if (!answerer || answerer.peer !== this) throw new Error(`unknown answer ${sdp}`)
+    const answerer = this.net.takeAnswer(sdp) as P | undefined
+    if (!answerer || (answerer.peer as unknown) !== this) throw new Error(`unknown answer ${sdp}`)
     this.peer = answerer
     this.haveRemote = true
     this.armTimeout()
-    // "ICE": the pair opens after a round trip, unless the network keeps them apart (then both
-    // sides fail at their deadlines).
-    if (!this.net.canConnect(this.localId, answerer.localId)) return
+    // "ICE": the pair opens after a round trip, unless the network keeps them apart.
+    if (!this.canOpen(this.localId, answerer.localId)) return
     setTimeout(() => {
-      if (!this.net.canConnect(this.localId, answerer.localId)) return
+      if (!this.canOpen(this.localId, answerer.localId)) return
       if (this.state !== 'connecting' || answerer.state !== 'connecting') return
       this.setState('open')
       answerer.setState('open')
     }, this.net.delayMs * 2)
+  }
+
+  close(): void {
+    const peer = this.peer
+    const wasLive = this.state === 'open' || this.state === 'connecting'
+    this.setState('closed')
+    // The remote's channels close too, if the news can get there.
+    if (wasLive && peer && !this.net.dropped(this.localId, peer.localId)) this.net.later(() => peer.setState('closed'))
+  }
+
+  setState(state: LinkState): void {
+    if (this.state === state || this.state === 'closed' || this.state === 'failed') return
+    this.state = state
+    if (state === 'open') this.wasOpen = true
+    if (state !== 'connecting' && this.timeout !== null) clearTimeout(this.timeout)
+    this.onStateChange(state)
+  }
+}
+
+/** A mesh connection in memory: adds MeshConn's ctl channel (JSON, reliable and ordered) and pings. */
+export class FakeConn extends FakeDataConn<FakeConn> implements PeerConn {
+  offerer = ''
+  readonly createdAt = performance.now()
+  pingSentAt: number | null = null
+  lastHeardAt = performance.now()
+  rttMs: number | null = null
+  onCtl: (msg: Ctl) => void = () => {}
+  /** Ctl messages sent, for assertions. */
+  readonly sent: Ctl[] = []
+  private pingSeq = 0
+  private pongWaiters = new Map<number, { sentAt: number; resolve: (remoteClock: number) => void }>()
+
+  protected canOpen(a: string, b: string): boolean {
+    return this.net.canConnect(a, b)
+  }
+
+  async usesRelay(): Promise<boolean | null> {
+    return this.net.isRelayed(this.localId, this.remoteId)
   }
 
   sendCtl(msg: object): boolean {
@@ -446,120 +456,22 @@ export class FakeConn implements PeerConn, FakeEnd {
     this.pingSentAt = null
     w.resolve(remoteClock)
   }
-
-  async statsRttMs(): Promise<number | null> {
-    return null
-  }
-
-  close(): void {
-    const peer = this.peer
-    const wasLive = this.state === 'open' || this.state === 'connecting'
-    this.setState('closed')
-    // The remote's channels close too, if the news can get there.
-    if (wasLive && peer && !this.net.dropped(this.localId, peer.localId)) this.net.later(() => peer.setState('closed'))
-  }
-
-  private setState(state: LinkState): void {
-    if (this.state === state || this.state === 'closed' || this.state === 'failed') return
-    this.state = state
-    if (state === 'open') this.wasOpen = true
-    if (state !== 'connecting' && this.timeout !== null) clearTimeout(this.timeout)
-    this.onStateChange(state)
-  }
 }
 
-/** A media lane in memory (see FakeConn for the handshake). */
-export class FakeLane implements LaneConn, FakeEnd {
-  state: LinkState = 'connecting'
-  wasOpen = false
-  peer: FakeLane | null = null
-  wireFreeAt = 0
-  readonly media: FakeChannel
-  readonly bin: FakeChannel
-  onMedia: (data: Uint8Array) => void = () => {}
-  onBin: (data: Uint8Array) => void = () => {}
-  onStateChange: (state: LinkState) => void = () => {}
-  onBufferLow: () => void = () => {}
-  private timeout: ReturnType<typeof setTimeout> | null = null
-
+/** A media lane in memory. */
+export class FakeLane extends FakeDataConn<FakeLane> implements LaneConn {
   constructor(
-    private net: FakeNetwork,
-    readonly localId: string,
-    readonly remoteId: string,
+    net: FakeNetwork,
+    localId: string,
+    remoteId: string,
     readonly index: number,
-    readonly token: string,
+    token: string,
   ) {
-    this.media = new FakeChannel(net, this, 'media')
-    this.media.bufferLowThreshold = LINK_BUFFER_LOW
-    this.media.onBufferLow = () => this.onBufferLow()
-    this.bin = new FakeChannel(net, this, 'bin')
+    super(net, localId, remoteId, token)
   }
 
-  get isOpen(): boolean {
-    return this.state === 'open'
-  }
-
-  get far(): FakeEnd | null {
-    return this.peer
-  }
-
-  get bufferedAmount(): number {
-    return this.media.bufferedAmount
-  }
-
-  get probeLink(): ProbeLink {
-    return this.bin
-  }
-
-  send(data: Uint8Array): boolean {
-    return this.media.send(data)
-  }
-
-  receiveData(kind: 'media' | 'bin', data: Uint8Array): void {
-    if (kind === 'media') this.onMedia(data)
-    else this.onBin(data)
-  }
-
-  armTimeout(ms = CONNECT_TIMEOUT_MS): void {
-    if (this.timeout !== null || this.state !== 'connecting') return
-    this.timeout = setTimeout(() => {
-      if (this.state === 'connecting') this.setState('failed')
-    }, ms)
-  }
-
-  async createOffer(): Promise<string> {
-    this.net.registerLaneOffer(this.token, this)
-    return this.token
-  }
-
-  async acceptOffer(sdp: string): Promise<string> {
-    const offerer = this.net.takeLaneOffer(sdp)
-    if (!offerer) throw new Error(`unknown lane offer ${sdp}`)
-    this.peer = offerer
-    this.armTimeout()
-    this.net.registerLaneAnswer(this.token, this)
-    return this.token
-  }
-
-  async acceptAnswer(sdp: string): Promise<void> {
-    const answerer = this.net.takeLaneAnswer(sdp)
-    if (!answerer || answerer.peer !== this) throw new Error(`unknown lane answer ${sdp}`)
-    this.peer = answerer
-    this.armTimeout()
-    if (!this.net.canConnectLane(this.localId, answerer.localId)) return
-    setTimeout(() => {
-      if (!this.net.canConnectLane(this.localId, answerer.localId)) return
-      if (this.state !== 'connecting' || answerer.state !== 'connecting') return
-      this.setState('open')
-      answerer.setState('open')
-    }, this.net.delayMs * 2)
-  }
-
-  close(): void {
-    const peer = this.peer
-    const wasLive = this.state === 'open' || this.state === 'connecting'
-    this.setState('closed')
-    if (wasLive && peer && !this.net.dropped(this.localId, peer.localId)) this.net.later(() => peer.setState('closed'))
+  protected canOpen(a: string, b: string): boolean {
+    return this.net.canConnectLane(a, b)
   }
 
   /** Tests: the lane's connection fails (as if its path died), on both ends. */
@@ -567,14 +479,6 @@ export class FakeLane implements LaneConn, FakeEnd {
     const peer = this.peer
     this.setState('failed')
     peer?.setState('failed')
-  }
-
-  private setState(state: LinkState): void {
-    if (this.state === state || this.state === 'closed' || this.state === 'failed') return
-    this.state = state
-    if (state === 'open') this.wasOpen = true
-    if (state !== 'connecting' && this.timeout !== null) clearTimeout(this.timeout)
-    this.onStateChange(state)
   }
 }
 

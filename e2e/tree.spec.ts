@@ -26,7 +26,7 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
   // Wait for relays to be promoted (min uptime 4s + probe) and the tree to settle.
   await waitFor(
     () => hostSnapshot(host),
-    (h) => h.peers === CAPS.length && Object.values(h.topology.home).filter((x) => x !== null).length >= 2,
+    (h) => h.peers === CAPS.length && Object.values(h.topology.homes).filter((x) => x.length > 0).length >= 2,
     60_000,
     'relays promoted',
   )
@@ -34,7 +34,7 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
 
   const h = await hostSnapshot(host)
   const snaps = await all(viewers)
-  console.table(snaps.map((s, i) => ({ v: i, cap: CAPS[i], home: s.home, children: s.children, fps: s.fps, latency: Math.round(s.latencyMs ?? -1), buffer: Math.round(s.bufferMs), probe: Math.round(s.probeKbps ?? -1), dropped: s.dropped })))
+  console.table(snaps.map((s, i) => ({ v: i, cap: CAPS[i], homes: s.homes.join(","), children: s.children, fps: s.fps, latency: Math.round(s.latencyMs ?? -1), buffer: Math.round(s.bufferMs), probe: Math.round(s.probeKbps ?? -1), dropped: s.dropped })))
   console.log('host children', h.hostChildren, 'overcommitted', h.overcommitted)
 
   for (const s of snaps) {
@@ -48,7 +48,7 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
   // (congestion control may lower the bitrate, which lets weaker peers carry a stripe).
   for (const [i, v] of viewers.entries()) {
     const stripeKbps = await v.evaluate(() => (window.__p2p as { stageSub?: { ann: { stripeKbps: number } } }).stageSub?.ann.stripeKbps ?? 0)
-    if (snaps[i].home !== null) expect(CAPS[i] * 0.75).toBeGreaterThanOrEqual(stripeKbps * 0.9)
+    if (snaps[i].homes.length) expect(CAPS[i] * 0.75).toBeGreaterThanOrEqual(stripeKbps * 0.9 * snaps[i].homes.length)
   }
   // The host serves only a few children; relays carry the rest.
   expect(h.hostChildren).toBeLessThanOrEqual(4)
@@ -84,6 +84,29 @@ test('striped tree (k=2, m=1): relays amplify, survives a relay leaving', async 
   )
 })
 
+test('4+2 with two viewers: each relays two stripes to the other when the publisher can send one copy', async ({ browser }) => {
+  test.setTimeout(180_000)
+  const streamId = `e2e-multihome-${Date.now()}`
+  // About one copy of the stream (6 stripes of ~1/4) fits the publisher's uplink, not two.
+  const host = await openHost(browser, streamId, { k: 4, m: 2, bitrate: 1200, up: 2600 })
+  const viewers = [await openViewer(browser, streamId, 'a', 6000), await openViewer(browser, streamId, 'b', 6000)]
+  await waitFor(
+    () => hostSnapshot(host),
+    (h) => h.peers === 2 && Object.values(h.topology.homes).every((x) => x.length === 2),
+    60_000,
+    'two homes each',
+  )
+  await waitFor(() => all(viewers), (ss) => ss.every((s) => s.fps > PERF.minFps && s.children > 0), 60_000, 'relaying to each other')
+  await new Promise((r) => setTimeout(r, 6000))
+  const snaps = await all(viewers)
+  console.table(snaps.map((s, i) => ({ v: i, homes: s.homes.join(','), children: s.children, fps: s.fps, parents: s.parents.map((p) => p?.slice(0, 4)).join(' ') })))
+  for (const s of snaps) {
+    expect(s.fps).toBeGreaterThan(PERF.minFps)
+    expect(s.homes).toHaveLength(2)
+    expect(s.parents.filter((p) => p !== null).length).toBeGreaterThanOrEqual(4)
+  }
+})
+
 test('single tree (k=1, m=0): orphans recover after their relay leaves; late joiner starts fast', async ({ browser }) => {
   test.setTimeout(180_000)
   const streamId = `e2e-single-${Date.now()}`
@@ -100,7 +123,7 @@ test('single tree (k=1, m=0): orphans recover after their relay leaves; late joi
   )
   await new Promise((r) => setTimeout(r, 6000))
   const snaps = await all(viewers)
-  console.table(snaps.map((s, i) => ({ v: i, home: s.home, children: s.children, parent: s.parents[0]?.slice(0, 6), fps: s.fps, latency: Math.round(s.latencyMs ?? -1) })))
+  console.table(snaps.map((s, i) => ({ v: i, homes: s.homes.join(","), children: s.children, parent: s.parents[0]?.slice(0, 6), fps: s.fps, latency: Math.round(s.latencyMs ?? -1) })))
   expect((await hostSnapshot(host)).hostChildren).toBeLessThanOrEqual(2)
 
   // Kill a relay that has children; its orphans should resume within a few seconds.

@@ -49,7 +49,7 @@ function checkInvariants(r: PlanResult, peers: PlannerPeer[], cfg: PlannerConfig
       if (allStripes) expect(parent, `${p.id} stripe ${s}`).not.toBeNull()
       if (parent === null) continue
       // a non-host parent must be a relay homed in that stripe
-      if (parent !== HOST) expect(r.topology.home[parent]).toBe(s)
+      if (parent !== HOST) expect(r.topology.homes[parent]).toContain(s)
       // walking up reaches the host (no cycles, no unattached ancestor)
       let cur: string | null = p.id
       const seen = new Set<string>()
@@ -62,13 +62,14 @@ function checkInvariants(r: PlanResult, peers: PlannerPeer[], cfg: PlannerConfig
       live++
     }
     expect(live, `${p.id} live stripes`).toBeGreaterThanOrEqual(cfg.k)
+    // at most m homes (one when there is no parity): a failed relay costs at most what parity covers
+    expect(r.topology.homes[p.id].length).toBeLessThanOrEqual(Math.max(1, cfg.m))
+    expect(new Set(r.topology.homes[p.id]).size).toBe(r.topology.homes[p.id].length)
   }
   // fan-out within capacity when there is no overcommit
   if (r.overcommitted === 0) {
     for (const p of peers) {
-      const h = r.topology.home[p.id]
-      if (h == null) continue
-      const kids = peers.filter((c) => r.topology.parents[c.id][h] === p.id).length
+      const kids = r.topology.homes[p.id].reduce((n, h) => n + peers.filter((c) => r.topology.parents[c.id][h] === p.id).length, 0)
       expect(kids).toBeLessThanOrEqual(r.slots[p.id])
     }
   }
@@ -85,13 +86,14 @@ describe('planner', () => {
     expect(maxDepth).toBeLessThanOrEqual(4)
   })
 
-  it('each peer relays in at most one stripe and homes are balanced', () => {
+  it('with plenty of relays, each peer relays in at most one stripe and homes are balanced', () => {
     const cfg = config()
     const peers = makePeers(200)
     const r = plan(peers, emptyTopology(), cfg, 1000)
     const supply = new Array(5).fill(0)
     for (const p of peers) {
-      const h = r.topology.home[p.id]
+      expect(r.topology.homes[p.id].length).toBeLessThanOrEqual(1)
+      const h = r.topology.homes[p.id][0]
       if (h != null) supply[h] += r.slots[p.id]
       for (let s = 0; s < 5; s++) {
         const kids = peers.filter((c) => r.topology.parents[c.id][s] === p.id).length
@@ -120,7 +122,7 @@ describe('planner', () => {
     const cfg = config()
     const peers = makePeers(120)
     const r1 = plan(peers, emptyTopology(), cfg, 1000)
-    const victim = peers.find((p) => r1.topology.home[p.id] != null && r1.depth[p.id][r1.topology.home[p.id]!] === 1)!
+    const victim = peers.find((p) => r1.topology.homes[p.id].length > 0 && r1.depth[p.id][r1.topology.homes[p.id][0]] === 1)!
     const remaining = peers.filter((p) => p !== victim)
     const r2 = plan(remaining, r1.topology, cfg, 2000)
     checkInvariants(r2, remaining, cfg)
@@ -146,7 +148,7 @@ describe('planner', () => {
     const cfg = config({ minUptimeMsForRelay: 5000 })
     const peers = makePeers(10)
     const r = plan(peers, emptyTopology(), cfg, 1000)
-    expect(Object.values(r.topology.home).every((h) => h === null)).toBe(true)
+    expect(Object.values(r.topology.homes).every((h) => h.length === 0)).toBe(true)
     expect(r.overcommitted).toBeGreaterThan(0) // host alone cannot serve 10 peers x 5 stripes
   })
 
@@ -162,7 +164,7 @@ describe('planner', () => {
     ]
     const r = plan(peers, emptyTopology(), cfg, 1000)
     checkInvariants(r, peers, cfg)
-    expect(r.topology.home.b).toBeNull()
+    expect(r.topology.homes.b).toEqual([])
     expect(r.slots.a).toBe(2)
     expect(r.slots.c).toBe(16) // capped by maxFanout
     // Feasible, so no relay gets more children than it offered (checked by checkInvariants).
@@ -215,7 +217,7 @@ describe('planner', () => {
     ]
     const current = {
       parents: { a: ['H'], b: ['H'], leaf: ['a'] },
-      home: { a: 0, b: 0, leaf: null },
+      homes: { a: [0], b: [0], leaf: [] },
     }
     const rttTo = (aMs: number, bMs: number) => (x: string, y: string) => {
       const other = x === 'leaf' ? y : y === 'leaf' ? x : null
@@ -230,7 +232,7 @@ describe('planner', () => {
   it('does not overload the publisher for a stripe that parity covers', () => {
     // Stripe relays for 0 and 2 only: stripe 1 has nothing but the root's single slot.
     const cfg = config({ k: 2, m: 1, rootSlots: 3 })
-    const current = { parents: {}, home: { a: 0, c: 2 } as Record<string, number | null> }
+    const current = { parents: {}, homes: { a: [0], c: [2] } }
     const peers: PlannerPeer[] = [
       { id: 'a', slots: 16, joinedAt: 0, failures: 0, avoid: [] },
       { id: 'c', slots: 16, joinedAt: 1, failures: 0, avoid: [] },
@@ -257,8 +259,87 @@ describe('planner', () => {
     const peers = [P('A', 8, 0), P('B', 8, 1), P('C', 4, 2), P('D', 3, 3, ['C']), P('L', 0, 4, ['B', 'C'])]
     const r = plan(peers, emptyTopology(), cfg, 1000)
     checkInvariants(r, peers, cfg, false)
-    const d = r.topology.home.D!
-    expect(r.topology.parents.D[d]).not.toBeNull()
+    for (const d of r.topology.homes.D) expect(r.topology.parents.D[d]).not.toBeNull()
+    expect(r.topology.homes.D.length).toBeGreaterThan(0)
+  })
+
+  describe('fewer relays than stripes (4+2)', () => {
+    const cfg = config({ k: 4, m: 2, rootSlots: 6, maxFanout: 16 })
+    const viewers = (n: number, slots = 8): PlannerPeer[] =>
+      Array.from({ length: n }, (_, i) => ({ id: `v${i}`, slots, joinedAt: i, failures: 0, avoid: [] }))
+    const rootEdges = (r: PlanResult, peers: PlannerPeer[]) =>
+      peers.reduce((n, p) => n + r.topology.parents[p.id].filter((x) => x === HOST).length, 0)
+    /** Stripes a peer still gets when `gone` vanishes (its subtree loses that stripe). */
+    const survives = (r: PlanResult, peer: string, gone: string) =>
+      r.topology.parents[peer].filter((par, s) => {
+        let cur: string | null = par
+        for (let i = 0; i < 10 && cur !== null && cur !== HOST; i++) {
+          if (cur === gone) return false
+          cur = r.topology.parents[cur][s]
+        }
+        return cur === HOST
+      }).length
+
+    it('2 viewers on a presenter with room for one copy: two homes each, no overcommit, ≥ k stripes each', () => {
+      const peers = viewers(2)
+      const r = plan(peers, emptyTopology(), cfg, 1000)
+      checkInvariants(r, peers, cfg, false)
+      for (const p of peers) expect(r.topology.homes[p.id]).toHaveLength(2)
+      expect(r.overcommitted).toBe(0)
+      expect(rootEdges(r, peers)).toBe(6)
+      // Each relays its two homes to the other; the root's last slots carry the unrelayed parity.
+      for (const p of peers) expect(r.topology.parents[p.id].filter((x) => x !== null).length).toBeGreaterThanOrEqual(cfg.k)
+    })
+
+    it('2 viewers on a presenter with room for two copies get everything from it directly', () => {
+      const c = { ...cfg, rootSlots: 12 }
+      const peers = viewers(2)
+      const r = plan(peers, emptyTopology(), c, 1000)
+      checkInvariants(r, peers, c)
+      expect(rootEdges(r, peers)).toBe(12)
+    })
+
+    it('3 viewers: every stripe has a relay, 1.5× at the root', () => {
+      const peers = viewers(3)
+      const r = plan(peers, emptyTopology(), cfg, 1000)
+      checkInvariants(r, peers, cfg)
+      const relayed = new Set(peers.flatMap((p) => r.topology.homes[p.id]))
+      expect(relayed.size).toBe(6)
+      expect(rootEdges(r, peers)).toBe(6)
+      for (const p of peers) for (const o of peers) if (o !== p) expect(survives(r, p.id, o.id)).toBeGreaterThanOrEqual(cfg.k)
+    })
+
+    it('6 or more viewers: one home each', () => {
+      const peers = viewers(8)
+      const r = plan(peers, emptyTopology(), cfg, 1000)
+      checkInvariants(r, peers, cfg)
+      for (const p of peers) expect(r.topology.homes[p.id]).toHaveLength(1)
+    })
+
+    it('keeps extra homes across replans, and gives them up when a new relay can take one', () => {
+      const peers = viewers(3)
+      const r1 = plan(peers, emptyTopology(), cfg, 1000)
+      expect(plan(peers, r1.topology, cfg, 2000).changes).toEqual([])
+      const more = [...peers, ...viewers(6).slice(3)]
+      let t = r1.topology
+      for (let i = 0; i < 3; i++) t = plan(more, t, cfg, 3000 + i * 1000).topology
+      for (const p of more) expect(t.homes[p.id]).toHaveLength(1)
+      // The first homes stay put.
+      for (const p of peers) expect(t.homes[p.id][0]).toBe(r1.topology.homes[p.id][0])
+    })
+
+    it('a relay with a single slot takes no extra home', () => {
+      const peers = [...viewers(2, 1)]
+      const r = plan(peers, emptyTopology(), cfg, 1000)
+      for (const p of peers) expect(r.topology.homes[p.id]).toHaveLength(1)
+    })
+
+    it('without parity a relay keeps a single home', () => {
+      const c = config({ k: 4, m: 0, rootSlots: 4 })
+      const peers = viewers(2)
+      const r = plan(peers, emptyTopology(), c, 1000)
+      for (const p of peers) expect(r.topology.homes[p.id]).toHaveLength(1)
+    })
   })
 
   it('keeps its invariants on random inputs', () => {
@@ -290,7 +371,7 @@ describe('planner', () => {
 
 describe('subtree', () => {
   it('lists descendants in one stripe, excluding the root, and survives cycles', () => {
-    const t = { parents: { a: [HOST, HOST], b: ['a', HOST], c: ['b', 'a'], x: ['y', null], y: ['x', null] }, home: {} }
+    const t = { parents: { a: [HOST, HOST], b: ['a', HOST], c: ['b', 'a'], x: ['y', null], y: ['x', null] }, homes: {} }
     expect(subtree(t, 'a', 0).sort()).toEqual(['b', 'c'])
     expect(subtree(t, 'a', 1)).toEqual(['c'])
     expect(subtree(t, HOST, 1).sort()).toEqual(['a', 'b', 'c'])

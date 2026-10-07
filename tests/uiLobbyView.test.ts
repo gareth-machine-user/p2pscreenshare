@@ -30,21 +30,18 @@ describe('resolveShareOptions', () => {
       testSize: undefined,
     })
     expect(r.auto).toBe(false)
-    expect(r.autoParity).toBe(false)
   })
 
-  it('auto quality from the settings may add parity', () => {
-    const r = resolveShareOptions(share({ autoLower: true }), q(''), false)
+  it('auto quality from the settings keeps the chosen stripes', () => {
+    const r = resolveShareOptions(share({ autoLower: true, k: 4, m: 2 }), q(''), false)
     expect(r.auto).toBe(true)
-    expect(r.autoParity).toBe(true)
+    expect(r.options).toMatchObject({ k: 4, m: 2 })
   })
 
   it('takes the URL values under overrides, falling back to the settings for bad numbers', () => {
     const r = resolveShareOptions(share({ k: 4, m: 1 }), q('source=test&k=2&m=x&bitrate=1234&fps=60&audio=1&mic=0&quality=auto&res=640x360'), true)
     expect(r.options).toMatchObject({ k: 2, m: 1, bitrateKbps: 1234, fps: 60, source: 'test', audio: true, mic: false, testSize: [640, 360] })
     expect(r.auto).toBe(true)
-    // URL overrides pin the parity.
-    expect(r.autoParity).toBe(false)
   })
 
   it('URL overrides without quality=auto turn auto off and default audio off', () => {
@@ -85,19 +82,15 @@ describe('resolveShareOptions', () => {
 })
 
 describe('applyAutoQuality', () => {
-  const target = () => ({ autoBitrate: false, autoParity: (_k: number, m: number) => m + 1 })
-
-  it('sets auto bitrate and lets the session pick parity', () => {
-    const t = target()
+  it('sets auto bitrate and shares with the resolved options', () => {
+    const t = { autoBitrate: false }
     const r = resolveShareOptions(share({ autoLower: true, m: 1 }), q(''), false)
-    expect(applyAutoQuality(r, t).m).toBe(2)
+    expect(applyAutoQuality(r, t)).toBe(r.options)
     expect(t.autoBitrate).toBe(true)
-    // The resolved options are left alone.
-    expect(r.options.m).toBe(1)
   })
 
-  it('keeps the parity when not auto, and clears auto bitrate', () => {
-    const t = { ...target(), autoBitrate: true }
+  it('clears auto bitrate when not auto', () => {
+    const t = { autoBitrate: true }
     const r = resolveShareOptions(share({ autoLower: false, m: 1 }), q(''), false)
     expect(applyAutoQuality(r, t).m).toBe(1)
     expect(t.autoBitrate).toBe(false)

@@ -182,7 +182,9 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    whose publisher reports a deficit, and gossiped with it.
 6. **Planning** (`src/session/channelPublisher.ts`, `src/topology/planner.ts`). The publisher replans
    every 2 s and 50 ms after inputs change. `plan()` is pure and deterministic: home stripes are
-   balanced by offered slots, each tree is built top-down keeping valid existing parents
+   balanced by offered slots (each relay has one; while some stripe has no relay, relays take it
+   on as an extra home, up to *m* each, so a small audience still relays every stripe and one bad
+   relay costs at most what parity covers), each tree is built top-down keeping valid existing parents
    (hysteresis: a move needs a parent a level shallower or 40 ms closer), newcomers stay leaves
    for 4 s, and edges are only made between linked pairs. Encoders overshoot their target, so
    the publisher announces the stripe bitrate it actually sends. It never overloads its own
@@ -202,8 +204,8 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
 
 One WebRTC connection is one SCTP association with one Reno-like congestion window (Chrome's
 dcSCTP: 5 MB receive window, bursts of 4 packets of 1191 bytes), which on real WAN paths tops out
-around 10–25 Mbps whatever the uplink. A presenter feeding one viewer at 16 Mbps with 4+1 stripes
-needs about 21.6 Mbps on that one connection. So each mesh pair opens **media lanes**
+around 10–25 Mbps whatever the uplink. A presenter feeding one viewer at 16 Mbps with 4+2 stripes
+needs about 25 Mbps on that one connection. So each mesh pair opens **media lanes**
 (`src/mesh/lane.ts`, `src/mesh/lanes.ts`): extra RTCPeerConnections that carry only an unordered
 `media` channel (same packet lifetime as the mesh link's) and a `bin` channel for headroom probes.
 
@@ -215,9 +217,11 @@ needs about 21.6 Mbps on that one connection. So each mesh pair opens **media la
   opens (never during the tracker rendezvous), and not at all if the link's selected candidate
   pair is relayed by TURN (checked with `getStats`). They close with the mesh link, so on leave,
   kick and ban too.
-- **Sending.** Stripe *s* of any channel goes over slot *s* mod *K* of the pair, slot 0 being the
-  mesh link. A lane that isn't open (yet, or while it reconnects) falls back to the mesh link, so
-  the mapping only changes when a lane is given up for good. Each lane has its own uplink queue;
+- **Sending.** The trees a peer sends to a pair are ranked (by channel, then stripe), and the
+  *i*-th goes over slot *i* mod *K* of the pair, slot 0 being the mesh link: a pair carrying
+  stripes 0 and 2 uses two connections. A lane that isn't open (yet, or while it reconnects) falls
+  back to the mesh link, so the mapping only changes when a lane is given up for good or the pair's
+  trees change. Each lane has its own uplink queue;
   the receiver de-duplicates by fragment id, so the split is invisible downstream. Audio is coded
   across the stripes like the video, so it spreads over the lanes the same way.
 - **Capacity.** Each lane is its own connection with its own delivered rate; a peer's capacity is
@@ -480,8 +484,8 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Situation | Setting | Why |
 |---|---|---|
 | Small audience (fewer than about 6 capable relays) | `k=2, m=1` | Only 3 stripes need relays; one failure is invisible |
-| General use | `k=4, m=1` | 25% overhead, about 6× fewer stalls than a single tree, ~320 ms latency |
-| High churn, or viewers with spare upload | `k=4, m=2` | Stalls become rare (≈1 per viewer-hour at 240 s lifetimes); Auto quality picks it when relays allow |
+| General use (the default) | `k=4, m=2` | 50% overhead; stalls become rare (≈1 per viewer-hour at 240 s lifetimes) and one bad relay is invisible even mid-repair. Small lobbies stay cheap: relays take on the stripes nobody else relays |
+| Tight upload all round | `k=4, m=1` | 25% overhead, about 6× fewer stalls than a single tree, ~320 ms latency |
 | Upload-starved audience | `k=1, m=0` or `k=4, m=1` with a lower bitrate | Parity overhead competes with capacity you don't have |
 | Large audience with strong uplinks | `k=8, m=2..4` with a higher `maxFanout` | Most resilient per byte of overhead; needs many relays |
 
@@ -552,7 +556,7 @@ Rate control, in both profiles:
     (≥ ~400 ms, doubling), typically after a burst overflowed the connection's 64 KB UDP socket
     buffer in Chromium; the whole association delivers nothing meanwhile. Its stripes, and what
     already waits for it, move to another of the pair's connections until it drains again
-    (`Mesh.mediaLinkFor`), and its windows say nothing about capacity (the Peers panel and Stats
+    (`RelayNode.linkFor`), and its windows say nothing about capacity (the Peers panel and Stats
     mark it *stalled*). Media channels buffer at most 64 KiB (`LINK_BUFFER_HIGH`) so bursts stay
     small enough not to cause such stalls (`e2e/diag-sctp.spec.ts` measures it).
   - Path RTTs (below) are shown, never used for decisions. Changes apply in place, with no new

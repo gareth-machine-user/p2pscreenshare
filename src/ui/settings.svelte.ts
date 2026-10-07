@@ -47,7 +47,7 @@ const KEY = 'p2pss:settings'
 
 export const DEFAULT_SETTINGS: Settings = {
   name: '',
-  share: { source: 'screen', facing: 'user', systemAudio: true, mic: false, video: DEFAULT_QUALITY, autoLower: true, k: 4, m: 1 },
+  share: { source: 'screen', facing: 'user', systemAudio: true, mic: false, video: DEFAULT_QUALITY, autoLower: true, k: 4, m: 2 },
   view: { quality: 'auto', buffering: 'auto', chatOpen: true },
 }
 
@@ -102,8 +102,7 @@ export function parseSettings(raw: string | null): Settings {
       systemAudio: bool(share.systemAudio, d.share.systemAudio),
       mic: bool(share.mic, d.share.mic),
       ...parseVideo(share),
-      k: int(share.k, STRIPE_LIMITS.k.min, STRIPE_LIMITS.k.max, d.share.k),
-      m: int(share.m, STRIPE_LIMITS.m.min, STRIPE_LIMITS.m.max, d.share.m),
+      ...parseStripes(share),
     },
     view: {
       quality: oneOf(view.quality, VIEW_QUALITIES, d.view.quality),
@@ -111,6 +110,14 @@ export function parseSettings(raw: string | null): Settings {
       chatOpen: bool(view.chatOpen, d.view.chatOpen),
     },
   }
+}
+
+/** The old default 4+1, as saved by an earlier version, becomes the new default (4+2). */
+function parseStripes(share: Record<string, unknown>): { k: number; m: number } {
+  const d = DEFAULT_SETTINGS.share
+  const k = int(share.k, STRIPE_LIMITS.k.min, STRIPE_LIMITS.k.max, d.k)
+  const m = int(share.m, STRIPE_LIMITS.m.min, STRIPE_LIMITS.m.max, d.m)
+  return k === 4 && m === 1 ? { k: d.k, m: d.m } : { k, m }
 }
 
 const RESOLUTION_VALUES = RESOLUTIONS.map((r) => r.value)

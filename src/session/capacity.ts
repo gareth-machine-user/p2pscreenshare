@@ -7,6 +7,9 @@
 // (its uplink queue never emptied: it carried all it could). Capacity is the most a connection, or
 // the whole uplink, delivered while backlogged over the last 10 s (a max filter, as in BBR), held
 // in between, and raised by whatever is delivered. See CapacityModel.
+import type { LinkSnap } from '../net/uplink'
+
+export type { LinkSnap }
 
 /** Share of the measured upload that may be planned (keyframe bursts, estimate error). */
 export const HEADROOM = 0.75
@@ -149,27 +152,6 @@ export const FROZEN_LAG_MS = 400
 export function deliveredKbps(handedBytes: number, bufferedBefore: number, bufferedAfter: number, ms: number): number {
   if (!(ms > 0)) return 0
   return (Math.max(0, handedBytes - (bufferedAfter - bufferedBefore)) * 8) / ms
-}
-
-/** One connection's cumulative counters at an instant (its media and bin channels together). */
-export interface LinkSnap {
-  at: number
-  /** Bytes handed to the connection's channels (net/uplink.ts LinkCounters.handedBytes). */
-  handed: number
-  /** Their bufferedAmount. */
-  buffered: number
-  /** How long the media link's uplink queue has held something (Uplink.busyMs). */
-  busyMs: number
-  /** Live media items and bytes sent, drops, queueing sum and count. */
-  items: number
-  mediaBytes: number
-  drops: number
-  qSum: number
-  qN: number
-  /** When the connection was last seen stalled (net/uplink.ts STALL_MS), or -Infinity. */
-  lastStallAt: number
-  /** How long the oldest item waiting for it has waited (ms). */
-  headAgeMs: number
 }
 
 /** One connection over one window. */

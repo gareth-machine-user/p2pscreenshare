@@ -128,7 +128,7 @@ export type PublisherMsg =
   | { t: 'set-parent'; ch: number; stripe: number; parent: string | null }
   | { t: 'add-child'; ch: number; stripe: number; child: string }
   | { t: 'remove-child'; ch: number; stripe: number; child: string }
-  | { t: 'position'; ch: number; home: number | null; depth: number[] }
+  | { t: 'position'; ch: number; homes: number[]; depth: number[] }
   /** Gzipped TopologyReport (base64url), at most every 3 s while requested. */
   | { t: 'topo'; ch: number; z: string }
 
@@ -269,7 +269,7 @@ const shapes: { [T in PeerMsg['t']]: (m: Obj) => boolean } = {
   'set-parent': (m) => isNum(m.ch) && isIndex(m.stripe) && isStrOrNull(m.parent),
   'add-child': (m) => isNum(m.ch) && isIndex(m.stripe) && typeof m.child === 'string',
   'remove-child': (m) => isNum(m.ch) && isIndex(m.stripe) && typeof m.child === 'string',
-  position: (m) => isNum(m.ch) && (m.home === null || isIndex(m.home)) && isNumArray(m.depth),
+  position: (m) => isNum(m.ch) && Array.isArray(m.homes) && m.homes.every(isIndex) && isNumArray(m.depth),
   topo: (m) => isNum(m.ch) && typeof m.z === 'string',
   'publish-req': () => true,
   'publish-deny': () => true,
@@ -296,7 +296,8 @@ export function isTopologyReport(v: unknown): v is TopologyReport {
     isObj(v.slots) &&
     isObj(v.topology) &&
     isObj(v.topology.parents) &&
-    isObj(v.topology.home) &&
+    isObj(v.topology.homes) &&
+    Object.values(v.topology.homes).every((h) => Array.isArray(h) && h.every(isIndex)) &&
     isObj(v.depth) &&
     Object.values(v.depth).every((d) => isNumArray(d)) &&
     Array.isArray(v.peers) &&

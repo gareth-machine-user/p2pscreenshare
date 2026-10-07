@@ -10,13 +10,15 @@
 // ban). A failed lane is retried with backoff, at most a few times per pair, and a page creates at
 // most LANE_BUDGET of them: Chromium allows 500 RTCPeerConnections per page, closed ones included.
 //
-// Stripe s of any channel goes over slot (s mod K) of the pair, K being 1 + the lanes that are
-// open, connecting or waiting for a retry; a slot whose lane isn't open falls back to lane 0. So the
-// mapping only changes when a lane is given up for good (or declined), not while one reconnects.
-import type { MediaLink, ProbeLink } from '../net/link'
+// The i-th tree this peer sends to the pair (ranked across channels by relay/relayNode.ts, so the
+// stripes a pair actually carries spread evenly) goes over slot (i mod K) of the pair, K being 1 +
+// the lanes that are open, connecting or waiting for a retry; a slot whose lane isn't open falls
+// back to lane 0. So the mapping only changes when a lane is given up for good (or declined), or
+// the pair's trees change, not while one reconnects.
 import { after } from '../net/ticker'
 import type { LaneConn, LaneFactory } from './lane'
 import type { PeerConn } from './meshConn'
+import type { PairConn } from './dataConn'
 
 export const MAX_LANES = 4
 /** Connections per pair unless the page says otherwise (`lanes=N`). */
@@ -76,7 +78,6 @@ export interface LaneHost {
   readonly wanted: number
   connect: LaneFactory
   onMedia(data: Uint8Array, from: string): void
-  onBinary(data: Uint8Array, from: string): void
   onBufferLow(): void
   onChange(): void
 }
@@ -111,37 +112,31 @@ export class Lanes {
     for (const pair of [...this.pairs.values()]) this.teardown(pair)
   }
 
-  /** The link that carries `stripe` to `peer`: one of its lanes, or the mesh link itself. */
-  linkFor(primary: PeerConn, stripe: number): MediaLink {
+  /**
+   * The connection for the pair's `index`-th tree: slot `index` mod K of [the mesh link, then each
+   * lane slot by index], K counting slots whose lane is still connecting or waiting for a retry, so
+   * the mapping holds while one reconnects. A slot whose lane isn't open falls back to the mesh link.
+   */
+  linkFor(primary: PeerConn, index: number): PairConn {
     const pair = this.pairs.get(primary.remoteId)
-    if (!pair || pair.primary !== primary || !pair.slots.size) return primary
-    const ids = [...pair.slots.keys()].sort((a, b) => a - b)
-    const slot = (((stripe | 0) % (ids.length + 1)) + ids.length + 1) % (ids.length + 1)
-    if (slot === 0) return primary
-    const lane = pair.slots.get(ids[slot - 1])?.lane
+    if (!pair || pair.primary !== primary) return primary
+    const slots = [0, ...[...pair.slots.keys()].sort((a, b) => a - b)]
+    const slot = slots[(((index | 0) % slots.length) + slots.length) % slots.length]
+    const lane = slot === 0 ? null : pair.slots.get(slot)?.lane
     return lane?.isOpen ? lane : primary
   }
 
-  /** Open lanes to a peer (not counting the mesh link). */
-  openLanes(id: string): LaneConn[] {
-    const out: LaneConn[] = []
-    for (const s of this.pairs.get(id)?.slots.values() ?? []) if (s.lane?.isOpen) out.push(s.lane)
+  /** The pair's open connections: the mesh link (lane 0), then each open lane by index. */
+  connections(primary: PeerConn): { lane: number; conn: PairConn }[] {
+    const out: { lane: number; conn: PairConn }[] = [{ lane: 0, conn: primary }]
+    const pair = this.pairs.get(primary.remoteId)
+    if (pair?.primary !== primary) return out
+    for (const [i, s] of [...pair.slots].sort((a, b) => a[0] - b[0])) if (s.lane?.isOpen) out.push({ lane: i, conn: s.lane })
     return out
-  }
-
-  /** The probe links of a peer's open lanes. */
-  probeLinks(id: string): ProbeLink[] {
-    return this.openLanes(id).map((l) => l.probeLink)
   }
 
   relayed(id: string): boolean {
     return !!this.pairs.get(id)?.relayed
-  }
-
-  /** The peer a lane leads to, if `link` is one of the lanes. */
-  peerOf(link: unknown): string | undefined {
-    for (const [id, pair] of this.pairs) for (const s of pair.slots.values()) if (s.lane === link) return id
-    return undefined
   }
 
   /** Lane signaling from `conn`'s peer (already validated with isLaneMsg). */
@@ -204,7 +199,6 @@ export class Lanes {
     this.created++
     slot.lane = lane
     lane.onMedia = (data) => this.host.onMedia(data, id)
-    lane.onBin = (data) => this.host.onBinary(data, id)
     lane.onBufferLow = () => this.host.onBufferLow()
     lane.onStateChange = (state) => {
       if (state === 'open') this.host.onChange()
@@ -302,7 +296,6 @@ export class Lanes {
     if (!lane) return
     lane.onStateChange = () => {}
     lane.onMedia = () => {}
-    lane.onBin = () => {}
     lane.close()
   }
 

@@ -9,8 +9,6 @@ export interface ResolvedShare {
   options: ShareOptions
   /** Auto quality: the session adapts the bitrate to the audience. */
   auto: boolean
-  /** Whether the session may add parity when relays allow (auto quality, not a URL override). */
-  autoParity: boolean
 }
 
 /**
@@ -44,7 +42,6 @@ export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, 
       testPattern: oneOfPattern(params.get('pattern')),
     },
     auto,
-    autoParity: auto && !urlOverrides,
   }
 }
 
@@ -55,16 +52,12 @@ function oneOfPattern(p: string | null): TestPatternKind | undefined {
 /** The part of the session that auto quality drives. */
 export interface AutoQualityTarget {
   autoBitrate: boolean
-  autoParity(k: number, m: number, bitrateKbps: number): number
 }
 
-/** Switches the session's auto bitrate to match, and lets it add parity: the options to share with. */
+/** Switches the session's auto bitrate to match: the options to share with. */
 export function applyAutoQuality(r: ResolvedShare, session: AutoQualityTarget | null): ShareOptions {
-  if (!session) return r.options
-  session.autoBitrate = r.auto
-  if (!r.autoParity) return r.options
-  const { k, m, bitrateKbps } = r.options
-  return { ...r.options, m: session.autoParity(k, m, bitrateKbps) }
+  if (session) session.autoBitrate = r.auto
+  return r.options
 }
 
 export interface StageState {

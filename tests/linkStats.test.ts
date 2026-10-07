@@ -81,16 +81,12 @@ describe('parseLinkStats', () => {
     expect(r.responsesReceived).toBe(3)
     expect(r.bytesSent).toBe(1882145)
     expect(r.relayed).toBe(false)
-    expect(r.availableOutgoingKbps).toBeNull() // data-only: absent
-    expect(r.sctp).toBeNull() // Chrome has no sctp-transport report
+    expect(r.cwnd).toBeNull() // Chrome has no sctp-transport report
   })
-  it('Chrome: relay candidate, outgoing bitrate and SCTP stats when present', () => {
-    const recs = chrome({ relay: true, sctp: true })
-    ;(recs.find((r) => r.id === 'CPsel') as StatsRecord).availableOutgoingBitrate = 2_500_000
-    const r = parseLinkStats(recs)!
+  it('Chrome: relay candidate, and the congestion window when an SCTP report is present', () => {
+    const r = parseLinkStats(chrome({ relay: true, sctp: true }))!
     expect(r.relayed).toBe(true)
-    expect(r.availableOutgoingKbps).toBe(2500)
-    expect(r.sctp).toEqual({ congestionWindow: 120000, receiverWindow: 262144, smoothedRttMs: 31, unackData: 12, mtu: 1191 })
+    expect(r.cwnd).toBe(120000)
   })
   it('Firefox: the pair flagged selected', () => {
     const r = parseLinkStats(firefox({ relay: true }))!
@@ -173,9 +169,8 @@ describe('pathInflation', () => {
     fresh: true,
     sendKbps: null,
     recvKbps: null,
-    availableOutgoingKbps: null,
     relayed: false,
-    sctp: null,
+    cwnd: null,
     ...o,
   })
   it('threshold: max(floor, half the baseline)', () => {

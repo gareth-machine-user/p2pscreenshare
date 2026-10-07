@@ -617,7 +617,7 @@
                   <div><span>Receiving now</span><b data-testid="live-recv-total" title="Live, all connections, last 2 s">{fmtMbps(view.live.recvKbps)}</b></div>
                   <div><span>Uploading now</span><b title="Live, all connections, last 2 s (relaying and probes)">{fmtMbps(view.live.sendKbps)}</b></div>
                   <div><span>Upload capacity</span><b title="What your uplink carried when it was full (or in the last headroom probe); not current use">{fmtKbps(view.capacity)}</b></div>
-                  <div><span>Relaying</span><b>{view.sub?.home == null ? 'no (leaf)' : `stripe ${view.sub.home} → ${view.stats?.children ?? 0} children`}</b></div>
+                  <div><span>Relaying</span><b>{!view.sub?.homes.length ? 'no (leaf)' : `${view.sub.homes.length > 1 ? 'stripes' : 'stripe'} ${view.sub.homes.join(', ')} → ${view.stats?.children ?? 0} children`}</b></div>
                 </div>
                 <FrameStats loss={view.loss} renderedFps={view.playerStats?.fps ?? null} uplink={view.uplinkRates} />
                 <PeerRates rows={view.peers} />

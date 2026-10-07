@@ -45,8 +45,6 @@ export interface MemberRecord extends Typed {
   rtt: Record<string, number>
   /** Channels this peer publishes. */
   channels: ChannelAnnouncement[]
-  /** Uplink drop rate while relaying (0..1). */
-  dropRate?: number
   /** Set on the final record of a peer leaving gracefully. */
   left?: boolean
 }
@@ -111,7 +109,6 @@ export function isMemberRecord(x: unknown): x is MemberRecord {
     (x.links === undefined || isArrayOf(x.links, isStr)) &&
     isNumMap(x.rtt) &&
     isArrayOf(x.channels, isChannelAnnouncement) &&
-    (x.dropRate === undefined || isNum(x.dropRate)) &&
     (x.left === undefined || typeof x.left === 'boolean')
   )
 }

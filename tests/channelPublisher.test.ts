@@ -228,7 +228,7 @@ async function striped(): Promise<void> {
   await settledTree(TREE, RELAYS)
   // Make-before-break leftovers from the warm-up (everyone starts as a leaf) time out.
   await advance(4500)
-  expect(h.cp.topology.home).toMatchObject({ p1: 0, p2: 1, p3: 2 })
+  expect(h.cp.topology.homes).toMatchObject({ p1: [0], p2: [1], p3: [2] })
   for (const c of ['c1', 'c2', 'c3']) expect(h.cp.topology.parents[c]).toEqual(['p1', 'p2', 'p3'])
 }
 
@@ -242,7 +242,7 @@ describe('ChannelPublisher: planning and commands', () => {
         expect(hasEdge(parent, id, s)).toBe(true)
       }
       const pos = sentTo(id, 'position').at(-1)
-      expect(pos).toEqual({ t: 'position', ch: CH, home: h.cp.topology.home[id], depth: h.cp.lastPlan!.depth[id] })
+      expect(pos).toEqual({ t: 'position', ch: CH, homes: h.cp.topology.homes[id], depth: h.cp.lastPlan!.depth[id] })
     }
     // No stale edges: each relay feeds exactly its children in the plan.
     for (const p of [HOST, ...TREE]) {
@@ -321,7 +321,7 @@ describe('ChannelPublisher: planning and commands', () => {
     h.mesh.unlinked.add(['c4', 'p1'].sort().join('|'))
     await join(['c4'], 6)
     await advance(200)
-    expect(h.cp.topology.home.c4).toBeNull()
+    expect(h.cp.topology.homes.c4).toEqual([])
     expect(parentOf('c4', 0)).not.toBe('p1')
     expect(parentOf('c4', 1)).toBe('p2')
     expect(parentOf('c4', 2)).toBe('p3')

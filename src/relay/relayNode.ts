@@ -59,6 +59,8 @@ const fragId = (h: FragmentHeader) =>
  */
 export class RelayNode {
   private children = new Map<string, Set<string>>()
+  /** Per peer: the rank of each tree it is our child in (see laneIndex); rebuilt lazily. */
+  private ranks = new Map<string, Map<string, number>>()
   private seen = new Map<string, number>()
   private lastSeenPrune = 0
   private caches = new Map<string, StripeCache>()
@@ -86,11 +88,30 @@ export class RelayNode {
   constructor(
     private uplink: Uplink,
     /**
-     * The link that carries a stripe to a peer: with media lanes (mesh/lanes.ts), stripes of one
-     * pair spread over several connections. Undefined while there is no open link.
+     * The connection for a peer's `index`-th tree (see laneIndex): with media lanes
+     * (mesh/lanes.ts), the trees of one pair spread over several connections. Undefined while
+     * there is no open link.
      */
-    private linkFor: (peerId: string, stripe: number) => MediaLink | undefined,
+    private connFor: (peerId: string, index: number) => MediaLink | undefined,
+    /** All of a peer's open connections (stalled ones' trees move to another). */
+    private connectionsOf: (peerId: string) => MediaLink[] = () => [],
   ) {}
+
+  /**
+   * The connection a tree's fragments go over to `peer`: its lane by rank, unless that connection
+   * is stalled (its send buffer stopped draining: net/uplink.ts stalledMs). Then another of the
+   * pair's that isn't, taking along what already waits for the stalled one, until it drains again.
+   */
+  private linkFor(peer: string, key: string, stripe: number): MediaLink | undefined {
+    const link = this.connFor(peer, this.laneIndex(peer, key, stripe))
+    if (!link || !this.uplink.isStalled(link)) return link
+    for (const conn of this.connectionsOf(peer)) {
+      if (conn === link || !conn.isOpen || this.uplink.isStalled(conn)) continue
+      this.uplink.moveQueued(link, conn)
+      return conn
+    }
+    return link
+  }
 
   childrenOf(channel: number, stripe: number): string[] {
     return [...(this.children.get(treeKey(channel, stripe)) ?? [])]
@@ -113,7 +134,29 @@ export class RelayNode {
     }
     if (set.has(child)) return
     set.add(child)
+    this.ranks.delete(child)
     this.replayTo(key, stripe, child)
+  }
+
+  /**
+   * Which of a peer's connections a tree goes over: its rank among the trees (across channels)
+   * this peer sends to that peer, so a pair carrying stripes 0 and 2 uses two lanes rather than
+   * both landing on slot 0 mod 2. A tree the peer isn't a child in keeps its stripe number.
+   */
+  private laneIndex(peer: string, key: string, stripe: number): number {
+    let ranks = this.ranks.get(peer)
+    if (!ranks) {
+      const keys: [number, number, string][] = []
+      for (const [k, set] of this.children) {
+        if (!set.has(peer)) continue
+        const [ch, s] = k.split(':').map(Number)
+        keys.push([ch, s, k])
+      }
+      keys.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+      ranks = new Map(keys.map(([, , k], i) => [k, i]))
+      this.ranks.set(peer, ranks)
+    }
+    return ranks.get(key) ?? stripe
   }
 
   /**
@@ -123,7 +166,7 @@ export class RelayNode {
   requestReplay(channel: number, stripes: number[], child: string): void {
     for (const stripe of new Set(stripes)) {
       const key = treeKey(channel, stripe)
-      const link = this.linkFor(child, stripe)
+      const link = this.linkFor(child, key, stripe)
       if (!link?.isOpen) continue
       if (!this.children.get(key)?.has(child) || this.replayedRecently(key, child)) continue
       this.noteReplay(key, child)
@@ -156,12 +199,14 @@ export class RelayNode {
 
   removeChild(channel: number, stripe: number, child: string): void {
     this.children.get(treeKey(channel, stripe))?.delete(child)
+    this.ranks.delete(child)
   }
 
   /** Stops forwarding to a peer, in every channel or in one. */
   removePeer(peer: string, channel?: number): void {
     const prefix = channel === undefined ? null : `${channel >>> 0}:`
     for (const [key, set] of this.children) if (prefix === null || key.startsWith(prefix)) set.delete(peer)
+    this.ranks.delete(peer)
   }
 
   /** Forgets everything about a channel (it ended, or this peer unsubscribed or was revoked). */
@@ -171,11 +216,12 @@ export class RelayNode {
       for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key)
     }
     this.newestCapture.delete(channel >>> 0)
+    this.ranks.clear()
   }
 
   /** Replays the cached GOP once the link to `child` is open. */
   private replayTo(key: string, stripe: number, child: string, attempt = 0): void {
-    const link = this.linkFor(child, stripe)
+    const link = this.linkFor(child, key, stripe)
     if (!link || !link.isOpen) {
       if (attempt < 60 && this.children.get(key)?.has(child)) {
         after(200, () => this.replayTo(key, stripe, child, attempt + 1))
@@ -266,7 +312,7 @@ export class RelayNode {
       const frame = h.fragCount > 1 ? `${h.channel >>> 0}:${h.stripe}:${h.epoch}:${h.frameSeq}` : undefined
       for (const child of kids) {
         if (child === from) continue
-        const link = this.linkFor(child, h.stripe)
+        const link = this.linkFor(child, key, h.stripe)
         if (link) this.uplink.send(link, frag.raw, layer, maxAge, false, frame)
       }
     }
