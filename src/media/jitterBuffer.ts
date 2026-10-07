@@ -199,8 +199,12 @@ export class DecodeScheduler {
     return this.needKey
   }
 
-  /** Returns frames to feed to the decoder now, in order. */
-  poll(now: number): AssembledFrame[] {
+  /**
+   * Returns frames to feed to the decoder now, in order. Frames due more than `decodeAheadMs`
+   * from now stay encoded here: decoded frames hold decoder output buffers until shown, and a
+   * multi-second jitter buffer of them starves the decoder.
+   */
+  poll(now: number, decodeAheadMs = Infinity): AssembledFrame[] {
     const out: AssembledFrame[] = []
     for (;;) {
       if (this.needKey) {
@@ -215,6 +219,8 @@ export class DecodeScheduler {
 
       const f = this.buffer.get(this.nextSeq)
       if (f) {
+        const fDue = this.clock.renderAt(f.captureTime)
+        if (fDue !== null && fDue - now > decodeAheadMs) break
         this.buffer.delete(f.seq)
         this.nextSeq++
         if (f.key || (f.refSeq !== NO_REF && this.decoded.has(f.refSeq))) {

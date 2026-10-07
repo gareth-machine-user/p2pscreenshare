@@ -40,6 +40,15 @@ describe('DecodeScheduler', () => {
     expect(s.poll(0).map((f) => f.seq)).toEqual([8, 9, 10])
   })
 
+  it('keeps frames encoded until they are within the decode-ahead window', () => {
+    const s = new DecodeScheduler(readyClock())
+    for (let seq = 0; seq < 8; seq++) s.push(makeFrame(seq)) // frame n renders at 33n + 50
+    expect(s.poll(0, 100).map((f) => f.seq)).toEqual([0, 1])
+    expect(s.poll(0, 100)).toEqual([])
+    expect(s.poll(100, 100).map((f) => f.seq)).toEqual([2, 3, 4])
+    expect(s.buffered).toBe(3)
+  })
+
   it('waits for a missing frame until the next frame is nearly due, then skips it', () => {
     const s = new DecodeScheduler(readyClock(), undefined, 10)
     s.push(makeFrame(0))

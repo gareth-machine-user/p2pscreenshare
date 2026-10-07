@@ -6,6 +6,8 @@ import type { AssembledFrame } from './reassembler'
 
 /** Most frames of a not-yet-announced epoch kept while waiting for its StreamInfo. */
 const MAX_EARLY_FRAMES = 120
+/** How far ahead of its render time a frame is decoded (ms); the rest of the buffer stays encoded. */
+const DECODE_AHEAD_MS = 300
 
 /** The StreamInfo fields the video decoder is configured from. */
 function videoKey(info: StreamInfo): string {
@@ -176,7 +178,7 @@ export class Player {
 
   private pump(): void {
     if (!this.decoder || this.decoder.state !== 'configured') return
-    for (const f of this.scheduler.poll(wallClock())) {
+    for (const f of this.scheduler.poll(wallClock(), DECODE_AHEAD_MS)) {
       const ts = Math.round(f.captureTime * 1000)
       // Entries are removed on output; failed decodes would otherwise leak them.
       if (this.renderAtByTs.size >= 300) this.renderAtByTs.clear()
