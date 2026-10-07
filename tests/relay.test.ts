@@ -259,27 +259,62 @@ describe('relay node: replay on request (need-gop)', () => {
 })
 
 describe('relay node: media lanes', () => {
-  it('sends each stripe over the link the lookup picks for it (forwarding and replays)', async () => {
-    const sent: { link: string; stripe: number; replay: boolean }[] = []
+  /** A relay whose lane lookup reports `peer/index`, recording what goes where. */
+  function laned() {
+    const sent: { link: string; stripe: number; channel: number; replay: boolean }[] = []
     const uplink = {
       send: (link: MediaLink & { name: string }, data: Uint8Array) => {
         const h = decodeFragment(data)!.header
-        sent.push({ link: link.name, stripe: h.stripe, replay: h.replay })
+        sent.push({ link: link.name, stripe: h.stripe, channel: h.channel, replay: h.replay })
       },
     } as unknown as Uplink
-    // Two lanes per peer: even stripes on the mesh link, odd ones on lane 1.
-    const node = new RelayNode(uplink, (peer, stripe) => ({ isOpen: true, name: `${peer}/${stripe % 2}` }) as unknown as MediaLink)
+    const node = new RelayNode(uplink, (peer, index) => ({ isOpen: true, name: `${peer}/${index}` }) as unknown as MediaLink)
     node.verifier = async () => true
+    return { node, sent }
+  }
+
+  it('numbers the trees sent to a peer, so its stripes spread over its lanes (forwarding and replays)', async () => {
+    const { node, sent } = laned()
     for (const s of [0, 1, 2]) node.addChild(CH, s, 'c')
     await feed(node, [0, 1, 2].map((s) => frag({ seq: 1, key: true, stripe: s })))
-    expect(sent).toEqual([
-      { link: 'c/0', stripe: 0, replay: false },
-      { link: 'c/1', stripe: 1, replay: false },
-      { link: 'c/0', stripe: 2, replay: false },
+    expect(sent.map((x) => [x.link, x.stripe])).toEqual([
+      ['c/0', 0],
+      ['c/1', 1],
+      ['c/2', 2],
     ])
     sent.length = 0
-    // A new child's catch-up replay goes over the stripe's lane too.
+    // A new child's catch-up replay: its only tree, so its first lane.
     node.addChild(CH, 1, 'd')
-    expect(sent).toEqual([{ link: 'd/1', stripe: 1, replay: true }])
+    expect(sent).toEqual([{ link: 'd/0', stripe: 1, channel: CH, replay: true }])
+  })
+
+  it('ranks the stripes a pair actually carries: stripes 0 and 2 get indices 0 and 1', async () => {
+    const { node, sent } = laned()
+    node.addChild(CH, 0, 'c')
+    node.addChild(CH, 2, 'c')
+    await feed(node, [0, 2, 0, 2].map((s, i) => frag({ seq: 1 + (i >> 1), key: i < 2, gop: 1, stripe: s })))
+    expect(sent.map((x) => [x.stripe, x.link])).toEqual([
+      [0, 'c/0'],
+      [2, 'c/1'],
+      [0, 'c/0'],
+      [2, 'c/1'],
+    ])
+  })
+
+  it('ranks across channels, and re-ranks when a tree is added or removed', async () => {
+    const { node, sent } = laned()
+    const PREVIEW = 7
+    node.addChild(CH, 0, 'c')
+    node.addChild(CH, 2, 'c')
+    node.addChild(PREVIEW, 0, 'c')
+    await feed(node, [frag({ seq: 1, key: true, stripe: 0, channel: PREVIEW }), frag({ seq: 1, key: true, stripe: 2 })])
+    expect(sent.map((x) => [x.channel, x.stripe, x.link])).toEqual([
+      [PREVIEW, 0, 'c/2'],
+      [CH, 2, 'c/1'],
+    ])
+    sent.length = 0
+    node.removeChild(CH, 0, 'c')
+    await feed(node, [frag({ seq: 2, key: true, stripe: 2 })])
+    expect(sent.map((x) => x.link)).toEqual(['c/0'])
   })
 })

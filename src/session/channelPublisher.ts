@@ -329,9 +329,9 @@ export class ChannelPublisher {
     // Forget its place, so it is replanned from scratch when it comes back.
     const parentsCopy = { ...this.topology.parents }
     delete parentsCopy[id]
-    const home = { ...this.topology.home }
-    delete home[id]
-    this.topology = { parents: parentsCopy, home }
+    const homes = { ...this.topology.homes }
+    delete homes[id]
+    this.topology = { parents: parentsCopy, homes }
     this.lastPositions.delete(id)
   }
 
@@ -608,12 +608,12 @@ export class ChannelPublisher {
   private sendPositions(r: PlanResult): void {
     for (const sub of this.subscribers.values()) {
       if (!sub.active) continue
-      const home = r.topology.home[sub.id] ?? null
+      const homes = r.topology.homes[sub.id] ?? []
       const depth = r.depth[sub.id] ?? []
-      const sig = `${home}|${depth.join(',')}`
+      const sig = `${homes.join(',')}|${depth.join(',')}`
       if (this.lastPositions.get(sub.id) === sig) continue
       this.lastPositions.set(sub.id, sig)
-      this.send(sub.id, { t: 'position', ch: this.id, home, depth })
+      this.send(sub.id, { t: 'position', ch: this.id, homes, depth })
     }
   }
 

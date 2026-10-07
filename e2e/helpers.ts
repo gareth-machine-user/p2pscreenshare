@@ -93,7 +93,7 @@ export interface ViewerSnapshot {
   fps: number
   latencyMs: number | null
   bufferMs: number
-  home: number | null
+  homes: number[]
   parents: (string | null)[]
   children: number
   childIds: string[]
@@ -113,7 +113,7 @@ export interface HostSnapshot {
   changes: number
   /** Per peer: rank penalty and the peers it avoids. */
   health: Record<string, { failures: number; avoid: string[] }>
-  topology: { parents: Record<string, (string | null)[]>; home: Record<string, number | null> }
+  topology: { parents: Record<string, (string | null)[]>; homes: Record<string, number[]> }
 }
 
 export function hostSnapshot(page: Page): Promise<HostSnapshot> {

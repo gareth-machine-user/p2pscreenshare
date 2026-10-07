@@ -25,7 +25,7 @@
           ...p,
           label: peerLabel(p.id, report.publisher, numbers),
           num: numbers.get(p.id) ?? Infinity,
-          home: report.topology.home[p.id] ?? null,
+          homes: report.topology.homes[p.id] ?? [],
           depth: report.depth[p.id] ?? [],
           slots: report.slots[p.id] ?? 0,
           late: Math.max(0, ...(p.stats?.stripes.map((s) => s.lateMs) ?? [0])),
@@ -77,7 +77,7 @@
             <td title="{nameOf(r.id)} ({r.id})">{shortName(nameOf(r.id))}</td>
             <td data-testid="topo-live-send">{fmtMbps(r.stats?.uplinkRates?.kbps)}</td>
             <td class="secondary">{fmtKbps(r.stats?.capacityKbps)}{r.stats && r.stats.uplinkDropRate > 0.01 ? ` ⚠ ${(r.stats.uplinkDropRate * 100).toFixed(0)}%` : ''}</td>
-            <td>{r.home ?? '—'}</td>
+            <td>{r.homes.length ? r.homes.join(', ') : '—'}</td>
             <td>{r.slots}</td>
             <td>{r.stats?.children ?? 0}</td>
             <td>{r.depth.join(' ')}</td>

@@ -37,8 +37,8 @@ export interface PlannerPeer {
 export interface Topology {
   /** parents[peerId][stripe] = parent id (host id or peer id), or null when unattached. */
   parents: Record<string, (string | null)[]>
-  /** Stripe in which the peer relays, or null if it is a leaf everywhere. */
-  home: Record<string, number | null>
+  /** Stripes in which the peer relays, its first home first; empty if it is a leaf everywhere. */
+  homes: Record<string, number[]>
 }
 
 export interface ParentChange {
@@ -55,12 +55,12 @@ export interface PlanResult {
   depth: Record<string, number[]>
   /** Attachments that exceed some parent's estimated capacity. */
   overcommitted: number
-  /** Children slots per peer in its home stripe. */
+  /** Children slots per peer, across its home stripes. */
   slots: Record<string, number>
 }
 
 export function emptyTopology(): Topology {
-  return { parents: {}, home: {} }
+  return { parents: {}, homes: {} }
 }
 
 export function stripeCount(c: Pick<PlannerConfig, 'k' | 'm'>): number {

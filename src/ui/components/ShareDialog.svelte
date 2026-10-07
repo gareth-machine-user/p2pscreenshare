@@ -124,7 +124,7 @@
       </label>
       <p class="hint">
         Viewers receive {s.k + s.m} stripes of ~{fmtKbps(Math.round(targetKbps(s.video, native) / s.k))}
-        and need any {s.k} to decode. Parity stripes hide a relay leaving.
+        and need any {s.k} to decode. Parity stripes hide a relay leaving or lagging.
       </p>
     </details>
 

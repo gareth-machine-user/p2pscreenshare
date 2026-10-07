@@ -55,7 +55,7 @@ export interface SubscriptionContext {
 export class Subscription {
   readonly player: Player
   parents: (string | null)[] = []
-  home: number | null = null
+  homes: number[] = []
   depth: number[] = []
   ann: ChannelAnnouncement
   lastStats: SubscriberStats | null = null
@@ -160,7 +160,7 @@ export class Subscription {
         this.ctx.relay.removeChild(this.channel, msg.stripe, msg.child)
         break
       case 'position':
-        this.home = msg.home
+        this.homes = msg.homes
         this.depth = msg.depth
         break
     }

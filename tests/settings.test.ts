@@ -78,7 +78,14 @@ describe('stripe limits', () => {
     expect(clampStripes(9, STRIPE_LIMITS.m)).toBe(8)
     const s = parseSettings(JSON.stringify({ share: { k: STRIPE_LIMITS.k.max, m: STRIPE_LIMITS.m.max } }))
     expect([s.share.k, s.share.m]).toEqual([16, 8])
-    expect(parseSettings(JSON.stringify({ share: { k: 17, m: 9 } })).share).toMatchObject({ k: 4, m: 1 })
+    expect(parseSettings(JSON.stringify({ share: { k: 17, m: 9 } })).share).toMatchObject({ k: 4, m: 2 })
+  })
+
+  it('defaults to 4+2, moving the old default 4+1 over and keeping other choices', () => {
+    expect(DEFAULT_SETTINGS.share).toMatchObject({ k: 4, m: 2 })
+    expect(parseSettings(JSON.stringify({ share: { k: 4, m: 1 } })).share).toMatchObject({ k: 4, m: 2 })
+    expect(parseSettings(JSON.stringify({ share: { k: 2, m: 1 } })).share).toMatchObject({ k: 2, m: 1 })
+    expect(parseSettings(JSON.stringify({ share: { k: 4, m: 0 } })).share).toMatchObject({ k: 4, m: 0 })
   })
 
   it('defaults within the limits', () => {

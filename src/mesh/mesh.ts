@@ -333,13 +333,14 @@ export class Mesh<C extends PeerConn = MeshConn> {
   }
 
   /**
-   * The link that carries `stripe` to `id`: one of the pair's media lanes when open, else the mesh
-   * link itself (see lanes.ts), unless that one is stalled. Undefined without an open mesh link.
+   * The link for the `index`-th tree sent to `id` (relay/relayNode.ts ranks them): one of the
+   * pair's media lanes when open, else the mesh link itself (see lanes.ts), unless that one is
+   * stalled. Undefined without an open mesh link.
    */
-  mediaLinkFor(id: string, stripe: number): MediaLink | undefined {
+  mediaLinkFor(id: string, index: number): MediaLink | undefined {
     const c = this.linkFor(id)
     if (!c) return undefined
-    const link = this.lanes.linkFor(c, stripe)
+    const link = this.lanes.linkFor(c, index)
     if (!this.isStalled(link)) return link
     // Its connection is stuck: another of the pair's that isn't (until it drains again).
     for (const { conn } of this.connectionsOf(id)) {

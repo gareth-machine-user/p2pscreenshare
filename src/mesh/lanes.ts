@@ -10,9 +10,11 @@
 // ban). A failed lane is retried with backoff, at most a few times per pair, and a page creates at
 // most LANE_BUDGET of them: Chromium allows 500 RTCPeerConnections per page, closed ones included.
 //
-// Stripe s of any channel goes over slot (s mod K) of the pair, K being 1 + the lanes that are
-// open, connecting or waiting for a retry; a slot whose lane isn't open falls back to lane 0. So the
-// mapping only changes when a lane is given up for good (or declined), not while one reconnects.
+// The i-th tree this peer sends to the pair (ranked across channels by relay/relayNode.ts, so the
+// stripes a pair actually carries spread evenly) goes over slot (i mod K) of the pair, K being 1 +
+// the lanes that are open, connecting or waiting for a retry; a slot whose lane isn't open falls
+// back to lane 0. So the mapping only changes when a lane is given up for good (or declined), or
+// the pair's trees change, not while one reconnects.
 import type { MediaLink, ProbeLink } from '../net/link'
 import { after } from '../net/ticker'
 import type { LaneConn, LaneFactory } from './lane'
@@ -111,12 +113,12 @@ export class Lanes {
     for (const pair of [...this.pairs.values()]) this.teardown(pair)
   }
 
-  /** The link that carries `stripe` to `peer`: one of its lanes, or the mesh link itself. */
-  linkFor(primary: PeerConn, stripe: number): MediaLink {
+  /** The link for the pair's `index`-th tree: one of its lanes, or the mesh link itself. */
+  linkFor(primary: PeerConn, index: number): MediaLink {
     const pair = this.pairs.get(primary.remoteId)
     if (!pair || pair.primary !== primary || !pair.slots.size) return primary
     const ids = [...pair.slots.keys()].sort((a, b) => a - b)
-    const slot = (((stripe | 0) % (ids.length + 1)) + ids.length + 1) % (ids.length + 1)
+    const slot = (((index | 0) % (ids.length + 1)) + ids.length + 1) % (ids.length + 1)
     if (slot === 0) return primary
     const lane = pair.slots.get(ids[slot - 1])?.lane
     return lane?.isOpen ? lane : primary

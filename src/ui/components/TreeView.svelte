@@ -76,10 +76,11 @@
           {/if}
         {/each}
         {#each l.nodes as n}
-          {@const home = n.id === hostId ? null : topology.home[n.id]}
+          {@const homes = n.id === hostId ? [] : (topology.homes[n.id] ?? [])}
+          {@const home = homes.includes(s) ? s : (homes[0] ?? null)}
           {@const label = labels.get(n.id) ?? (n.id === hostId ? 'P' : '')}
           <g data-testid="tree-node" data-peer={n.id}>
-            <title>{n.id === hostId ? `publisher: ${names.get(n.id) ?? n.id}` : `${label ? `#${label} ` : ''}${names.get(n.id) ?? n.id} (home ${home ?? '—'})`}</title>
+            <title>{n.id === hostId ? `publisher: ${names.get(n.id) ?? n.id}` : `${label ? `#${label} ` : ''}${names.get(n.id) ?? n.id} (home ${homes.length ? homes.join(', ') : '—'})`}</title>
             <circle
               cx={DX + n.x * DX}
               cy={14 + n.y * DY}

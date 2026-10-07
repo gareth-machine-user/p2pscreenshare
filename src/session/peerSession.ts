@@ -233,7 +233,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       lanes: opts.lanes,
     })
     // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
-    this.relay = new RelayNode(this.uplink, (id, stripe) => this.mesh.mediaLinkFor(id, stripe))
+    this.relay = new RelayNode(this.uplink, (id, index) => this.mesh.mediaLinkFor(id, index))
     this.relay.verifier = (raw, ch) => this.verify(raw, ch)
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
     this.headroom = new HeadroomProbe(this.uplink)
@@ -727,16 +727,6 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     }
   }
 
-  /**
-   * Auto mode picks a second parity stripe when the lobby has enough relays: at least two capable
-   * relays (two stripes of upload) per stripe.
-   */
-  autoParity(k: number, m: number, bitrateKbps: number): number {
-    const r = stripeKbpsFor(bitrateKbps, k, true)
-    const relays = this.mesh.members().filter((rec) => (rec.capacityKbps ?? 0) * 0.75 >= 2 * r).length
-    return relays >= 2 * (k + 2) ? Math.max(m, 2) : m
-  }
-
   /** Owner: removes a member (members close their links, doors refuse it). */
   async kick(id: string): Promise<void> {
     const key = this.mesh.pubKeyOf(id)
@@ -1101,7 +1091,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       fps: p?.fps ?? 0,
       latencyMs: p?.latencyMs ?? null,
       bufferMs: p?.bufferMs ?? 0,
-      home: sub?.home ?? null,
+      homes: sub?.homes ?? [],
       parents: sub ? [...sub.parents] : [],
       children: sub ? this.relay.allChildren(sub.channel).size : 0,
       childIds: sub ? [...this.relay.allChildren(sub.channel)] : [],
@@ -1121,7 +1111,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       changes: c?.totalChanges ?? 0,
       rootSlots: c ? this.rootSlots(c.id) : 0,
       health: Object.fromEntries([...(c?.subscribers.values() ?? [])].map((s) => [s.id, { failures: s.failures, avoid: [...s.avoid.keys()] }])),
-      topology: JSON.parse(JSON.stringify(c?.topology ?? { parents: {}, home: {} })),
+      topology: JSON.parse(JSON.stringify(c?.topology ?? { parents: {}, homes: {} })),
     }
   }
 
