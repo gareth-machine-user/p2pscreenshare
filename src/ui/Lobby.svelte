@@ -264,6 +264,10 @@
       policy: session.policy,
       revoked: session.revokedNotice,
       presenterAudio: session.publishing?.audio ?? null,
+      // Read here, each tick: the session's fields aren't reactive, so the template reading them
+      // directly would never see a camera flip or an auto-bitrate change.
+      facing: session.publishing?.facing ?? null,
+      autoBitrate: session.autoBitrate,
       limited: session.publishing?.full?.limited ?? null,
       clamp: rateLine,
       kicked: session.kicked,
@@ -597,11 +601,11 @@
             clamp={lobby.clamp}
             uploading={lobby.uploading}
             uploadFraction={view.live.sendKbps !== null && view.capacity ? view.live.sendKbps / view.capacity : null}
-            auto={session?.autoBitrate ?? false}
+            auto={lobby.autoBitrate}
             bind:quality={settings.share.video}
             bind:autoLower={settings.share.autoLower}
             nativeSize={nativeScreenSize()}
-            facing={session?.publishing?.facing ?? null}
+            facing={lobby.facing}
             onflip={() => void flipCamera()}
             onmic={(m) => {
               session?.publishing?.setMicMuted(m)
