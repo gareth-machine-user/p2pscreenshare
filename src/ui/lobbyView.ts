@@ -1,6 +1,7 @@
 // Pure rules behind the lobby page (Lobby.svelte), kept out of the component so they can be tested.
 import type { TestPatternKind } from '../media/capture'
 import type { ShareOptions } from '../session/publishedStream'
+import type { MemberRecord } from '../mesh/records'
 import { numParam, sizeParam } from './route'
 import { maxSizeFor, targetKbps } from '../media/quality'
 import { STRIPE_LIMITS, type ShareSettings } from './settings.svelte'
@@ -113,6 +114,57 @@ export function connectionWord(
   if (rttMs < 150) return { text: 'Good', title, warn: false }
   if (rttMs < 400) return { text: 'OK', title, warn: false }
   return { text: 'Slow', title, warn: true }
+}
+
+/** A member's badges (chat, the People list, the Peers tab). */
+export function peerBadges(id: string, ownerId: string | null, presenters: ReadonlySet<string>): string[] {
+  const out: string[] = []
+  if (id === ownerId) out.push('owner')
+  if (presenters.has(id)) out.push('presenting')
+  return out
+}
+
+/** A row of the People list. */
+export interface Person {
+  id: string
+  name: string
+  self: boolean
+  badges: string[]
+  /** Waiting for the owner to let them share. */
+  asking: boolean
+  /** Their connection, in a word or two; warn when it's poor or missing. */
+  conn: { text: string; title: string; warn: boolean } | null
+}
+
+type PersonRecord = Pick<MemberRecord, 'id' | 'name' | 'rtt'>
+
+/** Everyone in the lobby for the People tab: you first, then the owner, presenters and the rest. */
+export function lobbyPeople(p: {
+  self: PersonRecord
+  members: PersonRecord[]
+  ownerId: string | null
+  /** Who is presenting. */
+  presenters: ReadonlySet<string>
+  /** Who is asking to share. */
+  asking: { has(id: string): boolean }
+  linkStatus: (id: string) => Parameters<typeof connectionWord>[0]
+}): Person[] {
+  const selfId = p.self.id
+  const rank = (id: string) => (id === selfId ? 0 : id === p.ownerId ? 1 : p.presenters.has(id) ? 2 : 3)
+  return [p.self, ...p.members]
+    .map((r) => {
+      const self = r.id === selfId
+      return {
+        id: r.id,
+        name: r.name || r.id.slice(0, 6),
+        self,
+        badges: peerBadges(r.id, p.ownerId, p.presenters),
+        asking: p.asking.has(r.id),
+        // Our measured RTT to them, else theirs to us.
+        conn: self ? null : connectionWord(p.linkStatus(r.id), p.self.rtt[r.id] ?? r.rtt[selfId] ?? null),
+      }
+    })
+    .sort((a, b) => rank(a.id) - rank(b.id))
 }
 
 /** The viewer's one-line playback readout ("1080p30 · 84 ms"), or null until frames decode. */

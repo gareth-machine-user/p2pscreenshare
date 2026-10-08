@@ -2,7 +2,7 @@
 /// <reference types="vite/client" />
 // (tsconfig.tools.json lacks the app types these src/ui modules use: runes, import.meta.env.)
 import { describe, expect, it } from 'vitest'
-import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage, startErrorText, type StageState } from '../src/ui/lobbyView'
+import { applyAutoQuality, connectionWord, lobbyPeople, peerBadges, playbackReadout, resolveShareOptions, stageMessage, startErrorText, type StageState } from '../src/ui/lobbyView'
 import { DEFAULT_SETTINGS, STRIPE_LIMITS, type ShareSettings } from '../src/ui/settings.svelte'
 import { maxSizeFor, targetKbps, type VideoQuality } from '../src/media/quality'
 
@@ -173,5 +173,55 @@ describe('startErrorText', () => {
     const text = startErrorText(new Error('tracker exploded'), true)
     expect(text).toBe("Couldn't start the lobby: tracker exploded")
     expect(startErrorText('boom', true)).toBe("Couldn't start the lobby: boom")
+  })
+})
+
+describe('lobbyPeople', () => {
+  const rec = (id: string, name = id, rtt: Record<string, number> = {}) => ({ id, name, rtt })
+  const base = {
+    ownerId: 'owner',
+    presenters: new Set<string>(),
+    asking: new Set<string>(),
+    linkStatus: () => 'open' as const,
+  }
+
+  it('lists you first, then the owner, presenters and the rest, in member order', () => {
+    const people = lobbyPeople({
+      ...base,
+      self: rec('me'),
+      members: [rec('a'), rec('b'), rec('owner'), rec('c')],
+      presenters: new Set(['c', 'me']),
+    })
+    expect(people.map((p) => p.id)).toEqual(['me', 'owner', 'c', 'a', 'b'])
+    expect(people.map((p) => p.badges)).toEqual([['presenting'], ['owner'], ['presenting'], [], []])
+  })
+
+  it('ranks the owner first among others even when it presents', () => {
+    const people = lobbyPeople({ ...base, self: rec('me'), members: [rec('c'), rec('owner')], presenters: new Set(['owner', 'c']) })
+    expect(people.map((p) => p.id)).toEqual(['me', 'owner', 'c'])
+    expect(people[1].badges).toEqual(['owner', 'presenting'])
+  })
+
+  it('names unnamed peers by their id, flags requests and has no connection for you', () => {
+    const people = lobbyPeople({ ...base, self: rec('me-123456789', ''), members: [rec('abcdefgh', '')], asking: new Set(['abcdefgh']) })
+    expect(people[0]).toMatchObject({ name: 'me-123', self: true, conn: null, asking: false })
+    expect(people[1]).toMatchObject({ name: 'abcdef', self: false, asking: true })
+  })
+
+  it('uses our RTT to a peer, else theirs to us', () => {
+    const people = lobbyPeople({
+      ...base,
+      self: rec('me', 'me', { a: 500 }),
+      members: [rec('a', 'a', { me: 50 }), rec('b', 'b', { me: 50 }), rec('c')],
+      linkStatus: (id) => (id === 'c' ? 'unreachable' : 'open'),
+    })
+    expect(people.slice(1).map((p) => p.conn)).toEqual([connectionWord('open', 500), connectionWord('open', 50), connectionWord('unreachable', null)])
+  })
+})
+
+describe('peerBadges', () => {
+  it('marks the owner and presenters', () => {
+    expect(peerBadges('o', 'o', new Set(['o']))).toEqual(['owner', 'presenting'])
+    expect(peerBadges('x', null, new Set())).toEqual([])
   })
 })

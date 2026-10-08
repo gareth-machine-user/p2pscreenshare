@@ -7,7 +7,7 @@
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publishedStream'
   import { iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
-  import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage, startErrorText } from './lobbyView'
+  import { applyAutoQuality, lobbyPeople, peerBadges, playbackReadout, resolveShareOptions, stageMessage, startErrorText } from './lobbyView'
   import { ownerSeed, saveSettings, settings } from './settings.svelte'
   import { maxSizeFor, targetKbps } from '../media/quality'
   import { nativeScreenSize } from './screen'
@@ -239,10 +239,7 @@
   }
 
   function badges(id: string): string[] {
-    const out: string[] = []
-    if (id === ownerId) out.push('owner')
-    if (session?.liveStreams().some((s) => s.publisher === id)) out.push('presenting')
-    return out
+    return peerBadges(id, ownerId, new Set(session?.liveStreams().map((s) => s.publisher)))
   }
 
   const lobby = $derived.by(() => {
@@ -287,21 +284,14 @@
     const s = session
     if (!s) return []
     const mesh = s.mesh
-    const live = new Set(s.liveStreams().map((x) => x.publisher))
-    const rank = (id: string) => (id === mesh.selfId ? 0 : id === ownerId ? 1 : live.has(id) ? 2 : 3)
-    return [mesh.record, ...mesh.members()]
-      .map((r) => {
-        const self = r.id === mesh.selfId
-        return {
-          id: r.id,
-          name: r.name || r.id.slice(0, 6),
-          self,
-          badges: badges(r.id),
-          asking: s.requests.has(r.id),
-          conn: self ? null : connectionWord(mesh.linkStatus(r.id), mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
-        }
-      })
-      .sort((a, b) => rank(a.id) - rank(b.id))
+    return lobbyPeople({
+      self: mesh.record,
+      members: mesh.members(),
+      ownerId,
+      presenters: new Set(s.liveStreams().map((x) => x.publisher)),
+      asking: s.requests,
+      linkStatus: (id) => mesh.linkStatus(id),
+    })
   })
 
   // A phone that sleeps stops its camera: keep the screen on while sharing one.

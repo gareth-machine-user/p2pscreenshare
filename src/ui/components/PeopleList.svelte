@@ -1,14 +1,6 @@
 <script lang="ts" module>
-  export interface Person {
-    id: string
-    name: string
-    self: boolean
-    badges: string[]
-    /** Waiting for the owner to let them share. */
-    asking: boolean
-    /** Their connection, in a word or two; warn when it's poor or missing. */
-    conn: { text: string; title: string; warn: boolean } | null
-  }
+  import type { Person } from '../lobbyView'
+  export type { Person }
 </script>
 
 <script lang="ts">
