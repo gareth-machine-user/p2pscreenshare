@@ -100,6 +100,11 @@ export interface TopologyReport {
   slots: Record<string, number>
   rootSlots: number
   overcommitted: number
+  /**
+   * (peer, stripe) pairs the last plan left without a parent because nothing could link to the peer
+   * (PlanResult.unattached). Absent from older publishers.
+   */
+  unattached?: number
   changes: number
   peers: {
     id: string
@@ -303,7 +308,7 @@ export function parsePeerMsg(v: unknown): PeerMsg | null {
 
 /**
  * Checks a decoded TopologyReport: the fields the Topology panel dereferences. Display-only extras
- * that are malformed (the publisher's own stats, a peer's link) are dropped in place rather than
+ * that are malformed (the publisher's own stats, a peer's link, the unattached count) are dropped in place rather than
  * rejecting the report, as a NaN in them (null after JSON) is a hiccup, not an attack.
  */
 export function isTopologyReport(v: unknown): v is TopologyReport {
@@ -334,6 +339,7 @@ export function isTopologyReport(v: unknown): v is TopologyReport {
         (p.stats === null || isSubscriberStats(p.stats)),
     )
   if (!ok) return false
+  if (v.unattached !== undefined && !isNum(v.unattached)) delete v.unattached
   for (const p of v.peers as Obj[]) if (p.link !== undefined && p.link !== null && !isPeerLink(p.link)) p.link = null
   const ps = v.publisherStats
   if (ps !== undefined) {

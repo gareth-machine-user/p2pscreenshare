@@ -592,6 +592,7 @@ export class ChannelPublisher {
       slots: this.lastPlan?.slots ?? {},
       rootSlots: this.ctx.rootSlots(this.id),
       overcommitted: this.lastPlan?.overcommitted ?? 0,
+      unattached: this.lastPlan?.unattached ?? 0,
       changes: this.totalChanges,
       peers: [...this.subscribers.values()].map((s) => ({
         id: s.id,

@@ -157,6 +157,15 @@ describe('topology report validation', () => {
     expect(isTopologyReport(roundTrip(report))).toBe(true)
   })
 
+  it('carries the unattached count, optional for older publishers, dropped if malformed', () => {
+    const withCount = roundTrip({ ...report, unattached: 2 }) as unknown as TopologyReport
+    expect(isTopologyReport(withCount)).toBe(true)
+    expect(withCount.unattached).toBe(2)
+    const bad = roundTrip({ ...report, unattached: 'some' }) as unknown as TopologyReport
+    expect(isTopologyReport(bad)).toBe(true)
+    expect(bad.unattached).toBeUndefined()
+  })
+
   it('rejects malformed reports', () => {
     expect(isTopologyReport(null)).toBe(false)
     expect(isTopologyReport({ ...report, peers: {} })).toBe(false)

@@ -663,7 +663,7 @@ describe('ChannelPublisher: topology reports', () => {
     await striped()
     send('c1', { t: 'topo-req', ch: CH, on: true })
     const [first] = await topo('c1', 1)
-    expect(first).toMatchObject({ channel: CH, publisher: HOST, k: 2, m: 1, rootSlots: 3, topology: h.cp.topology })
+    expect(first).toMatchObject({ channel: CH, publisher: HOST, k: 2, m: 1, rootSlots: 3, unattached: 0, topology: h.cp.topology })
     expect(first.peers.map((p) => p.id).sort()).toEqual([...TREE].sort())
     // The periodic report (exactly when it falls within these 3 s depends on the ticker's phase).
     await advance(3000)
@@ -673,6 +673,17 @@ describe('ChannelPublisher: topology reports', () => {
     const n = (await topo('c1')).length // reports already being compressed still go out
     await advance(6000)
     expect((await topo('c1')).length).toBe(n)
+  })
+
+  it('reports stripes left unattached because nothing could link to the peer', async () => {
+    await striped()
+    // c4 can reach neither the relays nor the publisher's tree slots.
+    for (const p of ['p1', 'p2', 'p3', 'c1', 'c2', 'c3']) h.mesh.unlinked.add(['c4', p].sort().join('|'))
+    h.mesh.record.unreachable.push('c4')
+    await join(['c4'])
+    await advance(2100)
+    expect(h.cp.lastPlan!.unattached).toBe(3)
+    expect(h.cp.report().unattached).toBe(3)
   })
 })
 
