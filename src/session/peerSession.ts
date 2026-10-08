@@ -6,8 +6,8 @@
 // - Subscriber: one Subscription per watched channel (session/subscription.ts).
 // - Publish rights: requests to publish and the owner's answers (session/publishRights.ts).
 // - Relay: one RelayNode for every channel, forwarding over the mesh links' media channels.
-// - Capacity: each connection's delivered rate (session/capacity.ts), split into relay slots per
-//   watched channel; the presenter's bitrate follows it (session/congestion.ts).
+// - Capacity: each connection's delivered rate (session/connMetrics.ts, capacity.ts), split into
+//   relay slots per watched channel; the presenter's bitrate follows it (session/congestion.ts).
 import type { PublishPolicy } from '../mesh/auth'
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
@@ -16,13 +16,10 @@ import type { PeerConn } from '../mesh/meshConn'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { fromBase64Url } from '../net/lobby'
 import { Uplink } from '../net/uplink'
-import type { PairConn } from '../mesh/dataConn'
-import { LinkStatsTracker, parseLinkStats, pathInflation } from '../net/linkStats'
 import { isTopologyReport, parsePeerMsg, type EncoderRates, type PeerMsg, type TopologyReport, type UplinkRates } from '../proto/messages'
-import { RateWindow, round1 } from './rates'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
-import { CapacityModel, FROZEN_LAG_MS, linkWindow, rebalanceWeights, splitBudget, stripeKbpsFor, type ConnWindow, type LinkSnap } from './capacity'
+import { FROZEN_LAG_MS, rebalanceWeights, splitBudget, stripeKbpsFor, type CapacityModel } from './capacity'
 import { AudienceCap, audienceLimit, BitrateController, rateTarget, type RateTarget } from './congestion'
 import type { ChannelPublisher, PublisherContext } from './channelPublisher'
 import { PublishedStream, type ShareOptions } from './publishedStream'
@@ -30,6 +27,7 @@ import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { AutoFallback, liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { HeadroomProbe } from './headroom'
+import { ConnMetrics, type LinkRow } from './connMetrics'
 import { PublishRights, type PublishRequest, type PublishRightsContext, type RequestState } from './publishRights'
 import { debounce, every, takeMainThreadLag } from '../net/ticker'
 import type { Buffering } from '../media/jitterBuffer'
@@ -51,38 +49,6 @@ export interface PeerSessionOptions {
   meshDeps?: Pick<MeshOptions<PeerConn>, 'connect' | 'connectLane' | 'rendezvous' | 'storage'>
 }
 
-/** One connection to a peer, as the Peers panel shows it (PeerSession.linkStatsFor). */
-export interface LinkRow {
-  /** 0: the mesh link; 1..: media lanes. */
-  lane: number
-  /** Wire send rate (getStats bytesSent: all channels, with overhead). */
-  sendKbps: number | null
-  /** Wire receive rate (getStats bytesReceived). */
-  recvKbps: number | null
-  /** Live media handed to this connection over the last window. */
-  mediaKbps: number | null
-  /** What it delivered over the last window (all its channels), and what it can carry (capacity.ts). */
-  deliveredKbps: number | null
-  capKbps: number | null
-  /** It was its own bottleneck at some point (a slow receiver, or its congestion window). */
-  bound: boolean
-  /** Its uplink queue never emptied over the last window: it carried all it could. */
-  backlogged: boolean
-  /** Path RTT (ICE candidate pair) now, and its 2-minute minimum. */
-  rttMs: number | null
-  baselineMs: number | null
-  /** The RTT refreshed recently. */
-  fresh: boolean
-  /** Live-media queueing (uplink queue + send buffer) and drops/s over the last window. */
-  queueMs: number | null
-  drops: number | null
-  /** The connection stalled recently (its send buffer stopped draining; net/uplink.ts STALL_MS). */
-  stalled: boolean
-  relayed: boolean | null
-  /** SCTP congestion window (bytes), if the browser exposes sctp-transport stats (Chrome doesn't). */
-  cwnd: number | null
-}
-
 export interface LiveChannel {
   ann: ChannelAnnouncement
   publisher: string
@@ -90,6 +56,7 @@ export interface LiveChannel {
 
 export type { StageSource, ViewQuality } from './stage'
 export type { PublishRequest, RequestState } from './publishRights'
+export type { LinkRow } from './connMetrics'
 
 /** Budget weights shift towards channels with a deficit this often. */
 const REBALANCE_MS = 10_000
@@ -103,8 +70,6 @@ const HEADROOM_FIRST_MS = 1000
 const HEADROOM_CHECK_MS = 1000
 /** The encoder dropping this many frames per second means it can't keep up (shown, not acted on). */
 const ENCODER_BEHIND_FPS = 3
-/** Path RTT inflation shown as "+N ms" in the Peers panel, at least (display only). */
-const RTT_QUEUE_SHOWN_MS = 40
 /** Each connection's getStats() (path RTT, wire rates) is polled this often. */
 const LINK_STATS_MS = 2000
 
@@ -116,52 +81,14 @@ const AUTO_QUALITY_CHECK_MS = 500
 const STAGE_LOG_MS = 100
 const STAGE_LOG_MAX = 100
 
-/** One connection's last capacity window (session/capacity.ts linkWindow), rounded for display (Peers panel, Topology). */
-interface LaneRate {
-  mediaKbps: number
-  deliveredKbps: number
-  drops: number
-  queueMs: number
-  backlogged: boolean
-  stalled: boolean
-}
-
-/** The uplink's cumulative counters that sampleUplink turns into rates. */
-interface UplinkCounters {
-  bytes: number
-  items: number
-  dropped: number
-  /** Drops by layer: 0, 1, and 2 and above. */
-  t0: number
-  t1: number
-  t2: number
-  stalls: number
-  queueSum: number
-  queueN: number
-}
-
-function uplinkCounters(s: Uplink['stats']): UplinkCounters {
-  const d = s.droppedByLayer
-  return { bytes: s.sentBytes, items: s.sentItems, dropped: s.droppedItems, t0: d[0], t1: d[1], t2: d[2] + d[3], stalls: s.bufferStalls, queueSum: s.queueDelaySum, queueN: s.queueDelayN }
-}
-
-/** What the session keeps per open connection (a mesh link or a lane), in one place. */
-interface ConnRecord {
-  peer: string
-  lane: number
-  /** Its getStats() history (net/linkStats.ts): path RTT, wire rates. */
-  tracker: LinkStatsTracker
-  /** The snapshot the last capacity window ended with, and that window's figures. */
-  last: LinkSnap | null
-  rate: LaneRate | null
-}
-
 export class PeerSession implements PublisherContext, SubscriptionContext, PublishRightsContext {
   readonly mesh: Mesh
   readonly uplink: Uplink
   readonly relay: RelayNode
   /** Delivered-rate capacity per connection, per peer and of the uplink (session/capacity.ts). */
-  readonly capacity = new CapacityModel()
+  readonly capacity: CapacityModel
+  /** What this peer measures of its uplink and connections (session/connMetrics.ts). */
+  readonly metrics: ConnMetrics
   readonly selfId: string
   readonly ownerId: string
   readonly signingKey: CryptoKey
@@ -203,14 +130,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
   private headroom: HeadroomProbe
   /** When the first mesh link opened (headroom discovery starts then), or null. */
   private firstLinkAt: number | null = null
-  /** Some media connection was backlogged in the last window (no headroom probe then). */
-  private backloggedNow = false
-  private uplinkNow = { kbps: 0, dropRate: 0 }
-  /** This peer's uplink and (when presenting) encoder, per second over the last 2 s window. */
-  uplinkStatsNow: UplinkRates | null = null
+  /** This peer's encoder (when presenting), per second over the last 2 s window. */
   encoderStatsNow: EncoderRates | null = null
-  /** The uplink's counters per second; the first window runs from construction (all zero then). */
-  private uplinkWindow = new RateWindow<UplinkCounters>()
   private reconcileSoon = debounce(() => this.reconcile())
   private timers: (() => void)[] = []
   /** Set by leave(): no more reconciles (they would re-create subscriptions). */
@@ -224,9 +145,6 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
    * thread busy; such windows don't count towards capacity) or the encoder dropped frames.
    */
   localLoad: { stallMs: number; encoderDroppedFps: number } | null = null
-  /** Per open connection (mesh link or lane), refreshed by openConns(). */
-  private connRecs = new Map<PairConn, ConnRecord>()
-  private pollingStats = false
   /** Auto quality's cap for the presenter's stream, apart from the chosen quality (session/congestion.ts). */
   private audienceCap = new AudienceCap()
   /** Auto quality's stall detector for the stage stream (session/stage.ts). */
@@ -250,6 +168,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       // The fakes implement PeerConn, not MeshConn: all the session relies on.
       ...(opts.meshDeps as Partial<MeshOptions>),
     })
+    this.metrics = new ConnMetrics(this.mesh, this.uplink)
+    this.capacity = this.metrics.capacity
     // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
     this.relay = new RelayNode(
       this.uplink,
@@ -260,16 +180,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
     this.headroom = new HeadroomProbe(this.uplink)
     this.rights = new PublishRights(this)
-    this.uplinkWindow.sample(uplinkCounters(this.uplink.stats))
 
     const m = this.mesh
     m.onMedia = (data, from) => this.relay.receive(data, from)
     m.onBufferLow = () => this.uplink.kick()
     // Gossiped RTTs: the mesh link's path RTT from the getStats polling below.
-    m.pathRttMs = (id) => {
-      for (const r of this.connRecs.values()) if (r.peer === id && r.lane === 0) return r.tracker.current(performance.now())?.rttMs ?? null
-      return null
-    }
+    m.pathRttMs = (id) => this.metrics.pathRttMs(id)
     m.onApp = (raw, from) => {
       const msg = parsePeerMsg(raw)
       if (msg) this.handle(msg, from)
@@ -304,7 +220,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     this.timers.push(every(REBALANCE_MS, () => this.rebalance()))
     this.timers.push(every(AUTO_BITRATE_CHECK_MS, () => this.checkAutoBitrate()))
     this.timers.push(every(STAGE_LOG_MS, () => this.logStage()))
-    this.timers.push(every(LINK_STATS_MS, () => void this.pollLinkStats()))
+    this.timers.push(every(LINK_STATS_MS, () => void this.metrics.pollLinkStats()))
   }
 
   // --- channels ----------------------------------------------------------------------------------
@@ -572,7 +488,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
   }
 
   uplinkSample(): { kbps: number; dropRate: number } {
-    return this.uplinkNow
+    return this.metrics.uplinkNow
+  }
+
+  /** This peer's uplink, per second over the last 2 s window. */
+  get uplinkStatsNow(): UplinkRates | null {
+    return this.metrics.uplinkStatsNow
   }
 
   uplinkRates(): UplinkRates | null {
@@ -707,7 +628,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       uplinkKbps: this.capacity.uplinkKbps === null ? null : Math.round(this.capacity.uplinkKbps),
       medianPeerKbps: t?.medianPeerKbps == null ? null : Math.round(t.medianPeerKbps),
       feasibleKbps: full.limited?.feasibleKbps ?? null,
-      stalledLanes: [...this.connRecs.values()].filter((r) => r.rate?.stalled).length,
+      stalledLanes: this.metrics.stalledLanes(),
     }
   }
 
@@ -791,74 +712,14 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
 
   private sampleUplink(): void {
     const now = performance.now()
-    const r = this.uplinkWindow.sample(uplinkCounters(this.uplink.stats), now)
-    this.uplinkNow = {
-      kbps: (r.bytes * 8) / 1000,
-      dropRate: r.items + r.dropped > 0 ? r.dropped / (r.items + r.dropped) : 0,
-    }
-    this.uplinkStatsNow = {
-      kbps: Math.round((r.bytes * 8) / 1000),
-      drops: [round1(r.t0), round1(r.t1), round1(r.t2)],
-      stalls: round1(r.stalls),
-      queueMs: r.queueN > 0 ? Math.round(r.queueSum / r.queueN) : 0,
-    }
+    this.metrics.sampleUplink(now)
     this.encoderStatsNow = this.publishing?.sampleEncoder() ?? null
     const lagMs = Math.round(takeMainThreadLag())
-    this.sampleLinks(now, lagMs)
-    this.adaptBitrate(now)
-    this.updateOffers()
-  }
-
-  /**
-   * Every open connection (the mesh link and lanes of each peer) with its record. Records of
-   * connections that are no longer open are dropped here, so this is the one place they are pruned.
-   */
-  private openConns(): [PairConn, ConnRecord][] {
-    const out: [PairConn, ConnRecord][] = []
-    const seen = new Set<PairConn>()
-    for (const peer of [...this.mesh.conns.keys()]) {
-      for (const { lane, conn } of this.mesh.connectionsOf(peer)) {
-        if (!conn.isOpen) continue
-        seen.add(conn)
-        let r = this.connRecs.get(conn)
-        if (!r) this.connRecs.set(conn, (r = { peer, lane, tracker: new LinkStatsTracker(), last: null, rate: null }))
-        out.push([conn, r])
-      }
-    }
-    for (const conn of this.connRecs.keys()) if (!seen.has(conn)) this.connRecs.delete(conn)
-    this.capacity.retain(seen)
-    return out
-  }
-
-  /**
-   * One capacity window (session/capacity.ts): what each connection delivered since the last one,
-   * whether it was backlogged or stalled meanwhile. A window in which the page froze (the main
-   * thread lagged FROZEN_LAG_MS or more) says nothing about the network and is left out.
-   */
-  private sampleLinks(now: number, lagMs: number): void {
-    const windows: ConnWindow[] = []
-    for (const [conn, rec] of this.openConns()) {
-      const snap = this.uplink.snapshot(conn, conn.probeLink, now)
-      const last = rec.last
-      rec.last = snap
-      rec.rate = null
-      // A connection's counters restart if the uplink forgot it (closed and reopened).
-      if (!last || snap.handed < last.handed || snap.items < last.items) continue
-      const w = linkWindow(conn, rec.peer, last, snap)
-      windows.push(w)
-      rec.rate = {
-        mediaKbps: Math.round(w.mediaKbps),
-        deliveredKbps: Math.round(w.kbps),
-        drops: Math.round(w.dropsPerS * 10) / 10,
-        queueMs: Math.round(w.queueMs),
-        backlogged: w.backlogged,
-        stalled: w.stalled,
-      }
-    }
-    this.capacity.update(now, windows, { frozen: lagMs >= FROZEN_LAG_MS })
-    this.backloggedNow = windows.some((w) => w.active && w.backlogged)
+    this.metrics.sampleLinks(now, lagMs)
     const encoderDroppedFps = this.encoderStatsNow?.droppedFps ?? 0
     this.localLoad = lagMs >= FROZEN_LAG_MS || encoderDroppedFps >= ENCODER_BEHIND_FPS ? { stallMs: lagMs, encoderDroppedFps } : null
+    this.adaptBitrate(now)
+    this.updateOffers()
   }
 
   /**
@@ -874,7 +735,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     const limited = this.rate !== null && (this.rate.limit === 'uplink' || this.rate.limit === 'viewers')
     const every = limited ? HEADROOM_LIMITED_MS : HEADROOM_EVERY_MS
     const due = this.headroom.lastAt === -Infinity ? now - this.firstLinkAt >= HEADROOM_FIRST_MS : now - this.headroom.lastAt >= every
-    if (due && !this.backloggedNow) void this.discover()
+    if (due && !this.metrics.backloggedNow) void this.discover()
   }
 
   /**
@@ -883,109 +744,28 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
    * no probe ran.
    */
   async discover(): Promise<number | null> {
-    const conns = this.openConns()
-    const snap = () => new Map(conns.map(([conn]) => [conn, this.uplink.snapshot(conn, conn.probeLink)]))
-    const r = await this.headroom.run(
-      conns.map(([conn]) => conn.probeLink),
-      snap,
-    )
-    if (!r) return null
-    const windows: ConnWindow[] = []
-    for (const [conn, { peer }] of conns) {
-      const a = r.start.get(conn)
-      const b = r.end.get(conn)
-      if (!a || !b || !conn.isOpen) continue
-      windows.push({ ...linkWindow(conn, peer, a, b), active: true, backlogged: true })
-    }
-    this.capacity.update(performance.now(), windows, { probe: true })
+    if (!(await this.metrics.probe(this.headroom))) return null
     this.updateOffers()
     this.onChange()
     return this.capacity.uplinkKbps
   }
 
-  /** Polls getStats() on every open connection (mesh links and lanes) into its tracker. */
-  private async pollLinkStats(): Promise<void> {
-    if (this.pollingStats) return
-    this.pollingStats = true
-    try {
-      await Promise.all(
-        this.openConns().map(async ([conn, { tracker }]) => {
-          const report = await conn.stats?.()
-          const r = report && parseLinkStats(report)
-          if (r) tracker.update(r, performance.now())
-        }),
-      )
-    } finally {
-      this.pollingStats = false
-    }
-  }
-
-  /** The records of the open connections to `peer`, by lane. */
-  private recsOf(peer: string): [PairConn, ConnRecord][] {
-    return [...this.connRecs].filter(([, r]) => r.peer === peer).sort((a, b) => a[1].lane - b[1].lane)
-  }
-
   /**
-   * Per connection to `peer` (Peers panel, e2e): getStats() path stats (RTT now and baseline, wire
-   * send rate, relayed, SCTP congestion window where the browser exposes it) and the live-media
-   * queueing and drops of the last window.
+   * Per connection to `peer` (Peers panel, e2e): getStats() path stats and the live-media queueing
+   * and drops of the last window.
    */
   linkStatsFor(peer: string): LinkRow[] {
-    const kbps = (v: number | null | undefined) => (v === null || v === undefined ? null : Math.round(v))
-    const ms = (v: number | null | undefined) => (v === null || v === undefined ? null : Math.round(v * 10) / 10)
-    const now = performance.now()
-    return this.recsOf(peer).map(([conn, rec]) => {
-      const s = rec.tracker.current(now)
-      const r = rec.rate
-      const cap = this.capacity.conn(conn)
-      return {
-        lane: rec.lane,
-        sendKbps: kbps(s?.sendKbps),
-        recvKbps: kbps(s?.recvKbps),
-        mediaKbps: r?.mediaKbps ?? null,
-        deliveredKbps: r?.deliveredKbps ?? null,
-        capKbps: cap?.kbps == null ? null : Math.round(cap.kbps),
-        bound: cap?.bound ?? false,
-        backlogged: r?.backlogged ?? false,
-        rttMs: ms(s?.rttMs),
-        baselineMs: ms(s?.baselineMs),
-        fresh: s?.fresh ?? false,
-        queueMs: r?.queueMs ?? null,
-        drops: r?.drops ?? null,
-        stalled: r?.stalled ?? false,
-        relayed: s?.relayed ?? null,
-        cwnd: s?.cwnd ?? null,
-      }
-    })
+    return this.metrics.linkStatsFor(peer)
   }
 
-  /**
-   * This peer's live totals over the last poll (2 s): sent and received on the wire across all its
-   * connections (getStats), falling back to the uplink's own media counter for sending.
-   */
+  /** This peer's live totals on the wire over the last poll (2 s). */
   liveRates(): { sendKbps: number | null; recvKbps: number | null } {
-    const now = performance.now()
-    let send: number | null = null
-    let recv: number | null = null
-    for (const rec of this.connRecs.values()) {
-      const s = rec.tracker.current(now)
-      if (s?.sendKbps != null) send = (send ?? 0) + s.sendKbps
-      if (s?.recvKbps != null) recv = (recv ?? 0) + s.recvKbps
-    }
-    return { sendKbps: send ?? this.uplinkStatsNow?.kbps ?? null, recvKbps: recv }
+    return this.metrics.liveRates()
   }
 
   /** The link from this peer to `peer` over the last window, all its connections together (Topology). */
   linkRate(peer: string): { drops: number; queueMs: number; backlogged: boolean; capKbps: number | null } | null {
-    const rs = this.recsOf(peer).flatMap(([, r]) => (r.rate ? [r.rate] : []))
-    if (!rs.length) return null
-    const cap = this.capacity.peer(peer).kbps
-    return {
-      drops: Math.round(rs.reduce((a, r) => a + r.drops, 0) * 10) / 10,
-      queueMs: Math.max(...rs.map((r) => r.queueMs)),
-      backlogged: rs.some((r) => r.backlogged),
-      capKbps: cap === null ? null : Math.round(cap),
-    }
+    return this.metrics.linkRate(peer)
   }
 
   /** What the connections to `peer` carry together (Peers panel), and whether they were its bottleneck. */
@@ -995,11 +775,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
 
   /** Path RTT inflation to `peer` over its baseline (display only: the Peers panel's "+N ms"). */
   pathQueueFor(peer: string): { inflationMs: number; queued: boolean } | null {
-    const p = pathInflation(
-      this.recsOf(peer).map(([, r]) => r.tracker.current(performance.now())),
-      RTT_QUEUE_SHOWN_MS,
-    )
-    return p ? { inflationMs: Math.round(p.inflationMs), queued: p.inflated } : null
+    return this.metrics.pathQueueFor(peer)
   }
 
   // --- debug / e2e -------------------------------------------------------------------------------
