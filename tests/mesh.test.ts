@@ -355,6 +355,90 @@ describe('mesh (in-memory network)', () => {
   })
 })
 
+describe('signaling (in-memory network)', () => {
+  /** A knock (please offer to me), signed by `from`. */
+  function knock(from: PeerIdentity, to: string, at = Date.now(), nonce = crypto.randomUUID()): Promise<Envelope> {
+    return seal(from, { type: 'sig', from: from.id, to, kind: 'knock', nonce, at })
+  }
+
+  /**
+   * Four peers where the pair `lo` < `hi` can't connect (and, if `alsoBlockHi`, nor can p3 and
+   * `hi`), settled: both ends have given up on the pair, so only a knock makes `lo` offer again.
+   */
+  async function blockedPair(alsoBlockHi = false) {
+    const lobby = await makeLobby(4)
+    const [x, y] = [lobby.ids[1], lobby.ids[2]]
+    const [lo, hi] = x.id < y.id ? [x, y] : [y, x]
+    const p3 = lobby.ids[3]
+    lobby.net.block(lo.id, hi.id)
+    if (alsoBlockHi) lobby.net.block(p3.id, hi.id)
+    const at = (id: PeerIdentity) => lobby.meshes[lobby.ids.indexOf(id)]
+    for (const m of lobby.meshes) await m.start()
+    // Every peer has heard (from the records) that the pairs failed.
+    const settled = () =>
+      lobby.meshes.every((m) => m.members().length === 3 && m.unreachablePair(lo.id, hi.id) && (!alsoBlockHi || m.unreachablePair(p3.id, hi.id))) &&
+      !at(lo).conns.has(hi.id)
+    await until(settled, 60_000, 'blocked pairs given up')
+    // Offers `lo` sent towards `hi` (directly or through relays).
+    const offers = () => sentBy(lobby.net, lo.id).filter((m) => m.t === 'sig' && m.to === hi.id)
+    /** Hands `lo` a knock through the owner; whether `lo` started an offer because of it. */
+    const deliver = async (env: Envelope): Promise<boolean> => {
+      const before = offers().length
+      expect(lobby.net.inject(lobby.ids[0].id, lo.id, { t: 'sig', to: lo.id, env })).toBe(true)
+      await advance(200)
+      const offered = offers().length > before
+      // Let the attempt fail (the pair is blocked), so the next knock is judged on its own.
+      if (offered) await until(() => !at(lo).conns.has(hi.id), 30_000, 'attempt over')
+      return offered
+    }
+    return { lobby, lo, hi, p3, at, offers, deliver }
+  }
+
+  it('a replayed knock is refused, a fresh one is not', async () => {
+    const { lo, hi, deliver } = await blockedPair()
+    const env = await knock(hi, lo.id)
+    expect(await deliver(env)).toBe(true)
+    expect(await deliver(env)).toBe(false)
+    expect(await deliver(await knock(hi, lo.id))).toBe(true)
+  })
+
+  it('takes signaling from a clock up to 10 minutes off, refuses older', async () => {
+    const { lo, hi, deliver } = await blockedPair()
+    const min = 60_000
+    expect(await deliver(await knock(hi, lo.id, Date.now() - 11 * min))).toBe(false)
+    expect(await deliver(await knock(hi, lo.id, Date.now() + 11 * min))).toBe(false)
+    expect(await deliver(await knock(hi, lo.id, Date.now() + 9 * min))).toBe(true)
+    expect(await deliver(await knock(hi, lo.id, Date.now() - 9 * min))).toBe(true)
+  })
+
+  it('refuses a knock signed by someone other than its named sender', async () => {
+    const { lobby, lo, hi, deliver } = await blockedPair()
+    const forged = await seal(lobby.ids[3], { type: 'sig', from: hi.id, to: lo.id, kind: 'knock', nonce: 'n', at: Date.now() })
+    expect(await deliver(forged)).toBe(false)
+  })
+
+  it('routes an offer through a neighbour linked to the addressee, which hands it on', async () => {
+    const { lobby, lo, hi, p3, at, offers, deliver } = await blockedPair(true)
+    const owner = lobby.ids[0]
+    const sigOf = (m: { [k: string]: unknown }) => (m.env as Envelope).s
+    const old = new Set(offers().map(sigOf))
+    expect(await deliver(await knock(hi, lo.id))).toBe(true)
+    const fresh = offers().filter((m) => !old.has(sigOf(m)))
+    expect(new Set(fresh.map(sigOf)).size).toBe(1)
+    const env = fresh[0].env as Envelope
+    const carried = (m: { t: string; [k: string]: unknown }) => m.t === 'sig' && (m.env as Envelope).s === env.s
+    // p3 can't reach `hi` either, so only the owner relays.
+    const relayedBy = lobby.net.conns.filter((c) => c.localId === lo.id && c.sent.some(carried)).map((c) => c.remoteId)
+    expect(relayedBy).toEqual([owner.id])
+    expect(at(p3).linkFor(lo.id)).toBeDefined()
+    const ownerToHi = lobby.net.conns.filter((c) => c.localId === owner.id && c.remoteId === hi.id).flatMap((c) => c.sent)
+    expect(ownerToHi.some(carried)).toBe(true)
+    // `hi` answered back the same way.
+    const answers = lobby.net.conns.filter((c) => c.localId === hi.id).flatMap((c) => c.sent).filter((m) => m.t === 'sig' && m.to === lo.id)
+    expect(answers.length).toBeGreaterThan(0)
+  })
+})
+
 describe('chat log', () => {
   async function log(banned: string[] = []) {
     const { identity } = await generateIdentity()
