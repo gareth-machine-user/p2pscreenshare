@@ -1,6 +1,7 @@
 import { wallClock } from '../net/clock'
 import { fromBase64, type StreamInfo } from '../proto/messages'
 import { AudioPlayer } from './audio'
+import { closeCodec } from './codecs'
 import { DecodeScheduler, PlayoutClock } from './jitterBuffer'
 import { RebuildBackoff } from './rebuildBackoff'
 import type { AssembledFrame } from './reassembler'
@@ -116,12 +117,7 @@ export class Player {
   }
 
   private rebuildDecoder(info: StreamInfo, prev: StreamInfo | null): void {
-    try {
-      // A decoder that reported an error is already closed, and closing it again throws.
-      if (this.decoder && this.decoder.state !== 'closed') this.decoder.close()
-    } catch {
-      // Closing is best effort: the decoder is being replaced either way.
-    }
+    closeCodec(this.decoder)
     this.renderAtByTs.clear()
     if (prev && prev.epoch !== info.epoch) this.retiredEpoch = prev.epoch
     // Frames of this epoch that arrived before its StreamInfo (often including its keyframe).
@@ -276,11 +272,7 @@ export class Player {
     this.renderQueue.forEach((p) => p.frame.close())
     this.lastRendered?.close()
     this.early = []
-    try {
-      this.decoder?.close()
-    } catch {
-      // An errored decoder is already closed, and closing it again throws.
-    }
+    closeCodec(this.decoder)
     this.audio.close()
   }
 }

@@ -3,6 +3,7 @@ import { sleep } from '../net/ticker'
 import { NO_REF } from '../proto/framing'
 import { toBase64, type StreamInfo } from '../proto/messages'
 import { frameReader } from './capture'
+import { closeCodec } from './codecs'
 import type { EncodedFrame } from './packetizer'
 import { bitsPerPixel, HIGH_BPP } from './quality'
 
@@ -291,11 +292,7 @@ export class VideoPipeline {
       } catch {
         // Flushing fails on an encoder that errored or closed; its pending output is lost anyway.
       }
-      try {
-        if (old.state !== 'closed') old.close()
-      } catch {
-        // Closing is best effort: the old encoder is being replaced either way.
-      }
+      closeCodec(old)
     }
     this.repick = false
     let config: VideoEncoderConfig
@@ -328,11 +325,7 @@ export class VideoPipeline {
     } catch (err) {
       this.encoder = null
       this.failedAt = wallClock()
-      try {
-        encoder.close()
-      } catch {
-        // A failed configure may already have closed it; the configure error is what matters.
-      }
+      closeCodec(encoder)
       throw err
     }
   }
@@ -390,11 +383,7 @@ export class VideoPipeline {
   stop(): void {
     this.stopped = true
     this.reader?.stop()
-    try {
-      this.encoder?.close()
-    } catch {
-      // Already closed (e.g. after an encoder error): nothing left to release.
-    }
+    closeCodec(this.encoder)
   }
 }
 

@@ -3,17 +3,14 @@ import { NO_REF } from '../proto/framing'
 import type { StreamInfo } from '../proto/messages'
 import type { EncodedFrame } from './packetizer'
 import { Playout, type PlayoutStats } from './playout'
+import { closeCodec } from './codecs'
 import { RebuildBackoff } from './rebuildBackoff'
 import { AUDIO_FRAME_MS, AUDIO_KBPS } from '../session/capacity'
 
 type AudioInfo = NonNullable<StreamInfo['audio']>
 
-/** Minimum time between AudioDecoder rebuilds after errors. */
-const REBUILD_INTERVAL_MS = 1000
 /** Most encoded audio frames held for decoding (about 5 s). */
 const MAX_PENDING = Math.ceil(5000 / AUDIO_FRAME_MS)
-/** Fallback playback only: drift past which chunks re-sync to their targets, s. */
-const RESYNC_S = 0.12
 
 /** AudioWorklet module: the Playout class (stringified) behind a processor that feeds it. */
 const WORKLET_SRC = `
@@ -37,6 +34,15 @@ class P2PPlayout extends AudioWorkletProcessor {
 }
 registerProcessor('p2p-playout', P2PPlayout)
 `
+
+/** Copies decoded audio out as one float32 array per channel. */
+function planesOf(data: AudioData): Float32Array<ArrayBuffer>[] {
+  return Array.from({ length: data.numberOfChannels }, (_, ch) => {
+    const plane = new Float32Array(data.numberOfFrames)
+    data.copyTo(plane, { planeIndex: ch, format: 'f32-planar' })
+    return plane
+  })
+}
 
 /** An Opus config for audio at this rate and channel count; throws if Opus isn't supported. */
 async function opusConfig(sampleRate: number, numberOfChannels: number): Promise<AudioEncoderConfig> {
@@ -141,22 +147,14 @@ export class AudioPipeline {
     } catch (err) {
       console.error('AudioEncoder configure failed', err)
       this.encoder = null
-      try {
-        encoder.close()
-      } catch {
-        // A failed configure may already have closed it.
-      }
+      closeCodec(encoder)
     }
   }
 
   stop(): void {
     this.stopped = true
     void this.reader?.cancel().catch(() => {})
-    try {
-      this.encoder?.close()
-    } catch {
-      // Already closed (e.g. after an encoder error): nothing left to release.
-    }
+    closeCodec(this.encoder)
   }
 }
 
@@ -195,7 +193,8 @@ export class AudioPlayer {
     underruns: 0,
   }
   private info: AudioInfo | null = null
-  private lastBuildAt = -Infinity
+  /** Paces decoder rebuilds after errors: at most one a second. */
+  private rebuilds = new RebuildBackoff(1000, 1000)
 
   /** Must be called from a user gesture (autoplay policy). */
   enable(): void {
@@ -260,7 +259,7 @@ export class AudioPlayer {
     if (key === this.configured || typeof AudioDecoder === 'undefined') return
     this.configured = key
     this.info = info
-    this.lastBuildAt = -Infinity
+    this.rebuilds = new RebuildBackoff(1000, 1000)
     this.pending.clear()
     this.nextSeq = null
     this.node?.port.postMessage({ reset: true })
@@ -271,9 +270,7 @@ export class AudioPlayer {
   private build(): boolean {
     const info = this.info
     if (!info) return false
-    const now = wallClock()
-    if (now - this.lastBuildAt < REBUILD_INTERVAL_MS) return false
-    this.lastBuildAt = now
+    if (!this.rebuilds.tryNow(wallClock())) return false
     this.closeDecoder()
     // Frames still inside a failed decoder never come out: their play times must go too, or every
     // later chunk would be scheduled against the wrong one.
@@ -297,11 +294,7 @@ export class AudioPlayer {
   }
 
   private closeDecoder(): void {
-    try {
-      if (this.decoder && this.decoder.state !== 'closed') this.decoder.close()
-    } catch {
-      // Closing is best effort: the decoder is being discarded either way.
-    }
+    closeCodec(this.decoder)
     this.decoder = null
   }
 
@@ -368,7 +361,7 @@ export class AudioPlayer {
     const duration = data.numberOfFrames / data.sampleRate
     // Back to back with what is already scheduled, unless that drifted far from the target.
     let start = this.nextTime
-    if (this.nextTime < now || Math.abs(target - this.nextTime) > RESYNC_S) {
+    if (this.nextTime < now || Math.abs(target - this.nextTime) > Playout.RESYNC_S) {
       if (this.nextTime > 0) this.stats.resyncs++
       start = Math.max(target, now + 0.01)
     }
@@ -378,11 +371,7 @@ export class AudioPlayer {
       return
     }
     const buf = ctx.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate)
-    for (let ch = 0; ch < data.numberOfChannels; ch++) {
-      const plane = new Float32Array(data.numberOfFrames)
-      data.copyTo(plane, { planeIndex: ch, format: 'f32-planar' })
-      buf.copyToChannel(plane, ch)
-    }
+    planesOf(data).forEach((plane, ch) => buf.copyToChannel(plane, ch))
     data.close()
     const src = ctx.createBufferSource()
     src.buffer = buf
@@ -398,12 +387,7 @@ export class AudioPlayer {
       data.close()
       return
     }
-    const planes: Float32Array[] = []
-    for (let ch = 0; ch < data.numberOfChannels; ch++) {
-      const plane = new Float32Array(data.numberOfFrames)
-      data.copyTo(plane, { planeIndex: ch, format: 'f32-planar' })
-      planes.push(plane)
-    }
+    const planes = planesOf(data)
     const rate = data.sampleRate
     if (target + data.numberOfFrames / rate < now) this.stats.late++
     data.close()

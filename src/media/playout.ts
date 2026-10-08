@@ -1,6 +1,6 @@
 // Continuous audio playout, run inside an AudioWorklet (see audio.ts).
 //
-// Decoded Opus chunks (~20 ms each) go into one ring buffer, and a single resampler reads it out
+// Decoded Opus chunks (one per AUDIO_FRAME_MS frame, 40 ms) go into one ring buffer, and a single resampler reads it out
 // at the output device's rate. Playing each chunk as its own AudioBufferSourceNode clicks: every
 // buffer is resampled separately (44.1 kHz audio on a 48 kHz device has edge artefacts at each
 // boundary), and drift is fixed by jumping. Here there are no chunk boundaries, drift is fixed by
@@ -26,6 +26,11 @@ export interface PlayoutStats {
 }
 
 export class Playout {
+  /** Drift beyond which playback re-syncs to the target timeline, s (also audio.ts's fallback path). */
+  static get RESYNC_S(): number {
+    return 0.12
+  }
+
   outRate: number
   /** Output samples over which a fade runs (5 ms). */
   fadeLen: number
@@ -59,7 +64,7 @@ export class Playout {
   constructor(outRate: number) {
     this.outRate = outRate
     this.fadeLen = Math.max(1, Math.round(outRate * 0.005))
-    this.resyncS = 0.12
+    this.resyncS = Playout.RESYNC_S
     this.maxSkew = 0.01
     this.skewGain = 0.5
     this.stats = { resyncs: 0, underruns: 0, droppedSamples: 0, bufferedMs: 0, errorMs: 0, silentMs: 0 }
