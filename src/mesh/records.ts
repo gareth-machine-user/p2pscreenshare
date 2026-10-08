@@ -2,6 +2,7 @@
 // Pure (no DOM, no timers) so it can be unit tested.
 import type { Envelope, Typed } from './envelope'
 import type { StreamInfo } from '../proto/messages'
+import { MAX_PIECES } from '../proto/framing'
 
 /** A channel: one encoding of one publisher's stream, announced in the publisher's record. */
 export interface ChannelAnnouncement {
@@ -49,9 +50,6 @@ export interface MemberRecord extends Typed {
   left?: boolean
 }
 
-/** Stripes are numbered in one byte of the fragment header. */
-const MAX_STRIPES = 256
-
 const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x)
 const isStr = (x: unknown): x is string => typeof x === 'string'
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x)
@@ -76,7 +74,7 @@ function isChannelAnnouncement(x: unknown): x is ChannelAnnouncement {
     isCount(x.k) &&
     (x.k as number) >= 1 &&
     isCount(x.m) &&
-    (x.k as number) + (x.m as number) <= MAX_STRIPES &&
+    (x.k as number) + (x.m as number) <= MAX_PIECES &&
     isNum(x.kbps) &&
     // Positive: watchers divide by it, and a NaN offer would serialize as null and fail this check
     // in every watcher's own record.
