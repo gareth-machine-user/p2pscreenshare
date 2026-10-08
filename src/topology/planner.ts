@@ -42,6 +42,7 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
     parents: {},
     depth: {},
     overcommitted: 0,
+    unattached: 0,
     rootOver: [],
   }
   for (const p of peers) {
@@ -56,7 +57,7 @@ export function plan(peersIn: PlannerPeer[], current: Topology, cfg: PlannerConf
   // 6. Diff against the current topology.
   const changes = diffTopology(peers, current, ctx.parents, S)
 
-  return { topology: { parents: ctx.parents, homes }, changes, depth: ctx.depth, overcommitted: ctx.overcommitted, slots }
+  return { topology: { parents: ctx.parents, homes }, changes, depth: ctx.depth, overcommitted: ctx.overcommitted, unattached: ctx.unattached, slots }
 }
 
 /** State shared by the planning steps. */
@@ -74,6 +75,8 @@ interface PlanContext {
   depth: Record<string, number[]>
   /** Attachments that exceed some parent's estimated capacity. */
   overcommitted: number
+  /** Placements that found no parent at all. */
+  unattached: number
   /** Attachments that overcommit the root (the publisher), in placement order. */
   rootOver: { peer: string; stripe: number }[]
 }
@@ -135,7 +138,35 @@ function assignHomes(
     }
     if (best) homes[best.id].push(s)
   }
+
+  rehomeIntoEmptyStripes(eligible, homes, slots, S)
   return homes
+}
+
+/**
+ * First homes are sticky, so when every relay of a stripe leaves (and no relay can take it as an
+ * extra home), that stripe would have no relay until a newcomer arrives: its viewers hang off the
+ * root, are shed to k stripes, and lose all parity. Instead, a stripe with no relay at all takes one
+ * from the stripe with the most relays (if that leaves it at least one): its weakest single-home
+ * relay, ties by id. A no-op whenever every stripe has a relay.
+ */
+function rehomeIntoEmptyStripes(eligible: PlannerPeer[], homes: Record<string, number[]>, slots: Record<string, number>, S: number): void {
+  const covered = (s: number) => eligible.some((p) => homes[p.id].includes(s))
+  for (let s = 0; s < S; s++) {
+    if (covered(s)) continue
+    const count = new Array<number>(S).fill(0)
+    for (const p of eligible) for (const h of homes[p.id]) count[h]++
+    let donor = -1
+    for (let t = 0; t < S; t++) if (count[t] >= 2 && (donor < 0 || count[t] > count[donor])) donor = t
+    if (donor < 0) return
+    let pick: PlannerPeer | null = null
+    for (const p of eligible) {
+      const h = homes[p.id]
+      if (h.length !== 1 || h[0] !== donor) continue
+      if (!pick || slots[p.id] < slots[pick.id] || (slots[p.id] === slots[pick.id] && cmp(p.id, pick.id) < 0)) pick = p
+    }
+    if (pick) homes[pick.id] = [s]
+  }
 }
 
 /** A relay's slots in one of its home stripes: split evenly, the remainder to its lowest stripes. */
@@ -216,26 +247,32 @@ class StripeBuilder {
     let chosen = this.keepable(p, best) ?? best
     if (chosen === null) {
       chosen = this.overcommitTarget(p)
-      if (chosen !== null) this.ctx.overcommitted++
-      if (chosen === this.ctx.cfg.hostId) this.ctx.rootOver.push({ peer: p.id, stripe: this.s })
+      // A starved relay with free slots is a last resort, but not an overcommit.
+      if (chosen !== null && (this.remaining.get(chosen) ?? 0) <= 0) {
+        this.ctx.overcommitted++
+        if (chosen === this.ctx.cfg.hostId) this.ctx.rootOver.push({ peer: p.id, stripe: this.s })
+      }
+      if (chosen === null) this.ctx.unattached++
     }
     this.attach(p, chosen)
   }
 
   /**
    * No free capacity anywhere: stay with the current parent rather than shuffling overcommitted
-   * children, else take the relay least loaded relative to its capacity.
+   * children, else take the relay least loaded relative to its capacity. Starved relays (receiving
+   * nothing on this stripe) only when no other relay can take the peer.
    */
   private overcommitTarget(p: PlannerPeer): string | null {
     const cur = this.currentParent(p)
     if (cur !== null && this.nodeDepth.has(cur) && this.canLink(p, cur)) return cur
     let chosen: string | null = null
-    let leastRatio = Infinity
+    let bestKey: [number, number] = [Infinity, Infinity]
+    // placedRelays is in placement order, which is deterministic; the first of equal keys wins.
     for (const id of this.placedRelays) {
       if (!this.canLink(p, id)) continue
-      const ratio = (this.load.get(id)! + 1) / Math.max(this.capOf.get(id)!, 0.5)
-      if (ratio < leastRatio) {
-        leastRatio = ratio
+      const key: [number, number] = [this.starved(id) ? 1 : 0, (this.load.get(id)! + 1) / Math.max(this.capOf.get(id)!, 0.5)]
+      if (key[0] < bestKey[0] || (key[0] === bestKey[0] && key[1] < bestKey[1])) {
+        bestKey = key
         chosen = id
       }
     }

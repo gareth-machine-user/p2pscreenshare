@@ -55,6 +55,11 @@ export interface PlanResult {
   depth: Record<string, number[]>
   /** Attachments that exceed some parent's estimated capacity. */
   overcommitted: number
+  /**
+   * (peer, stripe) pairs left without a parent because no placed relay (nor the root) could link
+   * to the peer. Stripes shed on purpose (parity covers them) are not counted.
+   */
+  unattached: number
   /** Children slots per peer, across its home stripes. */
   slots: Record<string, number>
 }
@@ -65,13 +70,6 @@ export function emptyTopology(): Topology {
 
 export function stripeCount(c: Pick<PlannerConfig, 'k' | 'm'>): number {
   return c.k + c.m
-}
-
-/** Children of `id` in `stripe`, derived from the parent map. */
-export function childrenOf(t: Topology, id: string, stripe: number): string[] {
-  const out: string[] = []
-  for (const [peer, ps] of Object.entries(t.parents)) if (ps[stripe] === id) out.push(peer)
-  return out
 }
 
 /**

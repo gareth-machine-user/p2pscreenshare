@@ -50,13 +50,26 @@ async function ensureServer(port: number, cmd: string[]): Promise<void> {
 class Page {
   private ws: WebSocket
   private seq = 0
-  private waiting = new Map<number, (v: any) => void>()
+  private waiting = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; method: string }>()
+  private closed: Error | null = null
 
   private constructor(ws: WebSocket) {
     this.ws = ws
     ws.onmessage = (e) => {
       const msg = JSON.parse(String(e.data))
-      if (msg.id !== undefined) this.waiting.get(msg.id)?.(msg)
+      if (msg.id === undefined) return
+      const w = this.waiting.get(msg.id)
+      if (!w) return
+      this.waiting.delete(msg.id)
+      // A CDP error reply (unknown target, bad params, ...) has `error` and no `result`.
+      if (msg.error) w.reject(new Error(`CDP ${w.method}: ${msg.error.message ?? JSON.stringify(msg.error)}`))
+      else w.resolve(msg)
+    }
+    // The browser or target went away: fail whatever is still waiting instead of hanging.
+    ws.onclose = () => {
+      this.closed = new Error('CDP connection closed')
+      for (const w of this.waiting.values()) w.reject(this.closed)
+      this.waiting.clear()
     }
   }
 
@@ -67,9 +80,10 @@ class Page {
   }
 
   send(method: string, params: object = {}): Promise<any> {
+    if (this.closed) return Promise.reject(this.closed)
     const id = ++this.seq
-    return new Promise((resolve) => {
-      this.waiting.set(id, (m) => (this.waiting.delete(id), resolve(m)))
+    return new Promise((resolve, reject) => {
+      this.waiting.set(id, { resolve, reject, method })
       this.ws.send(JSON.stringify({ id, method, params }))
     })
   }
@@ -166,6 +180,7 @@ async function main(): Promise<void> {
     const r = await browserCdp.send('Target.createTarget', { url, ...(browserContextId ? { browserContextId } : {}) })
     const id = r.result.targetId
     const t = (await (await fetch(`${cdp}/json`)).json()).find((x: any) => x.id === id)
+    if (!t?.webSocketDebuggerUrl) throw new Error(`target ${id} for ${url} not listed by CDP`)
     return Page.connect(t.webSocketDebuggerUrl)
   }
   // The presenter in the default profile, the viewer in a separate (incognito-like) one: one profile

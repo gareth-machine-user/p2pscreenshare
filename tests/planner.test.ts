@@ -144,6 +144,27 @@ describe('planner', () => {
     checkInvariants(r, peers, cfg)
   })
 
+  it('counts peers no parent can take as unattached, but not stripes shed for parity', () => {
+    const cfg = config({ k: 1, m: 0, rootSlots: 1 })
+    const peers: PlannerPeer[] = [
+      { id: 'a', slots: 6, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'b', slots: 0, joinedAt: 1, failures: 0, avoid: ['a', HOST] },
+    ]
+    const r = plan(peers, emptyTopology(), cfg, 1000)
+    expect(r.topology.parents.b[0]).toBeNull()
+    expect(r.unattached).toBe(1)
+    // A stripe shed on purpose (see 'does not overload the publisher...') is not unattached.
+    const cfg2 = config({ k: 2, m: 1, rootSlots: 3 })
+    const peers2: PlannerPeer[] = [
+      { id: 'a', slots: 16, joinedAt: 0, failures: 0, avoid: [] },
+      { id: 'c', slots: 16, joinedAt: 1, failures: 0, avoid: [] },
+      ...Array.from({ length: 6 }, (_, i) => ({ id: `l${i}`, slots: 0, joinedAt: 2 + i, failures: 0, avoid: [] })),
+    ]
+    const r2 = plan(peers2, { parents: {}, homes: { a: [0], c: [2] } }, cfg2, 1000)
+    expect(Object.values(r2.topology.parents).some((ps) => ps.includes(null))).toBe(true)
+    expect(r2.unattached).toBe(0)
+  })
+
   it('new peers start as leaves until they have uptime', () => {
     const cfg = config({ minUptimeMsForRelay: 5000 })
     const peers = makePeers(10)
@@ -244,6 +265,61 @@ describe('planner', () => {
     expect(rootKids(1)).toBeLessThanOrEqual(1)
     // ...and everyone still gets at least k stripes.
     for (const p of peers) expect(r.topology.parents[p.id].filter((x) => x !== null).length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('moves a relay into a stripe whose relays all left, from the stripe with the most', () => {
+    const cfg = config({ k: 2, m: 1, rootSlots: 3 })
+    const peers = Array.from({ length: 9 }, (_, i): PlannerPeer => ({ id: `p${i}`, slots: 6 + i, joinedAt: i, failures: 0, avoid: [] }))
+    const r1 = plan(peers, emptyTopology(), cfg, 1000)
+    const gone = new Set(peers.filter((p) => r1.topology.homes[p.id][0] === 2).map((p) => p.id))
+    expect(gone.size).toBeGreaterThan(0)
+    const rest = peers.filter((p) => !gone.has(p.id))
+    const r2 = plan(rest, r1.topology, cfg, 2000)
+    checkInvariants(r2, rest, cfg)
+    const relaysIn = (s: number) => rest.filter((p) => r2.topology.homes[p.id].includes(s))
+    for (let s = 0; s < 3; s++) expect(relaysIn(s).length, `stripe ${s}`).toBeGreaterThan(0)
+    // Only one relay moved: the weakest of a stripe with the most relays.
+    const moved = rest.filter((p) => r2.topology.homes[p.id][0] !== r1.topology.homes[p.id][0])
+    expect(moved).toHaveLength(1)
+    const from = r1.topology.homes[moved[0].id][0]
+    expect(Math.min(...rest.filter((p) => r1.topology.homes[p.id][0] === from).map((p) => p.slots))).toBe(moved[0].slots)
+    // ...and it stays there.
+    expect(plan(rest, r2.topology, cfg, 3000).changes).toEqual([])
+  })
+
+  it('never moves a relay between stripes while every stripe has one', () => {
+    const cfg = config({ k: 2, m: 1, rootSlots: 3 })
+    // Lopsided but covered: stripe 0 has three relays, stripes 1 and 2 one each.
+    const current = { parents: {}, homes: { a: [0], b: [0], c: [0], d: [1], e: [2] } }
+    const peers = ['a', 'b', 'c', 'd', 'e'].map((id, i): PlannerPeer => ({ id, slots: 6, joinedAt: i, failures: 0, avoid: [] }))
+    const r1 = plan(peers, current, cfg, 1000)
+    expect(r1.topology.homes).toEqual(current.homes)
+    expect(plan(peers, r1.topology, cfg, 2000).changes).toEqual([])
+  })
+
+  it('does not hand new children to a starved relay while a healthy one can take them', () => {
+    const cfg = config({ k: 1, m: 0, rootSlots: 1 })
+    const P = (id: string, slots: number, joinedAt: number, starved?: number[]): PlannerPeer => ({ id, slots, joinedAt, failures: 0, avoid: [], starved })
+    // a (starved, 3 slots) and b (healthy, 2 slots) relay; the root and b are full.
+    const current = { parents: { a: ['H'], b: ['a'], x: ['b'], y: ['b'] }, homes: { a: [0], b: [0] } }
+    const peers = [P('a', 3, 0, [0]), P('b', 2, 1), P('x', 0, 2), P('y', 0, 3), P('n', 0, 4)]
+    const r = plan(peers, current, cfg, 1000)
+    // n overcommits healthy b rather than joining a, which receives nothing.
+    expect(r.topology.parents.n[0]).toBe('b')
+    expect(r.overcommitted).toBe(1)
+  })
+
+  it('takes a starved relay with free slots as a last resort, without counting an overcommit', () => {
+    const cfg = config({ k: 1, m: 0, rootSlots: 1 })
+    // n can't reach the (full) root, and a, the only relay, is starved.
+    const current = { parents: { a: ['H'] }, homes: { a: [0] } }
+    const peers: PlannerPeer[] = [
+      { id: 'a', slots: 3, joinedAt: 0, failures: 0, avoid: [], starved: [0] },
+      { id: 'n', slots: 0, joinedAt: 2, failures: 0, avoid: ['H'] },
+    ]
+    const r = plan(peers, current, cfg, 1000)
+    expect(r.topology.parents.n[0]).toBe('a')
+    expect(r.overcommitted).toBe(0)
   })
 
   it('never sheds a relay from the stripe it feeds its children', () => {
@@ -349,7 +425,30 @@ describe('planner', () => {
       const int = (n: number) => Math.floor(rnd() * n)
       const k = 1 + int(3)
       const m = int(3)
-      const cfg = config({ k, m, rootSlots: k + m + int(4), maxFanout: 2 + int(8), switchGain: 1 })
+      // Half the seeds also exercise RTT tie-breaks, lateness penalties and starved relays.
+      const extras = seed % 2 === 0
+      const rttOf = new Map<string, number>()
+      const lateOf = new Map<string, number>()
+      const rtt = (a: string, b: string) => {
+        const key = a < b ? `${a}|${b}` : `${b}|${a}`
+        if (!rttOf.has(key)) rttOf.set(key, int(5) === 0 ? -1 : 5 + int(200))
+        const v = rttOf.get(key)!
+        return v < 0 ? null : v
+      }
+      const lateness = (parent: string, stripe: number) => {
+        const key = `${parent}:${stripe}`
+        if (!lateOf.has(key)) lateOf.set(key, int(4) === 0 ? 100 + int(300) : 0)
+        return lateOf.get(key)!
+      }
+      const S = k + m
+      const cfg = config({
+        k,
+        m,
+        rootSlots: k + m + int(4),
+        maxFanout: 2 + int(8),
+        switchGain: 1,
+        ...(extras ? { rtt, lateness } : {}),
+      })
       const n = 1 + int(25)
       const ids = Array.from({ length: n }, (_, i) => `p${i}`)
       const peers: PlannerPeer[] = ids.map((id, i) => ({
@@ -358,13 +457,19 @@ describe('planner', () => {
         joinedAt: i,
         failures: int(3),
         avoid: ids.filter((o) => o !== id && rnd() < 0.15),
+        ...(extras ? { starved: [...Array(S).keys()].filter(() => rnd() < 0.2) } : {}),
       }))
       const r1 = plan(peers, emptyTopology(), cfg, 1000)
       checkInvariants(r1, peers, cfg, false)
+      // Pure: the same inputs give the same plan.
+      expect(plan(peers, emptyTopology(), cfg, 1000)).toEqual(r1)
       // Replan after some churn on top of the previous topology.
       const next = peers.filter(() => rnd() > 0.2)
       const r2 = plan(next, r1.topology, cfg, 2000)
       checkInvariants(r2, next, cfg, false)
+      // Unattached placements are exactly the null parents not shed on purpose: never more than all nulls.
+      const nulls = next.reduce((a, p) => a + r2.topology.parents[p.id].filter((x) => x === null).length, 0)
+      expect(r2.unattached).toBeLessThanOrEqual(nulls)
     }
   })
 })

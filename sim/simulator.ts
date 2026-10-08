@@ -15,7 +15,7 @@
 // - One-way hop latency = access(a) + access(b) + 10ms; serialization = piece bits / per-child rate.
 // - A frame is decodable once any k of k+m stripes arrive -> latency = k-th fastest stripe path.
 // - When a peer leaves, its descendants lose that stripe for REPAIR_MS (detect + replan + relink).
-//   A viewer stalls while it is missing more than m stripes.
+//   A viewer stalls while it is missing more than m stripes (in an outage, or with no parent at all).
 // - Overloaded parents (children * stripe rate > true capacity) degrade their subtree.
 // - simulateLossy() adds viewers with a bad downlink (LossyOptions) and runs the publisher's
 //   complaint and keyframe-request handling on them, old or new policy.
@@ -32,6 +32,7 @@ import {
   LATE_PARENT_AVOID_MS,
   judgeComplaints,
   LateParentTracker,
+  PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
   type Accusation,
   type LatenessSample,
@@ -62,7 +63,6 @@ const LATE_EXTRA_MS = 250
 
 // Lossy viewers (simulateLossy). Subscriber-side constants mirror session/subscription.ts,
 // publisher-side ones session/channelPublisher.ts.
-const PARENT_GRACE_MS = 3000
 const REATTACH_COOLDOWN_MS = 4000
 const KEY_REQUEST_INTERVAL_MS = 500
 const STATS_INTERVAL_MS = 2000
@@ -602,7 +602,7 @@ class Simulation {
   /** Stall, quality and latency of every settled viewer for one tick. */
   private observe(now: number): void {
     const { k, m } = this.o
-    // Load per parent per stripe.
+    // Children per parent, across all stripes (its whole uplink is shared between them).
     const load = new Map<string, number>()
     for (const ps of Object.values(this.topo.parents)) {
       ps.forEach((par) => par && load.set(par, (load.get(par) ?? 0) + 1))
@@ -613,18 +613,6 @@ class Simulation {
       if (now - p.joinedAt < 3000 + this.o.gossipMs) continue // still joining
       if (this.lossy.has(p.id)) continue // measured separately
       this.viewerTicks++
-      const o = this.outage.get(p.id)
-      const missing = o ? o.filter((t) => t > now).length : 0
-      if (missing > m) {
-        this.stallTicks++
-        if (!this.stalled.has(p.id)) {
-          this.stalled.add(p.id)
-          this.stallEvents++
-        }
-      } else {
-        this.stalled.delete(p.id)
-      }
-
       const stripeLat: number[] = []
       const stripeQuality: number[] = []
       for (let s = 0; s < this.S; s++) {
@@ -649,6 +637,20 @@ class Simulation {
         this.maxDepth = Math.max(this.maxDepth, depth)
         stripeLat.push(lat)
         stripeQuality.push(Math.min(1, quality))
+      }
+      // Missing: in an outage, or not attached to the tree at all (e.g. shed to k stripes by the
+      // planner, which leaves no parity to absorb the next loss).
+      const o = this.outage.get(p.id)
+      let missing = 0
+      for (let s = 0; s < this.S; s++) if ((o?.[s] ?? -Infinity) > now || !Number.isFinite(stripeLat[s])) missing++
+      if (missing > m) {
+        this.stallTicks++
+        if (!this.stalled.has(p.id)) {
+          this.stalled.add(p.id)
+          this.stallEvents++
+        }
+      } else {
+        this.stalled.delete(p.id)
       }
       stripeLat.sort((a, b) => a - b)
       stripeQuality.sort((a, b) => b - a)
