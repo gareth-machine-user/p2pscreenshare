@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CapacityModel, FROZEN_LAG_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
-import { BitrateController, DOWN_GAP_MS, rateTarget, TARGET_SHARE, upperMedian, videoKbpsForWire, type RateInputs } from '../src/session/congestion'
+import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, rateTarget, TARGET_SHARE, upperMedian, videoKbpsForWire, type RateInputs } from '../src/session/congestion'
 import { LINK_BUFFER_HIGH } from '../src/net/link'
 
 // k=4, m=1 with audio: every direct child gets one full copy, all 5 stripes.
@@ -289,5 +289,65 @@ describe('estimator and controller, end to end', () => {
   it('never climbs above what the audience can relay', () => {
     const r = simulate({ seconds: 60, uplink: () => 100_000, link: () => 100_000, audienceKbps: 7000 })
     expect(Math.max(...between(r.rates, 5, 60))).toBe(7000)
+  })
+})
+
+describe('auto quality (lower automatically)', () => {
+  /**
+   * PeerSession every 2 s: the Auto quality cap, then the bitrate target and controller, with
+   * plenty of uplink. `limitedAt(t)` is the publisher's feasibility verdict at t seconds.
+   */
+  function run(seconds: number, auto: boolean, limitedAt: (t: number) => { feasibleKbps: number } | null) {
+    const cap = new AudienceCap()
+    const ctl = new BitrateController()
+    let kbps = QUALITY
+    const rates: number[] = []
+    for (let t = 0; t <= seconds; t += 2) {
+      const now = t * 1000
+      const limited = limitedAt(t)
+      cap.step(now, auto, limited, QUALITY)
+      const target = rateTarget({ ...base, uplinkKbps: 1e6, audienceKbps: audienceLimit(auto ? cap.kbps : null, limited, kbps) })
+      const next = ctl.step(now, kbps, target)
+      if (next !== null) kbps = applyRate(next, QUALITY)
+      rates.push(kbps)
+    }
+    return rates
+  }
+  const at = (rates: number[], t: number) => rates[t / 2]
+
+  it('cuts to what the audience carries, and returns to the chosen quality once it carries more', () => {
+    // Short from 10 s to 60 s (a slow viewer), then fine again (it left).
+    const rates = run(300, true, (t) => (t >= 10 && t < 60 ? { feasibleKbps: 4000 } : null))
+    expect(at(rates, 8)).toBe(QUALITY)
+    expect(at(rates, 20)).toBe(4000)
+    expect(at(rates, 58)).toBe(4000)
+    // Held for AUDIENCE_LIFT_MS after the audience recovers, then back up at the controller's pace.
+    expect(at(rates, 60 + AUDIENCE_LIFT_MS / 1000 - 2)).toBe(4000)
+    expect(at(rates, 300)).toBe(QUALITY)
+  })
+
+  it('without Auto quality it never cuts, only stops climbing', () => {
+    const rates = run(60, false, (t) => (t >= 10 ? { feasibleKbps: 4000 } : null))
+    expect(rates.every((r) => r === QUALITY)).toBe(true)
+  })
+
+  it('cuts at most once per gap, each time to the new verdict', () => {
+    const cap = new AudienceCap()
+    expect(cap.step(0, true, { feasibleKbps: 8000 }, QUALITY)).toBe(8000)
+    expect(cap.step(2000, true, { feasibleKbps: 6000 }, QUALITY)).toBe(8000)
+    expect(cap.step(AUDIENCE_CUT_GAP_MS, true, { feasibleKbps: 6000 }, QUALITY)).toBe(6000)
+    // A verdict above the cap, or the chosen quality, changes nothing.
+    expect(cap.step(2 * AUDIENCE_CUT_GAP_MS, true, { feasibleKbps: 9000 }, QUALITY)).toBe(6000)
+    expect(new AudienceCap().step(0, true, { feasibleKbps: QUALITY + 1000 }, QUALITY)).toBeNull()
+    // Turning Auto quality off drops the cap at once.
+    expect(cap.step(2 * AUDIENCE_CUT_GAP_MS + 2000, false, { feasibleKbps: 6000 }, QUALITY)).toBeNull()
+  })
+
+  it('a short dip in the audience does not lift the cap', () => {
+    const cap = new AudienceCap()
+    cap.step(0, true, { feasibleKbps: 5000 }, QUALITY)
+    cap.step(10_000, true, null, QUALITY)
+    cap.step(20_000, true, { feasibleKbps: 5000 }, QUALITY)
+    expect(cap.step(20_000 + AUDIENCE_LIFT_MS - 1, true, null, QUALITY)).toBe(5000)
   })
 })

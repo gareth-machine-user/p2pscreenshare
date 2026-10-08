@@ -21,12 +21,12 @@ import { RateWindow, round1 } from './rates'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
 import { CapacityModel, FROZEN_LAG_MS, linkWindow, rebalanceWeights, splitBudget, stripeKbpsFor, type ConnWindow, type LinkSnap } from './capacity'
-import { BitrateController, rateTarget, type RateTarget } from './congestion'
+import { AudienceCap, audienceLimit, BitrateController, rateTarget, type RateTarget } from './congestion'
 import type { ChannelPublisher, PublisherContext } from './channelPublisher'
 import { PublishedStream, type ShareOptions } from './publishedStream'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
-import { liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
+import { AutoFallback, liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { HeadroomProbe } from './headroom'
 import { after, every, takeMainThreadLag } from '../net/ticker'
 import type { Buffering } from '../media/jitterBuffer'
@@ -94,8 +94,6 @@ export interface PublishRequest {
 
 /** Budget weights shift towards channels with a deficit this often. */
 const REBALANCE_MS = 10_000
-/** Auto quality: wait this long between automatic restarts of a stream. */
-const AUTO_RESTART_GAP_MS = 30_000
 /** Headroom discovery (session/headroom.ts) runs this often while no media connection is backlogged... */
 const HEADROOM_EVERY_MS = 30_000
 /** ...or this often while the measured capacity holds the bitrate below the chosen quality. */
@@ -110,11 +108,6 @@ const ENCODER_BEHIND_FPS = 3
 const RTT_QUEUE_SHOWN_MS = 40
 /** Each connection's getStats() (path RTT, wire rates) is polled this often. */
 const LINK_STATS_MS = 2000
-
-/** Auto quality falls back to the preview when the full stream stalls this long... */
-const AUTO_STALL_MS = 6000
-/** ...and returns once it plays smoothly again for this long. */
-const AUTO_RECOVER_MS = 4000
 
 /** Uplink stats (the capacity windows, and the bitrate that follows them) run this often. */
 const UPLINK_SAMPLE_MS = 2000
@@ -206,6 +199,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private lastQueueDelay = { sum: 0, n: 0 }
   private reconcileTimer: (() => void) | null = null
   private timers: (() => void)[] = []
+  /** Set by leave(): no more reconciles (they would re-create subscriptions). */
+  private left = false
   private topoWatching = new Set<number>()
   private rateCtl = new BitrateController()
   /** The bitrate the presenter's stream should run at, and what limits it (session/congestion.ts). */
@@ -218,10 +213,10 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   /** Per open connection (mesh link or lane), refreshed by openConns(). */
   private connRecs = new Map<PairConn, ConnRecord>()
   private pollingStats = false
-  private lastAutoRestart = -Infinity
-  private stallSince: number | null = null
-  private smoothSince: number | null = null
-  private lastStageDecoded = 0
+  /** Auto quality's cap for the presenter's stream, apart from the chosen quality (session/congestion.ts). */
+  private audienceCap = new AudienceCap()
+  /** Auto quality's stall detector for the stage stream (session/stage.ts). */
+  private autoStall = new AutoFallback()
 
   constructor(opts: PeerSessionOptions) {
     this.selfId = opts.identity.id
@@ -284,6 +279,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   async start(): Promise<void> {
     await this.mesh.start()
+    // Left while the mesh was starting: start no timers that leave() could no longer cancel.
+    if (this.left) return
     this.timers.push(every(UPLINK_SAMPLE_MS, () => this.sampleUplink()))
     this.timers.push(every(HEADROOM_CHECK_MS, () => this.maybeDiscover()))
     this.timers.push(every(AUTO_QUALITY_CHECK_MS, () => this.checkAutoQuality()))
@@ -340,6 +337,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   private scheduleReconcile(delay = 50): void {
+    // After leave(): a reconcile would re-create subscriptions that nobody closes.
+    if (this.left) return
     if (this.reconcileTimer !== null) {
       if (delay > 0) return
       this.reconcileTimer()
@@ -361,6 +360,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
    * live (the tile rail). A presenter sees its own capture locally.
    */
   private reconcile(): void {
+    if (this.left) return
     this.rebuildChannels()
     const plan = planStage({
       selfId: this.selfId,
@@ -400,37 +400,17 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.scheduleReconcile(0)
   }
 
-  /**
-   * Auto quality: show the preview while the full stream stalls, and go back once it recovers. A
-   * stall means frames stopped arriving: a static screen legitimately runs at a few fps (only
-   * the idle refresh), and treating that as a stall would flip the stage back and forth.
-   */
+  /** Auto quality: show the preview while the full stream stalls (session/stage.ts AutoFallback). */
   private checkAutoQuality(): void {
-    if (this.quality !== 'auto') return
-    const full = this.stageSub
-    const now = performance.now()
-    if (!full) {
-      this.stallSince = this.smoothSince = null
+    if (this.quality !== 'auto') {
+      this.autoStall.reset()
       return
     }
-    const decoded = full.player.stats.decodedFrames
-    const progressing = decoded > this.lastStageDecoded
-    this.lastStageDecoded = decoded
-    if (!this.autoFallback) {
-      this.stallSince = progressing ? null : (this.stallSince ?? now)
-      if (this.stallSince !== null && now - this.stallSince > AUTO_STALL_MS && decoded > 0) {
-        this.autoFallback = true
-        this.smoothSince = null
-        this.scheduleReconcile(0)
-      }
-    } else {
-      this.smoothSince = progressing ? (this.smoothSince ?? now) : null
-      if (this.smoothSince !== null && now - this.smoothSince > AUTO_RECOVER_MS) {
-        this.autoFallback = false
-        this.stallSince = null
-        this.scheduleReconcile(0)
-      }
-    }
+    const full = this.stageSub
+    const next = this.autoStall.step(performance.now(), full, full?.player.stats.decodedFrames ?? 0, this.autoFallback)
+    if (next === this.autoFallback) return
+    this.autoFallback = next
+    this.scheduleReconcile(0)
   }
 
   /** Where the stage picture comes from right now, and the player to draw (if remote). */
@@ -478,6 +458,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   cancelRequest(): void {
+    // Withdrawn at the owner too, or it could still allow a request nobody is waiting on.
+    if (this.requestState === 'waiting') this.sendTo(this.ownerId, { t: 'publish-cancel' })
     this.requestState = 'idle'
     this.onChange()
   }
@@ -512,9 +494,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   async setPolicy(policy: PublishPolicy): Promise<void> {
     if (!this.isOwner) return
-    await this.mesh.updateAuth((doc) => setPolicy(doc, policy))
+    // 'deny-all' and 'allow-all' set the policy in the same auth update that answers the pending
+    // requests: one version, one gossip round.
     if (policy === 'closed') await this.respond('', 'deny-all')
-    if (policy === 'open') await this.respond('', 'allow-all')
+    else if (policy === 'open') await this.respond('', 'allow-all')
+    else await this.mesh.updateAuth((doc) => setPolicy(doc, policy))
   }
 
   private onAuthChange(): void {
@@ -549,6 +533,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     if (!this.canShare) throw new Error('You need the owner’s permission to share.')
     this.revokedNotice = false
     this.stopSharing()
+    this.audienceCap = new AudienceCap()
     const stream = new PublishedStream(opts, this)
     stream.onEnded = () => {
       if (this.publishing === stream) this.stopSharing()
@@ -646,18 +631,14 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   /**
    * Auto quality for a presenter: when the audience's upload can't carry the stream for 10 s, the
-   * publisher's sharing controls warn, and with Auto quality the encoder drops to a bitrate it
-   * can carry (a brief blip).
+   * publisher's sharing controls warn, and with Auto quality the bitrate is capped at what it can
+   * carry (adaptBitrate applies it). The chosen quality stays the ceiling, so the cap lifts once
+   * the audience carries the stream again.
    */
   private checkAutoBitrate(): void {
-    const s = this.publishing
-    const full = s?.full
-    if (!s || !full?.limited || !this.autoBitrate) return
-    const now = performance.now()
-    if (now - this.lastAutoRestart < AUTO_RESTART_GAP_MS || full.limited.feasibleKbps >= s.opts.bitrateKbps) return
-    this.lastAutoRestart = now
-    // In place: re-capturing would need the user to pick the screen again.
-    void s.setQuality(full.limited.feasibleKbps)
+    const full = this.publishing?.full
+    if (!this.publishing || !full) return
+    this.audienceCap.step(performance.now(), this.autoBitrate, full.limited, this.publishing.ceilingKbps)
   }
 
   /**
@@ -682,7 +663,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     const t = rateTarget({
       chosenKbps: s.ceilingKbps,
       // The audience's relay slots: never climb past what they carry (Auto quality cuts to it).
-      audienceKbps: full.limited ? Math.max(full.limited.feasibleKbps, full.kbps) : null,
+      audienceKbps: audienceLimit(this.autoBitrate ? this.audienceCap.kbps : null, full.limited, full.kbps),
       uplinkKbps: this.capacity.uplinkKbps,
       directChildren: edges.children,
       peerKbps,
@@ -761,6 +742,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
         else if (this.policy === 'open') void this.respond(from, 'allow')
         else this.requests.set(from, { id: from, at: Date.now() })
         this.onChange()
+        return
+      case 'publish-cancel':
+        if (this.isOwner && this.requests.delete(from)) this.onChange()
         return
       case 'publish-deny':
         if (from === this.ownerId && this.requestState === 'waiting') this.requestState = 'denied'
@@ -1101,7 +1085,13 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   }
 
   async leave(): Promise<void> {
+    // First, so nothing below (stopSharing announces) or after (mesh callbacks until its links
+    // close) schedules a reconcile that would watch channels again.
+    this.left = true
+    this.reconcileTimer?.()
+    this.reconcileTimer = null
     this.timers.forEach((cancel) => cancel())
+    this.timers = []
     this.stopSharing()
     for (const sub of this.subs.values()) sub.close()
     this.subs.clear()

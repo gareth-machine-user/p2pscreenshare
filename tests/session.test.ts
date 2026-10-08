@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { liveStreamsOf, planStage, type StageChannel, type ViewQuality } from '../src/session/stage'
+import { AUTO_RECOVER_MS, AUTO_STALL_MS, AutoFallback, liveStreamsOf, planStage, type StageChannel, type ViewQuality } from '../src/session/stage'
 import { HeadroomProbe, PROBE_BUFFER, PROBE_CHUNK, PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeStarved } from '../src/session/headroom'
 import { deliveredKbps } from '../src/session/capacity'
 import type { LinkState, ProbeLink } from '../src/net/link'
@@ -76,6 +76,68 @@ describe('stage selection', () => {
   it('tolerates a stream without a preview', () => {
     const cs = [...stream('a', 1, false), ...stream('b', 2)]
     expect(plan(cs, 'a', 'preview').ids).toEqual([previewOf(cs, 'b')])
+  })
+})
+
+describe('auto quality fallback', () => {
+  const TICK = 500
+  /** Steps every TICK ms for `ms`, the counter advancing by `perTick` each step; returns the last state. */
+  function run(a: AutoFallback, t: { now: number; decoded: number }, sub: object, ms: number, perTick: number, fallback: boolean): boolean {
+    for (let end = t.now + ms; t.now < end; ) {
+      t.now += TICK
+      t.decoded += perTick
+      fallback = a.step(t.now, sub, t.decoded, fallback)
+    }
+    return fallback
+  }
+
+  it('falls back after a stall, and returns once the stream plays again', () => {
+    const a = new AutoFallback()
+    const sub = {}
+    const t = { now: 0, decoded: 0 }
+    expect(run(a, t, sub, 2000, 15, false)).toBe(false)
+    expect(run(a, t, sub, AUTO_STALL_MS - TICK, 0, false)).toBe(false)
+    expect(run(a, t, sub, 3 * TICK, 0, false)).toBe(true)
+    expect(run(a, t, sub, AUTO_RECOVER_MS, 15, true)).toBe(true)
+    expect(run(a, t, sub, 2 * TICK, 15, true)).toBe(false)
+  })
+
+  it('a new stage subscription starts from its own counter, not the previous one', () => {
+    const a = new AutoFallback()
+    const t = { now: 0, decoded: 0 }
+    // Long on stream A: its counter is far ahead.
+    run(a, t, {}, 60_000, 15, false)
+    // B's counter starts at 0 and is far behind A's, but it plays.
+    const b = {}
+    const tb = { now: t.now, decoded: 0 }
+    expect(run(a, tb, b, 3 * AUTO_STALL_MS, 15, false)).toBe(false)
+    // In fallback on a new subscription, progress brings it back.
+    const c = {}
+    const tc = { now: tb.now, decoded: 0 }
+    expect(run(a, tc, c, AUTO_RECOVER_MS + 2 * TICK, 15, true)).toBe(false)
+  })
+
+  it('forgets an old stall when quality leaves auto, or the fallback is changed elsewhere', () => {
+    const a = new AutoFallback()
+    const sub = {}
+    const t = { now: 0, decoded: 0 }
+    run(a, t, sub, 1000, 15, false)
+    run(a, t, sub, AUTO_STALL_MS - 1000, 0, false) // stalled, not yet long enough
+    a.reset() // quality changed away from auto, and back much later
+    t.now += 60_000
+    expect(run(a, t, sub, TICK, 0, false)).toBe(false)
+    // A fallback turned off elsewhere (a new selection) restarts the stall timer.
+    const u = { now: 0, decoded: 0 }
+    const b = new AutoFallback()
+    run(b, u, sub, AUTO_STALL_MS - 1000, 0, false)
+    expect(b.step((u.now += TICK), sub, u.decoded, true)).toBe(true)
+    expect(run(b, u, sub, TICK, 0, false)).toBe(false)
+  })
+
+  it('without a stage subscription, nothing changes', () => {
+    const a = new AutoFallback()
+    expect(a.step(10_000, null, 0, true)).toBe(true)
+    expect(a.step(20_000, null, 0, false)).toBe(false)
   })
 })
 

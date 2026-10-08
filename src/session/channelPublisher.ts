@@ -67,6 +67,9 @@ const STRIPE_SAMPLES = 40
 /** Audience upload counts as short when supply is below 90% of demand for this long. */
 const SHORT_SUPPLY_FOR_MS = 10_000
 
+/** Key of one (peer, stripe) pair in the per-edge maps below. */
+const edgeKey = (peer: string, stripe: number): string => `${peer}:${stripe}`
+
 export interface ChannelSubscriber {
   id: string
   /** When it subscribed (newcomers stay leaves for a few seconds). */
@@ -92,7 +95,8 @@ export class ChannelPublisher {
   totalChanges = 0
   stream: StreamInfo | null = null
 
-  private pendingRemovals = new Map<string, { oldParent: string; cancel: () => void }>()
+  /** edgeKey(child, stripe) -> the parent kept feeding until the new one delivers (make-before-break). */
+  private pendingRemovals = new Map<string, { child: string; stripe: number; oldParent: string; cancel: () => void }>()
   private replanTimer: (() => void) | null = null
   private timers: (() => void)[] = []
   /** Which subscribers' keyframe requests the encoder honours (one lossy viewer can't force many). */
@@ -100,12 +104,12 @@ export class ChannelPublisher {
   /** Recent "parent forwards nothing" complaints, to corroborate each other. */
   private complaints = new ComplaintLog()
   private lastPositions = new Map<string, string>()
-  /** `${peer}:${stripe}` -> until when that peer's feed is known to be broken upstream. */
+  /** edgeKey(peer, stripe) -> until when that peer's feed is known to be broken upstream. */
   private disruptedUntil = new Map<string, number>()
   /** Frames are signed in order, so fragments leave in capture order. */
   private signing: Promise<void> = Promise.resolve()
   private reattachQueue: { child: string; stripe: number; linkOpen: boolean; at: number }[] = []
-  /** `${peer}:${stripe}` -> when that peer's parent there last changed. */
+  /** edgeKey(peer, stripe) -> when that peer's parent there last changed. */
   private parentChangedAt = new Map<string, number>()
   private reattachTimer: (() => void) | null = null
   private topoWatchers = new Set<string>()
@@ -277,7 +281,7 @@ export class ChannelPublisher {
     if (!sub) return
     this.deactivate(sub)
     this.subscribers.delete(id)
-    for (let s = 0; s < this.stripes; s++) this.parentChangedAt.delete(`${id}:${s}`)
+    for (let s = 0; s < this.stripes; s++) this.parentChangedAt.delete(edgeKey(id, s))
     this.keyGate.forget(id)
     this.complaints.forget(id)
     this.topoWatchers.delete(id)
@@ -319,11 +323,10 @@ export class ChannelPublisher {
       this.markSubtreeDisrupted(id, stripe)
     })
     for (const [key, pr] of this.pendingRemovals) {
-      const [child, stripe] = key.split(':')
-      if (child === id || pr.oldParent === id) {
+      if (pr.child === id || pr.oldParent === id) {
         pr.cancel()
         this.pendingRemovals.delete(key)
-        if (child === id) this.removeEdge(pr.oldParent, id, Number(stripe))
+        if (pr.child === id) this.removeEdge(pr.oldParent, id, pr.stripe)
       }
     }
     // Forget its place, so it is replanned from scratch when it comes back.
@@ -357,7 +360,7 @@ export class ChannelPublisher {
       const sub = this.subscribers.get(child)
       if (!sub?.active) continue
       // Sent before the child heard of its new parent: it is about the old one, and handled.
-      if (at - (this.parentChangedAt.get(`${child}:${stripe}`) ?? -Infinity) < PARENT_GRACE_MS) continue
+      if (at - (this.parentChangedAt.get(edgeKey(child, stripe)) ?? -Infinity) < PARENT_GRACE_MS) continue
       const parent = this.topology.parents[child]?.[stripe]
       // The parent is itself starved by an upstream failure that is already being handled:
       // keep this child where it is (the parent's feed will resume).
@@ -424,13 +427,13 @@ export class ChannelPublisher {
     const nodes = subtree(this.topology, root, stripe)
     if (includeRoot) nodes.push(root)
     for (const n of nodes) {
-      const key = `${n}:${stripe}`
+      const key = edgeKey(n, stripe)
       this.disruptedUntil.set(key, Math.max(this.disruptedUntil.get(key) ?? 0, until))
     }
   }
 
   private isDisrupted(peer: string, stripe: number): boolean {
-    const key = `${peer}:${stripe}`
+    const key = edgeKey(peer, stripe)
     const until = this.disruptedUntil.get(key)
     if (until === undefined) return false
     if (performance.now() < until) return true
@@ -559,7 +562,7 @@ export class ChannelPublisher {
   }
 
   private apply(c: ParentChange): void {
-    const key = `${c.peer}:${c.stripe}`
+    const key = edgeKey(c.peer, c.stripe)
     this.parentChangedAt.set(key, performance.now())
     if (c.to !== null) this.addEdge(c.to, c.peer, c.stripe)
     this.send(c.peer, { t: 'set-parent', ch: this.id, stripe: c.stripe, parent: c.to })
@@ -580,12 +583,12 @@ export class ChannelPublisher {
       // Make-before-break: keep the old parent feeding until the new one delivers.
       const oldParent = from
       const cancel = after(REMOVAL_TIMEOUT_MS, () => this.completeRemoval(c.peer, c.stripe, null))
-      this.pendingRemovals.set(key, { oldParent, cancel })
+      this.pendingRemovals.set(key, { child: c.peer, stripe: c.stripe, oldParent, cancel })
     }
   }
 
   private completeRemoval(peer: string, stripe: number, deliveredBy: string | null): void {
-    const key = `${peer}:${stripe}`
+    const key = edgeKey(peer, stripe)
     const pr = this.pendingRemovals.get(key)
     if (!pr) return
     const current = this.topology.parents[peer]?.[stripe]

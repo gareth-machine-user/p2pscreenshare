@@ -116,3 +116,55 @@ export class BitrateController {
     return Math.min(t.kbps, currentKbps * UP_STEP)
   }
 }
+
+/** Auto quality: at most one cut to what the audience can carry per this long (ms). */
+export const AUDIENCE_CUT_GAP_MS = 30_000
+/** ...and the cut is lifted once the audience has carried the stream this long (ms). */
+export const AUDIENCE_LIFT_MS = 30_000
+
+/**
+ * Auto quality ("Lower automatically"): while the audience's relay slots can't carry the stream
+ * (ChannelPublisher.limited), cap the bitrate at what they can carry. It is kept apart from the
+ * chosen quality, which stays the ceiling: once the audience has carried the stream for
+ * AUDIENCE_LIFT_MS the cap is lifted, and BitrateController climbs back at its own pace (held
+ * where the audience runs short again by `audienceLimit`).
+ */
+export class AudienceCap {
+  /** The cap (kbps), or null. */
+  kbps: number | null = null
+  private lastCut = -Infinity
+  private fineSince: number | null = null
+
+  /** One check, with Auto quality on or off, and the publisher's feasibility verdict. */
+  step(now: number, auto: boolean, limited: { feasibleKbps: number } | null, chosenKbps: number): number | null {
+    if (!auto) {
+      this.kbps = null
+      this.fineSince = null
+      return null
+    }
+    if (limited) {
+      this.fineSince = null
+      if (now - this.lastCut >= AUDIENCE_CUT_GAP_MS && limited.feasibleKbps < Math.min(this.kbps ?? Infinity, chosenKbps)) {
+        this.kbps = limited.feasibleKbps
+        this.lastCut = now
+      }
+    } else if (this.kbps !== null) {
+      this.fineSince ??= now
+      if (now - this.fineSince >= AUDIENCE_LIFT_MS) {
+        this.kbps = null
+        this.fineSince = null
+      }
+    }
+    return this.kbps
+  }
+}
+
+/**
+ * The `audienceKbps` input of rateTarget: the Auto quality cap, and, while the audience is short,
+ * no climbing past the current bitrate (or what it could carry, if more).
+ */
+export function audienceLimit(capKbps: number | null, limited: { feasibleKbps: number } | null, currentKbps: number): number | null {
+  const hold = limited ? Math.max(limited.feasibleKbps, currentKbps) : null
+  if (capKbps === null) return hold
+  return hold === null ? capKbps : Math.min(capKbps, hold)
+}
