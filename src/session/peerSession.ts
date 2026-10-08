@@ -704,6 +704,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     return this.stageView().player
   }
 
+  /** When headroom discovery last ran (-Infinity before the first). */
+  get lastProbeAt(): number {
+    return this.headroom.lastAt
+  }
+
   get stageSub(): Subscription | null {
     return this.selected ? this.subFor(this.selected, 'full') : null
   }
