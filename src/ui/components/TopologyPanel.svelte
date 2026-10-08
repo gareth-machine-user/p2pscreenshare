@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import type { TopologyReport } from '../../proto/messages'
   import { fmtKbps, fmtMs } from '../route'
   import { fmtMbps } from '../liveRates'
@@ -13,10 +14,13 @@
   }: { report: TopologyReport | null; nameOf: (id: string) => string; joinedAt?: (id: string) => number | undefined } = $props()
 
   /** Stable numbers (#1, #2, … in join order; the publisher is P), shared by the tree and the table. */
-  let numbering = new Map<string, number>()
-  const numbers = $derived.by(() => {
-    if (report) numbering = assignNumbers(numbering, report.peers.map((p) => ({ id: p.id, joinedAt: joinedAt(p.id) })))
-    return numbering
+  // Each report renumbers from the last numbering, so it is state carried across reports rather
+  // than derived from the current one. Pre-effect: updated before the DOM is.
+  let numbers = $state.raw(new Map<string, number>())
+  $effect.pre(() => {
+    if (!report) return
+    const peers = report.peers.map((p) => ({ id: p.id, joinedAt: joinedAt(p.id) }))
+    numbers = assignNumbers(untrack(() => numbers), peers)
   })
 
   const rows = $derived(
