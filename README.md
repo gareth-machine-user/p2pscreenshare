@@ -160,7 +160,8 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
 2. **Meshing in** (`src/mesh/mesh.ts`). Over the door link the joiner receives every member's
    record and recent chat, then connects to everyone else. Signaling for a pair travels over the
    `ctl` channel of a peer both are linked to, the lower id offers, and connections open in
-   batches of 8.
+   batches of 8. A member linked to only one peer for 20 s takes other doors' offers again, so a
+   door that drops its signaling can't keep it from the rest of the lobby.
 3. **Gossip** (`src/mesh/records.ts`). Each peer owns one signed record (name, upload estimate,
    relay slots offered per channel, subscriptions, open and failed links, RTTs, announced
    channels) and sends it to its neighbours every 2 s and on change, gzipped when large. Every

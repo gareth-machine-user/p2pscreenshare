@@ -62,14 +62,20 @@ const ISOLATED_MS = 3000
  */
 const SIG_MAX_AGE_MS = 10 * 60_000
 /** A knock doesn't restart an offer to the knocker made this recently (it is likely in flight). */
-export { CHAT_MAX_LEN, type ChatMessage } from './chatLog'
-
 const KNOCK_KEEP_OFFER_MS = 5000
+/**
+ * A member linked to only one peer for this long takes any door's offer: that one peer may be a door
+ * keeping it from everyone else (dropping its signaling, or the records in its snapshot). Longer
+ * than a connect attempt, so links still being set up have opened or failed by then.
+ */
+const LONE_LINK_MS = 20_000
 /**
  * Members learned of this soon after this peer joined were in the lobby before it, so their claimed
  * join time is taken as is. Later ones joined after, so this peer vouches no earlier than first sight.
  */
 const JOIN_VOUCH_GRACE_MS = 5000
+
+export { CHAT_MAX_LEN, type ChatMessage } from './chatLog'
 
 interface SigBody extends Typed {
   type: 'sig'
@@ -176,6 +182,8 @@ export class Mesh<C extends PeerConn = MeshConn> {
   private isolatedSince: number | null = null
   /** Whether this peer ever had an open mesh link. */
   private everLinked = false
+  /** Since when this peer has had exactly one open link (null otherwise). */
+  private loneSince: number | null = null
   /** Wall-clock time this peer joined (first link, or started the lobby). */
   private joinedWallAt: number | null = null
   /**
@@ -603,14 +611,24 @@ export class Mesh<C extends PeerConn = MeshConn> {
     if (this.conns.get(id)?.isOpen || this.isBlocked(id)) return false
     // A kicked peer is refused (its key is known from gossip once it was a member).
     if (this.isBannedPeer(id)) return false
+    const now = performance.now()
     // Joining (an owner coming back to a populated lobby too), or cut off from everyone: answer
     // the first offer.
-    const fresh = !this.everLinked && performance.now() - this.seekingSince < ALONE_DOOR_MS * 2
+    const fresh = !this.everLinked && now - this.seekingSince < ALONE_DOOR_MS * 2
     if (!this.joined || fresh || this.isolatedSince !== null) return this.connectingCount === 0
+    // Linked to one peer only (see LONE_LINK_MS): any door will do, but a pair known to fail ICE
+    // keeps to its retry backoff.
+    if (this.loneSince !== null && now - this.loneSince > LONE_LINK_MS) {
+      const cur = this.conns.get(id)
+      if (this.unreachablePair(this.selfId, id) || cur?.haveRemote) return false
+      // Our own attempt never got an answer (its signaling went through that one peer): the door's offer replaces it.
+      if (cur) this.discardConn(cur)
+      return true
+    }
     // Otherwise a door answers doors of a lower id it has no link to: that merges groups that
     // formed apart, and re-links a pair whose link dropped when no neighbour can relay for it. A
     // pair whose ICE failed waits for its retry backoff, rather than trying every announce.
-    const backoff = this.self.unreachable.includes(id) && (this.retry.get(id)?.at ?? 0) > performance.now()
+    const backoff = this.self.unreachable.includes(id) && (this.retry.get(id)?.at ?? 0) > now
     return this.rendezvous.isDoor && id < this.selfId && !this.conns.has(id) && !backoff
   }
 
@@ -654,12 +672,16 @@ export class Mesh<C extends PeerConn = MeshConn> {
       }
     }
     this.rendezvous.setDoor(door)
-    const linked = this.openConns().length > 0
+    const links = this.openConns().length
     // A peer that dropped everyone (asleep, offline) has no members left but must look again.
-    if (linked || (this.store.ids().length === 0 && !this.everLinked)) this.isolatedSince = null
+    if (links > 0 || (this.store.ids().length === 0 && !this.everLinked)) this.isolatedSince = null
     else if (this.isolatedSince === null) this.isolatedSince = now
     const isolated = this.isolatedSince !== null && now - this.isolatedSince > ISOLATED_MS
-    this.rendezvous.setSeeking(!this.joined || isolated)
+    if (links !== 1) this.loneSince = null
+    else this.loneSince ??= now
+    // Linked to one peer only (see LONE_LINK_MS), or to none: stay where doors' offers arrive.
+    const lone = this.loneSince !== null && now - this.loneSince > LONE_LINK_MS
+    this.rendezvous.setSeeking(!this.joined || isolated || lone)
   }
 
   /** Opens links to members we aren't connected to, at most CONNECT_BATCH at a time. */

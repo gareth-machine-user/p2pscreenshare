@@ -353,6 +353,55 @@ describe('mesh (in-memory network)', () => {
     await advance(1000)
     expect(doors()).toEqual(before)
   })
+
+  it("a later joiner takes a liar's claimed join time, which costs it no door duty: the liar is older anyway", async () => {
+    const lobby = await makeLobby(5)
+    const [owner, h1, h2, liar, joiner] = lobby.meshes
+    for (const m of [owner, h1, h2]) await m.start()
+    await until(() => meshed([owner, h1, h2]), 15_000, 'mesh of three')
+    await advance(6000)
+    liar.updateRecord({ joinedAt: 0 })
+    await liar.start()
+    await until(() => meshed([owner, h1, h2, liar]), 15_000, 'liar meshed in')
+    await advance(6000)
+    joiner.updateRecord({ joinedAt: Date.now() })
+    await joiner.start()
+    await until(() => meshed(lobby.meshes), 15_000, 'joiner meshed in')
+    await advance(1000)
+    expect(joiner.member(liar.selfId)?.joinedAt).toBe(0)
+    expect([h1.isDoor, h2.isDoor, joiner.isDoor]).toEqual([true, true, false])
+    // Door duty only asks who is older than this peer, and the liar is: by how much doesn't matter.
+    await h1.leave()
+    await advance(2000)
+    expect([h2.isDoor, joiner.isDoor]).toEqual([true, false])
+    await h2.leave()
+    await advance(2000)
+    expect(joiner.isDoor).toBe(true)
+  })
+
+  it('a joiner whose door drops its signaling meshes in through another door', async () => {
+    const lobby = await makeLobby(5)
+    const [, , , liar, joiner] = lobby.meshes
+    const early = lobby.meshes.slice(0, 4)
+    for (const m of early) await m.start()
+    await until(() => meshed(early), 15_000, 'mesh of four')
+    // The liar makes itself a door (its own claim says it is the oldest) and relays nobody's signaling.
+    const l = liar as unknown as { onSig: (env: Envelope, to: string, from: string) => Promise<void> }
+    const onSig = l.onSig.bind(liar)
+    l.onSig = (env, to, from) => (to === liar.selfId ? onSig(env, to, from) : Promise.resolve())
+    liar.updateRecord({ joinedAt: 0 })
+    await until(() => liar.isDoor, 3000, 'liar a door')
+    // The joiner happens to answer the liar's offer first.
+    const r = (joiner as unknown as { rendezvous: { shouldAnswer: (id: string) => boolean } }).rendezvous
+    const answer = r.shouldAnswer
+    let steer = true
+    r.shouldAnswer = (id) => (!steer || id === liar.selfId) && answer(id)
+    joiner.updateRecord({ joinedAt: Date.now() })
+    await joiner.start()
+    await until(() => !!joiner.linkFor(liar.selfId), 15_000, 'joiner linked to the liar')
+    steer = false
+    await until(() => meshed(lobby.meshes), 40_000, 'joiner meshed in')
+  })
 })
 
 describe('signaling (in-memory network)', () => {

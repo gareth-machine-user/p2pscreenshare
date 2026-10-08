@@ -4,7 +4,8 @@
 // moves automatically as members leave. Each door keeps a small pool of pre-gathered WebRTC offers
 // announced to the lobby's info-hash; the tracker hands each offer to a distinct peer in the swarm.
 // A joiner answers the first offer it can open and verify, and once its door link is up it leaves
-// the swarm and meshes with everyone else over that link (mesh/mesh.ts).
+// the swarm and meshes with everyone else over that link (mesh/mesh.ts). If that link stays its only
+// one, it comes back and answers other doors: any peer with the code can act as a door.
 //
 // Offers and answers are sealed with a key derived from the join code (see lobby.ts), so only
 // peers holding the code can read or answer them. Inside the seal, each side signs its SDP with its
