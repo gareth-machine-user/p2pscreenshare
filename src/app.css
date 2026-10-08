@@ -818,6 +818,15 @@ button.scroll-cue:hover {
   border: 1px solid #252b36;
   font-size: 13px;
   color: #a8b0be;
+  /* Out of the way while watching: it shows with the controls, and briefly when a stream starts. */
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.stage.peek .stage-chip,
+.stage:hover .stage-chip,
+.stage.touched .stage-chip,
+.stage:focus-within .stage-chip {
+  opacity: 1;
 }
 .stage-chip.plain {
   padding-left: 12px;

@@ -53,6 +53,21 @@
   /** Touch devices have no hover: a tap toggles the overlay. */
   let touched = $state(false)
   let fullscreen = $state(false)
+  /** Briefly true when a stream comes on stage, so the chip says who it is before fading out. */
+  let peek = $state(false)
+  let peekTimer: ReturnType<typeof setTimeout> | undefined
+  let peekedAt: Player | MediaStream | null = null
+
+  $effect(() => {
+    // Only when a different stream comes on: this re-runs on every parent re-render.
+    const on = player ?? localStream
+    if (on === peekedAt) return
+    peekedAt = on
+    clearTimeout(peekTimer)
+    peek = !!on
+    if (on) peekTimer = setTimeout(() => (peek = false), 4000)
+  })
+  $effect(() => () => clearTimeout(peekTimer))
 
   $effect(() => {
     if (!player || !canvas) return
@@ -102,6 +117,7 @@
 <div
   class="stage"
   class:touched
+  class:peek
   class:fullscreen
   class:live
   class:has-card={!!children}
