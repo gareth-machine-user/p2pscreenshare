@@ -3,7 +3,7 @@ import type { TestPatternKind } from '../media/capture'
 import type { ShareOptions } from '../session/publishedStream'
 import { numParam, sizeParam } from './route'
 import { maxSizeFor, targetKbps } from '../media/quality'
-import type { ShareSettings } from './settings.svelte'
+import { STRIPE_LIMITS, type ShareSettings } from './settings.svelte'
 
 export interface ResolvedShare {
   options: ShareOptions
@@ -18,6 +18,11 @@ export interface ResolvedShare {
  * sets the test pattern size either way, `pattern=busy|bursty` its high-entropy variants.
  * `nativeSize` is the screen in device pixels, for the bitrate of the Native resolution.
  */
+/** A stripe count within its settings' bounds, as an integer (the wire format and the FEC need one). */
+function stripeCount(n: number, limits: { min: number; max: number }): number {
+  return Math.min(limits.max, Math.max(limits.min, Math.round(n)))
+}
+
 export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, urlOverrides: boolean, nativeSize?: [number, number]): ResolvedShare {
   const kbps = targetKbps(sh.video, nativeSize)
   /** The URL's value under overrides, else the setting's. */
@@ -28,8 +33,8 @@ export function resolveShareOptions(sh: ShareSettings, params: URLSearchParams, 
   const auto = pick(() => params.get('quality') === 'auto', sh.autoLower)
   return {
     options: {
-      k: Math.max(1, pick(() => numParam(params, 'k', sh.k), sh.k)),
-      m: Math.max(0, pick(() => numParam(params, 'm', sh.m), sh.m)),
+      k: stripeCount(pick(() => numParam(params, 'k', sh.k), sh.k), STRIPE_LIMITS.k),
+      m: stripeCount(pick(() => numParam(params, 'm', sh.m), sh.m), STRIPE_LIMITS.m),
       bitrateKbps: pick(() => numParam(params, 'bitrate', kbps), kbps),
       fps: pick(() => numParam(params, 'fps', sh.video.fps), sh.video.fps),
       source: test ? 'test' : camera ? 'camera' : 'screen',
@@ -121,4 +126,14 @@ export function playbackReadout(
   const latency = p.latencyMs ?? 0
   const level = latency > 1500 || dropped > 0.1 ? 'poor' : latency > 600 || dropped > 0.02 ? 'ok' : 'good'
   return { text: parts.join(' · '), title: 'Resolution and frame rate, and the delay from the presenter’s screen to yours', level }
+}
+
+/**
+ * Why the lobby (or a new one) couldn't start, for the page. Only a missing WebCrypto (an insecure
+ * origin has no `crypto.subtle`; older browsers lack Ed25519) gets the HTTPS / browser advice.
+ */
+export function startErrorText(e: unknown, hasSubtle = !!globalThis.crypto?.subtle): string {
+  const notSupported = !hasSubtle || (e instanceof Error && e.name === 'NotSupportedError')
+  if (notSupported) return "This browser can't create the lobby's keys. Open the page over HTTPS, in an up-to-date browser."
+  return `Couldn't start the lobby: ${e instanceof Error ? e.message : String(e)}`
 }

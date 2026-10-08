@@ -108,10 +108,9 @@ test('revoking a publisher stops its stream, and relays drop what it still sends
     return stream.full.id
   }, (await streams(viewer)).id)
   const before = await streams(viewer)
-  await new Promise((r) => setTimeout(r, 4000))
-  const later = await streams(viewer)
+  // Poll until the viewer has rejected a good run of the forced fragments (it took ~4 s of sending).
+  const later = await waitFor(() => streams(viewer), (s) => s.rejected > before.rejected + 20, 15_000, 'forced fragments rejected')
   console.log('forced channel', forced, 'rejected', before.rejected, '->', later.rejected)
-  expect(later.rejected).toBeGreaterThan(before.rejected + 20)
   expect(later.live).toEqual(['owner'])
 })
 
@@ -134,4 +133,19 @@ test('deny, then allow all opens sharing to everyone', async ({ browser }) => {
   await expect(bob.getByTestId('share-screen')).toHaveText(/Share screen/, { timeout: 10_000 })
   await owner.getByTestId('lobby-settings').click()
   await expect(owner.getByTestId('policy')).toHaveValue('open')
+})
+
+test('cancelling a request to share clears it for the owner', async ({ browser }) => {
+  test.setTimeout(90_000)
+  const seed = `e2e-cancel-${Date.now()}`
+  const owner = await openHost(browser, seed, { k: 1, m: 0 })
+  const alice = await openMember(browser, seed, 'alice', { share: '1', source: 'test', k: '1', m: '0', bitrate: '600', res: '320x180' })
+  await expect(alice.getByTestId('request-waiting')).toBeVisible({ timeout: 20_000 })
+  await expect(owner.getByTestId('publish-request')).toContainText('alice', { timeout: 20_000 })
+
+  // Alice changes her mind: the owner's toast goes away, so it can't be allowed after the fact.
+  await alice.locator('.request-state button', { hasText: 'Cancel' }).click()
+  await expect(alice.getByTestId('request-waiting')).toHaveCount(0)
+  await expect(owner.getByTestId('publish-request')).toHaveCount(0, { timeout: 10_000 })
+  await waitFor(() => streams(alice), (s) => !s.publishing && !s.canShare, 5_000, 'alice not granted')
 })

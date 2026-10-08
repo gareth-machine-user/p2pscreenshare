@@ -3,6 +3,7 @@
   import { describeQuality, type VideoQuality } from '../../media/quality'
   import Icon from './Icon.svelte'
   import QualityPicker from './QualityPicker.svelte'
+  import { dismissable } from '../dismiss'
 
   let {
     audio,
@@ -51,21 +52,6 @@
   } = $props()
 
   let qualityOpen = $state(false)
-  let wrap: HTMLDivElement | undefined = $state()
-
-  // Closes the quality panel on a click outside it, or Escape.
-  $effect(() => {
-    if (!qualityOpen) return
-    const close = (e: Event) => {
-      if (e instanceof KeyboardEvent ? e.key === 'Escape' : !wrap?.contains(e.target as Node)) qualityOpen = false
-    }
-    document.addEventListener('pointerdown', close)
-    document.addEventListener('keydown', close)
-    return () => {
-      document.removeEventListener('pointerdown', close)
-      document.removeEventListener('keydown', close)
-    }
-  })
 </script>
 
 <!-- Why the stream is below the chosen quality, in one place above the bar. -->
@@ -104,7 +90,7 @@
     </button>
   {/if}
   <button data-testid="switch-source" onclick={onswitch}><Icon name="swap" />Switch source</button>
-  <div class="quality-wrap" bind:this={wrap}>
+  <div class="quality-wrap" use:dismissable={qualityOpen ? () => (qualityOpen = false) : null}>
     <button
       data-testid="presenter-quality"
       class:warn={!!clamp}

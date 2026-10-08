@@ -133,13 +133,6 @@ button.danger {
   border-color: var(--danger-line);
   color: var(--danger-text);
 }
-button.ghost {
-  background: transparent;
-  border-color: transparent;
-}
-button.ghost:hover {
-  background: var(--raised-hover);
-}
 button.icon-only {
   justify-content: center;
   padding: 0;
@@ -179,9 +172,6 @@ button.link {
 .hint {
   color: var(--muted);
   font-size: 13px;
-}
-.error {
-  color: var(--danger);
 }
 .warn,
 td.warn,
@@ -918,8 +908,7 @@ button.scroll-cue:hover {
   height: 12px;
 }
 .bars.good i,
-.bars.ok i:nth-child(-n + 2),
-.bars.poor i:nth-child(1) {
+.bars.ok i:nth-child(-n + 2) {
   background: var(--good);
 }
 .bars.poor i:nth-child(1) {
@@ -1057,6 +1046,18 @@ button.scroll-cue:hover {
   gap: 4px;
   padding: 8px;
   border-bottom: 1px solid var(--border);
+}
+.side-tablist {
+  flex: 1;
+  display: flex;
+  gap: 4px;
+}
+/* The tab's content: chat or the people list, filling the rest of the panel. */
+.side-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .side-tabs [role='tab'] {
   flex: 1;
@@ -1655,9 +1656,4 @@ th {
 }
 tr.stale td {
   color: var(--danger);
-}
-.label {
-  color: var(--muted);
-  font-size: 13px;
-  margin-bottom: 4px;
 }

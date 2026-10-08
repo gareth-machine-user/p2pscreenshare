@@ -126,7 +126,9 @@
   data-testid="stage"
   role="presentation"
   onpointerdown={(e) => {
-    if (e.pointerType === 'touch' && e.target === e.currentTarget) touched = !touched
+    // The canvas or video fills the stage, so the tap lands on it: anything but the controls,
+    // the details panel and an empty stage's card toggles the overlay.
+    if (e.pointerType === 'touch' && !(e.target as Element).closest('.player-overlay, .gear-panel, .stage-card')) touched = !touched
   }}
 >
   {#if localStream}

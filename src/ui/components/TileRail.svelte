@@ -16,9 +16,11 @@
 
 <script lang="ts">
   import Icon from './Icon.svelte'
+  import { dismissable } from '../dismiss'
 
   let { tiles, onselect, onstop }: { tiles: Tile[]; onselect: (publisher: string) => void; onstop: (publisher: string) => void } = $props()
   let menuFor = $state<string | null>(null)
+  const closeMenu = () => (menuFor = null)
 
   function canvasFor(node: HTMLCanvasElement, player: Player | null) {
     let detach = player?.attach(node)
@@ -47,7 +49,7 @@
 <div class="tile-rail" data-testid="tile-rail">
   <span class="tile-rail-label">Live now</span>
   {#each tiles as t (t.publisher)}
-    <div class="tile" class:selected={t.selected} data-testid="tile" data-publisher={t.publisher}>
+    <div class="tile" class:selected={t.selected} data-testid="tile" data-publisher={t.publisher} use:dismissable={menuFor === t.publisher ? closeMenu : null}>
       <button class="tile-pick" aria-pressed={t.selected} onclick={() => onselect(t.publisher)} title={`Watch ${t.name}`}>
         {#if t.localStream}
           <video use:videoFor={t.localStream} autoplay muted playsinline></video>

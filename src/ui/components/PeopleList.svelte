@@ -15,6 +15,7 @@
   import Avatar from './Avatar.svelte'
   import Badges from './Badges.svelte'
   import Icon from './Icon.svelte'
+  import { dismissable } from '../dismiss'
 
   let {
     people,
@@ -29,20 +30,7 @@
   } = $props()
 
   let menuFor = $state<string | null>(null)
-
-  // Closes the menu on a click outside it, or Escape.
-  $effect(() => {
-    if (!menuFor) return
-    const close = (e: Event) => {
-      if (e instanceof KeyboardEvent ? e.key === 'Escape' : !(e.target as Element).closest?.('.person-menu')) menuFor = null
-    }
-    document.addEventListener('pointerdown', close)
-    document.addEventListener('keydown', close)
-    return () => {
-      document.removeEventListener('pointerdown', close)
-      document.removeEventListener('keydown', close)
-    }
-  })
+  const closeMenu = () => (menuFor = null)
 </script>
 
 <ul class="people" data-testid="people">
@@ -60,7 +48,7 @@
       </div>
       {#if p.conn}<span class="person-conn" class:warn={p.conn.warn} title={p.conn.title}>{p.conn.text}</span>{/if}
       {#if !p.self && (onkick || (p.asking && onallow))}
-        <div class="person-menu">
+        <div class="person-menu" use:dismissable={menuFor === p.id ? closeMenu : null}>
           <button aria-label={`Options for ${p.name}`} aria-expanded={menuFor === p.id} onclick={() => (menuFor = menuFor === p.id ? null : p.id)}>
             <Icon name="more" />
           </button>

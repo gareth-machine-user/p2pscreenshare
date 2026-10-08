@@ -17,7 +17,7 @@
     <div class="toast" data-testid="publish-request" data-peer={r.id}>
       <div class="toast-head">
         <Avatar id={r.id} name={r.name} />
-        <div><b>{r.name}</b> wants to share their screen</div>
+        <div><b>{r.name}</b> wants to share</div>
       </div>
       <div class="toast-actions">
         <button data-testid="deny" onclick={() => onrespond(r.id, 'deny')}>Not now</button>

@@ -7,7 +7,7 @@
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publishedStream'
   import { fmtKbps, fmtMs, iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
-  import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage } from './lobbyView'
+  import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage, startErrorText } from './lobbyView'
   import { ownerSeed, saveSettings, settings } from './settings.svelte'
   import { maxSizeFor, targetKbps } from '../media/quality'
   import { nativeScreenSize } from './screen'
@@ -30,6 +30,7 @@
   import SidePanel from './components/SidePanel.svelte'
   import PeopleList, { type Person } from './components/PeopleList.svelte'
   import InviteCard from './components/InviteCard.svelte'
+  import { dismissable } from './dismiss'
 
   let props: { joinCode: string; params: URLSearchParams } = $props()
   // The page is remounted on every route change, so reading the initial props is intended.
@@ -80,6 +81,8 @@
 
   let session = $state<PeerSession | null>(null)
   let invalid = $state(false)
+  /** The page couldn't start (no WebCrypto, or the session failed to start). */
+  let initError = $state<string | null>(null)
   let ownerId: string | null = null
   let destroyed = false
 
@@ -120,7 +123,10 @@
       else waitForLobbyThenRequest(s)
     }
   }
-  void init()
+  init().catch((e) => {
+    console.error('lobby failed to start', e)
+    if (!destroyed) initError = startErrorText(e)
+  })
 
   /** Tests: ask to share once linked to the owner. */
   function waitForLobbyThenRequest(s: PeerSession) {
@@ -216,19 +222,7 @@
   let popover = $state<'invite' | 'settings' | null>(null)
   let settingsOpen = $derived(popover === 'settings')
 
-  // Closes the popover on a click outside it, or Escape.
-  $effect(() => {
-    if (!popover) return
-    const close = (e: Event) => {
-      if (e instanceof KeyboardEvent ? e.key === 'Escape' : !(e.target as Element).closest?.('.popover-anchor')) popover = null
-    }
-    document.addEventListener('pointerdown', close)
-    document.addEventListener('keydown', close)
-    return () => {
-      document.removeEventListener('pointerdown', close)
-      document.removeEventListener('keydown', close)
-    }
-  })
+  const closePopover = () => (popover = null)
 
   $effect(() => {
     void settings.view.chatOpen
@@ -496,7 +490,7 @@
     {/if}
     {#if lobby?.ownerAway && lobby.joined}<span class="badge warn" data-testid="owner-away">Owner away</span>{/if}
     <span class="spacer"></span>
-    <div class="popover-anchor">
+    <div class="popover-anchor" use:dismissable={popover === 'invite' ? closePopover : null}>
       <button data-testid="invite" aria-expanded={popover === 'invite'} onclick={() => (popover = popover === 'invite' ? null : 'invite')}>
         <Icon name="link" />Invite
       </button>
@@ -524,7 +518,7 @@
       </button>
     {/if}
     {#if isOwner && lobby}
-      <div class="popover-anchor">
+      <div class="popover-anchor" use:dismissable={settingsOpen ? closePopover : null}>
         <button class="icon-only" data-testid="lobby-settings" aria-expanded={settingsOpen} aria-label="Lobby settings" title="Lobby settings" onclick={() => (popover = settingsOpen ? null : 'settings')}>
           <Icon name="sliders" size={17} />
         </button>
@@ -559,6 +553,8 @@
     <div class="stage-col">
       {#if invalid}
         <Stage message="This link is incomplete. Ask for the full lobby link." />
+      {:else if initError}
+        <Stage message={initError} />
       {:else if view}
           <Stage
             player={view.player}
@@ -737,4 +733,11 @@
   />
 {/if}
 
-<svelte:window onpagehide={() => void session?.leave()} />
+<!-- Leaving closes the session. If the browser keeps the page in its back/forward cache and Back
+     restores it, that session is gone: reload to join again. -->
+<svelte:window
+  onpagehide={() => void session?.leave()}
+  onpageshow={(e) => {
+    if (e.persisted) location.reload()
+  }}
+/>

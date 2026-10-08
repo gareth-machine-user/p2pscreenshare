@@ -1,6 +1,7 @@
 <script lang="ts">
   import { hostIdentity, newHostSeed } from '../net/lobby'
   import { joinCodeFrom } from './route'
+  import { startErrorText } from './lobbyView'
   import { rememberOwnerSeed, saveSettings, settings } from './settings.svelte'
   import Icon from './components/Icon.svelte'
   import Logo from './components/Logo.svelte'
@@ -8,6 +9,7 @@
 
   let link = $state('')
   let creating = $state(false)
+  let createError = $state<string | null>(null)
   const pasted = $derived(joinCodeFrom(link))
   let nameInput: HTMLInputElement | undefined = $state()
   let how: HTMLElement | undefined = $state()
@@ -15,11 +17,18 @@
   async function create(e?: SubmitEvent) {
     e?.preventDefault()
     creating = true
+    createError = null
     saveSettings()
-    const seed = newHostSeed()
-    const { joinCode } = await hostIdentity(seed)
-    rememberOwnerSeed(joinCode, seed)
-    location.hash = `#/lobby/${joinCode}`
+    try {
+      const seed = newHostSeed()
+      const { joinCode } = await hostIdentity(seed)
+      rememberOwnerSeed(joinCode, seed)
+      location.hash = `#/lobby/${joinCode}`
+    } catch (err) {
+      console.error('could not create a lobby', err)
+      createError = startErrorText(err)
+      creating = false
+    }
   }
 
   function join() {
@@ -67,6 +76,7 @@
       <button type="submit" class="primary create" data-testid="create-lobby" disabled={creating}>
         Create a lobby<Icon name="arrowRight" size={18} />
       </button>
+      {#if createError}<p class="hint warn-text" role="alert" data-testid="create-error">{createError}</p>{/if}
       <div class="divider">or join one</div>
       <div class="join">
         <label class="sr-only" for="paste-link">Lobby link</label>

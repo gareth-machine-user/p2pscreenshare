@@ -28,27 +28,31 @@
 </script>
 
 <aside class="side" class:collapsed={!open} data-testid="chat">
-  <div class="side-tabs" role="tablist" aria-label="Chat and people">
+  <div class="side-tabs">
     {#if open}
-      <button role="tab" aria-selected={tab === 'chat'} data-testid="tab-chat" onclick={() => (tab = 'chat')}>
-        Chat{#if unread}<span class="unread" aria-label="New messages"></span>{/if}
-      </button>
-      <button role="tab" aria-selected={tab === 'people'} data-testid="tab-people" onclick={() => (tab = 'people')}>
-        People <span class="count">{count}</span>
-      </button>
+      <div class="side-tablist" role="tablist" aria-label="Chat and people">
+        <button id="side-tab-chat" role="tab" aria-selected={tab === 'chat'} aria-controls="side-panel" data-testid="tab-chat" onclick={() => (tab = 'chat')}>
+          Chat{#if unread}<span class="unread" aria-hidden="true"></span><span class="sr-only"> (new messages)</span>{/if}
+        </button>
+        <button id="side-tab-people" role="tab" aria-selected={tab === 'people'} aria-controls="side-panel" data-testid="tab-people" onclick={() => (tab = 'people')}>
+          People <span class="count">{count}</span>
+        </button>
+      </div>
     {/if}
     <button
       class="collapse"
       data-testid="chat-toggle"
       aria-expanded={open}
-      aria-label={open ? 'Hide the side panel' : 'Show chat and people'}
+      aria-label={open ? 'Hide the side panel' : unread ? 'Show chat and people (new messages)' : 'Show chat and people'}
       title={open ? 'Hide the side panel' : 'Show chat and people'}
       onclick={() => (open = !open)}
     >
-      <Icon name={open ? 'sidebar' : 'chat'} />{#if !open && unread}<span class="unread" aria-label="New messages"></span>{/if}
+      <Icon name={open ? 'sidebar' : 'chat'} />{#if !open && unread}<span class="unread" aria-hidden="true"></span>{/if}
     </button>
   </div>
   {#if open}
-    {#if tab === 'chat'}{@render chat()}{:else}{@render roster()}{/if}
+    <div class="side-panel" id="side-panel" role="tabpanel" aria-labelledby={tab === 'chat' ? 'side-tab-chat' : 'side-tab-people'}>
+      {#if tab === 'chat'}{@render chat()}{:else}{@render roster()}{/if}
+    </div>
   {/if}
 </aside>

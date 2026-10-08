@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { EncoderRates, LossRates, UplinkRates } from '../../proto/messages'
   import { fmtKbps, fmtMs } from '../route'
+  import { tuning } from '../../tuning'
 
   let {
     loss = null,
@@ -25,6 +26,8 @@
 
   const n = (x: number) => (x === 0 ? '0' : x < 10 ? x.toFixed(1) : Math.round(x).toString())
   const warn = (x: number) => x > 0.5
+  /** The uplink's queueing deadlines per temporal layer, for the active latency/quality profile. */
+  const deadlines = tuning.maxAgeByLayer.slice(0, 3).join(' / ')
 </script>
 
 <!-- Where frames go missing, per second over the last 2 s. -->
@@ -59,7 +62,7 @@
     <h4>Your uplink</h4>
     <div class="stats-grid" data-testid="uplink-stats">
       <div><span>Sending</span><b>{fmtKbps(uplink.kbps)}</b></div>
-      <div><span>Dropped T0 / T1 / T2 /s</span><b class:warn={warn(uplink.drops[0] + uplink.drops[1] + uplink.drops[2])} title="Fragments that missed their queueing deadline (900 / 350 / 180 ms)">{n(uplink.drops[0])} / {n(uplink.drops[1])} / {n(uplink.drops[2])}</b></div>
+      <div><span>Dropped T0 / T1 / T2 /s</span><b class:warn={warn(uplink.drops[0] + uplink.drops[1] + uplink.drops[2])} title="Fragments that missed their queueing deadline ({deadlines} ms)">{n(uplink.drops[0])} / {n(uplink.drops[1])} / {n(uplink.drops[2])}</b></div>
       <div><span>Queueing delay</span><b>{fmtMs(uplink.queueMs)}</b></div>
       <div><span>Send-buffer stalls /s</span><b class:warn={warn(uplink.stalls)}>{n(uplink.stalls)}</b></div>
     </div>

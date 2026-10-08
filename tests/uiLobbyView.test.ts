@@ -2,8 +2,8 @@
 /// <reference types="vite/client" />
 // (tsconfig.tools.json lacks the app types these src/ui modules use: runes, import.meta.env.)
 import { describe, expect, it } from 'vitest'
-import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage, type StageState } from '../src/ui/lobbyView'
-import { DEFAULT_SETTINGS, type ShareSettings } from '../src/ui/settings.svelte'
+import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage, startErrorText, type StageState } from '../src/ui/lobbyView'
+import { DEFAULT_SETTINGS, STRIPE_LIMITS, type ShareSettings } from '../src/ui/settings.svelte'
 import { maxSizeFor, targetKbps, type VideoQuality } from '../src/media/quality'
 
 const share = (over: Partial<ShareSettings> = {}): ShareSettings => ({ ...DEFAULT_SETTINGS.share, ...over })
@@ -56,6 +56,13 @@ describe('resolveShareOptions', () => {
     const video: VideoQuality = { resolution: 'native', fps: 30, level: 'standard', customKbps: null }
     const at = (size: [number, number]) => resolveShareOptions(share({ video }), q(''), false, size).options.bitrateKbps
     expect(at([3840, 2160])).toBeGreaterThan(at([1920, 1080]))
+  })
+
+  it('clamps URL stripe counts to the settings bounds, as integers', () => {
+    const opts = (query: string) => resolveShareOptions(share(), q(query), true).options
+    expect(opts('k=2.6&m=1.4')).toMatchObject({ k: 3, m: 1 })
+    expect(opts('k=300&m=100')).toMatchObject({ k: STRIPE_LIMITS.k.max, m: STRIPE_LIMITS.m.max })
+    expect(opts('k=0.2&m=-0.4')).toMatchObject({ k: 1, m: 0 })
   })
 
   it('clamps k and m to their minimums', () => {
@@ -153,5 +160,18 @@ describe('playbackReadout', () => {
     expect(playbackReadout({ ...p, droppedFrames: 50 })?.level).toBe('ok')
     expect(playbackReadout({ ...p, latencyMs: 2000 })?.level).toBe('poor')
     expect(playbackReadout({ ...p, droppedFrames: 200 })?.level).toBe('poor')
+  })
+})
+
+describe('startErrorText', () => {
+  it('gives the HTTPS / browser advice only when WebCrypto is missing', () => {
+    expect(startErrorText(new TypeError("Cannot read properties of undefined (reading 'deriveBits')"), false)).toMatch(/HTTPS/)
+    expect(startErrorText(new DOMException('Unrecognized name.', 'NotSupportedError'), true)).toMatch(/HTTPS/)
+  })
+
+  it('names any other failure as it is', () => {
+    const text = startErrorText(new Error('tracker exploded'), true)
+    expect(text).toBe("Couldn't start the lobby: tracker exploded")
+    expect(startErrorText('boom', true)).toBe("Couldn't start the lobby: boom")
   })
 })
