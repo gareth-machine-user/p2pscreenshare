@@ -6,7 +6,7 @@
   import { DEFAULT_ICE } from '../net/bootstrap'
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publishedStream'
-  import { fmtKbps, fmtMs, iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
+  import { iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
   import { applyAutoQuality, connectionWord, playbackReadout, resolveShareOptions, stageMessage, startErrorText } from './lobbyView'
   import { ownerSeed, saveSettings, settings } from './settings.svelte'
   import { maxSizeFor, targetKbps } from '../media/quality'
@@ -14,16 +14,13 @@
   import Stage from './components/Stage.svelte'
   import ShareDialog from './components/ShareDialog.svelte'
   import ChatPanel from './components/ChatPanel.svelte'
-  import PeersPanel from './components/PeersPanel.svelte'
-  import TopologyPanel from './components/TopologyPanel.svelte'
+  import DetailsPanel, { type DetailsTab } from './components/DetailsPanel.svelte'
   import TileRail, { type Tile } from './components/TileRail.svelte'
   import RequestToasts from './components/RequestToasts.svelte'
   import PresenterBar from './components/PresenterBar.svelte'
   import NameDialog from './components/NameDialog.svelte'
-  import FrameStats from './components/FrameStats.svelte'
-  import { rateReason, rateText } from './rateText'
-  import { fmtMbps, sessionPeers, uploadBadge } from './liveRates'
-  import PeerRates from './components/PeerRates.svelte'
+  import { rateText } from './rateText'
+  import { sessionPeers, uploadBadge } from './liveRates'
   import Icon from './components/Icon.svelte'
   import Logo from './components/Logo.svelte'
   import Avatar from './components/Avatar.svelte'
@@ -217,7 +214,7 @@
 
   let muted = $state(true)
   let copied = $state(false)
-  let gearTab = $state<'stats' | 'peers' | 'topology'>('stats')
+  let gearTab = $state<DetailsTab>('stats')
   /** The top bar's open popover. */
   let popover = $state<'invite' | 'settings' | null>(null)
   let settingsOpen = $derived(popover === 'settings')
@@ -580,61 +577,16 @@
               {/if}
             {/snippet}
             {#snippet panel()}
-              <div class="tabs">
-                <button class:active={gearTab === 'stats'} onclick={() => (gearTab = 'stats')}>Stats</button>
-                <button class:active={gearTab === 'peers'} data-testid="tab-peers" onclick={() => (gearTab = 'peers')}>Peers</button>
-                <button class:active={gearTab === 'topology'} data-testid="tab-topology" onclick={() => (gearTab = 'topology')}>Topology</button>
-              </div>
-              {#if gearTab === 'peers' && session}
-                <PeersPanel {session} {badges} {tick} onkick={isOwner ? (id) => void session?.kick(id) : null} />
-              {:else if gearTab === 'topology'}
-                <TopologyPanel report={view.report} {nameOf} joinedAt={(id) => session?.mesh.member(id)?.joinedAt} />
-              {:else if view.presenting && view.pub}
-                <div class="stats-grid" data-testid="publisher-stats">
-                  <div><span>Viewers</span><b data-testid="viewer-count">{view.pub.subscribers}</b></div>
-                  <div><span>Codec</span><b>{view.pub.codec ?? '—'}</b></div>
-                  <div><span>Stripes</span><b>{view.pub.k} + {view.pub.m}</b></div>
-                  <div><span>Uploading now</span><b data-testid="live-send-total" title="Live, all connections, last 2 s">{fmtMbps(view.live.sendKbps)}</b></div>
-                  <div><span>Upload capacity</span><b data-testid="upload-capacity" title="What your uplink carried when it was full (or in the last headroom probe); not current use">{fmtKbps(view.capacity)}</b></div>
-                  <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
-                  <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
-                </div>
-                <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.rate ? rateReason(view.rate) : null} stalledLanes={view.rate?.stalledLanes ?? 0} clamp={lobby?.clamp ?? null} />
-                <PeerRates rows={view.peers} />
-              {:else}
-                <div class="stats-grid" data-testid="viewer-stats">
-                  <div><span>State</span><b data-testid="state">{view.sub ? 'connected' : 'idle'}</b></div>
-                  <div><span>Showing</span><b data-testid="stage-source">{view.source}</b></div>
-                  <div><span>Glass-to-glass</span><b data-testid="latency">{fmtMs(view.playerStats?.latencyMs)}</b></div>
-                  <div><span>Jitter buffer</span><b>{fmtMs(view.playerStats?.bufferMs)}</b></div>
-                  <div><span>FPS</span><b>{view.playerStats?.fps ?? '—'}</b></div>
-                  <div><span>Resolution</span><b>{view.playerStats?.width ?? 0}×{view.playerStats?.height ?? 0}</b></div>
-                  <div><span>Decoded / dropped</span><b>{view.playerStats?.decodedFrames ?? 0} / {view.playerStats?.droppedFrames ?? 0}</b></div>
-                  <div><span>Receiving now</span><b data-testid="live-recv-total" title="Live, all connections, last 2 s">{fmtMbps(view.live.recvKbps)}</b></div>
-                  <div><span>Uploading now</span><b title="Live, all connections, last 2 s (relaying and probes)">{fmtMbps(view.live.sendKbps)}</b></div>
-                  <div><span>Upload capacity</span><b title="What your uplink carried when it was full (or in the last headroom probe); not current use">{fmtKbps(view.capacity)}</b></div>
-                  <div><span>Relaying</span><b>{!view.sub?.homes.length ? 'no (leaf)' : `${view.sub.homes.length > 1 ? 'stripes' : 'stripe'} ${view.sub.homes.join(', ')} → ${view.stats?.children ?? 0} children`}</b></div>
-                </div>
-                <FrameStats loss={view.loss} renderedFps={view.playerStats?.fps ?? null} uplink={view.uplinkRates} />
-                <PeerRates rows={view.peers} />
-                {#if view.stats}
-                  <table class="stripes">
-                    <thead><tr><th>Stripe</th><th>Parent</th><th>Depth</th><th>Last data</th><th>RTT</th><th>Late</th></tr></thead>
-                    <tbody>
-                      {#each view.stats.stripes as st, i}
-                        <tr class:stale={st.lastRecvAgoMs === null || st.lastRecvAgoMs > 1000}>
-                          <td>{i}</td>
-                          <td>{st.parent === view.sub?.publisher ? 'publisher' : st.parent ? nameOf(st.parent) : '—'}</td>
-                          <td>{view.sub?.depth[i] ?? '—'}</td>
-                          <td>{st.lastRecvAgoMs === null ? 'never' : fmtMs(st.lastRecvAgoMs) + ' ago'}</td>
-                          <td>{fmtMs(st.rttMs)}</td>
-                          <td>{fmtMs(st.lateMs)}</td>
-                        </tr>
-                      {/each}
-                    </tbody>
-                  </table>
-                {/if}
-              {/if}
+              <DetailsPanel
+                {view}
+                {session}
+                bind:tab={gearTab}
+                {tick}
+                {badges}
+                {nameOf}
+                clamp={lobby?.clamp ?? null}
+                onkick={isOwner ? (id) => void session?.kick(id) : null}
+              />
             {/snippet}
           </Stage>
           {#if view.tiles.length}
