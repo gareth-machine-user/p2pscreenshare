@@ -8,9 +8,9 @@
 // - Each peer has a true upload capacity and an access latency. It offers relay slots from a noisy
 //   estimate of its upload, re-measured every 10 s. The publisher sees those offers (and new
 //   subscribers) only through gossip, `--gossip` ms late, so it plans on slightly stale inputs.
-// - The planner and its policy (hysteresis, relay trust, late-parent handling) are the app's own
-//   (topology/planner.ts, topology/policy.ts); stripe bitrate and fan-out cap come from
-//   session/capacity.ts.
+// - The planner and its policy (hysteresis, relay trust, late-parent handling, reattach batching and
+//   starved subtrees) are the app's own (topology/planner.ts, topology/policy.ts); stripe bitrate,
+//   the budget split into root slots and offers, and the fan-out cap come from session/capacity.ts.
 // - The planner breaks ties by RTT (2 × (access(a) + access(b) + 10 ms)).
 // - One-way hop latency = access(a) + access(b) + 10ms; serialization = piece bits / per-child rate.
 // - A frame is decodable once any k of k+m stripes arrive -> latency = k-th fastest stripe path.
@@ -21,7 +21,7 @@
 //   complaint and keyframe-request handling on them, old or new policy.
 
 import { pathToFileURL } from 'node:url'
-import { HEADROOM, MAX_FANOUT, rebalanceWeights, splitBudget, stripeKbpsFor } from '../src/session/capacity'
+import { MAX_FANOUT, rebalanceWeights, splitBudget, stripeKbpsFor } from '../src/session/capacity'
 import type { PlannerConfig, PlannerPeer, Topology } from '../src/topology/model'
 import { emptyTopology, subtree } from '../src/topology/model'
 import { plan } from '../src/topology/planner'
@@ -293,7 +293,8 @@ class Simulation {
       hostId: HOST,
       k: o.k,
       m: o.m,
-      rootSlots: Math.floor((o.hostUploadKbps * HEADROOM) / this.stripeKbps),
+      // The publisher's own budget split (session/capacity.ts): its root gets at most maxFanout per stripe.
+      rootSlots: splitBudget(o.hostUploadKbps, [{ id: 0, stripeKbps: this.stripeKbps, stripes: this.S }], [], o.maxFanout).rootSlots[0],
       maxFanout: o.maxFanout,
       rtt: (a, b) => 2 * ((this.access.get(a) ?? 10) + (this.access.get(b) ?? 10) + 10),
       lateness: o.handleLate ? (parent, stripe) => this.late.get(parent, stripe) : undefined,
@@ -519,7 +520,8 @@ class Simulation {
   private reestimate(id: string, at: number): void {
     const est = this.trueCap.get(id)! * (0.8 + this.rnd() * 0.3)
     const h = this.offerHistory.get(id) ?? []
-    h.push([at, Math.floor((est * HEADROOM) / this.stripeKbps)])
+    // What the peer gossips: its budget split over the one channel it watches (capped at maxFanout).
+    h.push([at, splitBudget(est, [], [{ id: 0, stripeKbps: this.stripeKbps, weight: 1 }], this.o.maxFanout).offers[0]])
     if (h.length > 4) h.shift()
     this.offerHistory.set(id, h)
   }
@@ -731,7 +733,7 @@ export function simulateCompeting(
     const offers = new Map(
       peers.map((p) => {
         const w = weights.get(p.id)!
-        const split = splitBudget(estimate.get(p.id)!, [], channels.map((c, i) => ({ id: i, stripeKbps: c.stripeKbps, weight: w[i] })))
+        const split = splitBudget(estimate.get(p.id)!, [], channels.map((c, i) => ({ id: i, stripeKbps: c.stripeKbps, weight: w[i] })), maxFanout)
         return [p.id, split.offers]
       }),
     )
@@ -740,7 +742,7 @@ export function simulateCompeting(
         hostId: c.host,
         k: c.k,
         m: c.m,
-        rootSlots: Math.floor((hostUploadKbps * HEADROOM) / c.stripeKbps),
+        rootSlots: splitBudget(hostUploadKbps, [{ id: 0, stripeKbps: c.stripeKbps, stripes: c.k + c.m }], [], maxFanout).rootSlots[0],
         maxFanout,
       })
       const r = plan(
