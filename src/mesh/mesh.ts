@@ -42,7 +42,7 @@ const CONNECT_ATTEMPT_MS = 15_000
 const RELINK_MS = 2000
 /** Two connections to one peer made within this window are crossed door offers (glare), not a reload. */
 const GLARE_WINDOW_MS = 15_000
-/** An offer for a link that opened this recently is a stale duplicate, not a reconnect. */
+/** An offer while the open link was created this recently is a stale duplicate, not a reconnect. */
 const FRESH_LINK_MS = 2000
 /** Links to a kicked peer close this long after the news goes out, so it reaches the peer first. */
 const KICK_CLOSE_DELAY_MS = 500
@@ -52,11 +52,22 @@ const LEAVE_CLOSE_DELAY_MS = 100
 const ALONE_DOOR_MS = 5000
 /** A member with no open links for this long goes back to the tracker to find the lobby again. */
 const ISOLATED_MS = 3000
-const SIG_MAX_AGE_MS = 120_000
+/**
+ * How far a signaling message's `at` may be from this peer's clock. Peers' clocks are not synced
+ * (net/clock.ts is the local clock), so this is mostly a skew allowance: a pair whose clocks differ
+ * by more could never link through relays. Replays are refused by nonce however wide it is (a
+ * nonce is kept as long as its `at` would pass), so the cost is only keeping nonces longer.
+ */
+const SIG_MAX_AGE_MS = 10 * 60_000
 /** A knock doesn't restart an offer to the knocker made this recently (it is likely in flight). */
 const KNOCK_KEEP_OFFER_MS = 5000
 const CHAT_KEEP = 50
 export const CHAT_MAX_LEN = 500
+/**
+ * Most a chat message's (sender-chosen) time may be ahead of this peer's clock. The log is ordered
+ * by it, so a message dated far ahead would never be evicted and would push every newer one out.
+ */
+const CHAT_MAX_FUTURE_MS = 60_000
 const CHAT_RATE = { count: 5, perMs: 5000 }
 
 interface SigBody extends Typed {
@@ -188,7 +199,8 @@ export class Mesh<C extends PeerConn = MeshConn> {
   private connect: ConnFactory<C>
   /** Extra media connections per pair. */
   readonly lanes: Lanes
-  private chatEnvs: Envelope[] = []
+  /** The chat log with each message's envelope (to hand on), ordered by time like `chat`. */
+  private chatLog: { m: ChatMessage; env: Envelope }[] = []
   private chatSent = new RateWindow(CHAT_RATE)
   private chatByAuthor = new Map<string, RateWindow>()
   /** Links whose first snapshot (and its chat history) has arrived. */
@@ -209,6 +221,8 @@ export class Mesh<C extends PeerConn = MeshConn> {
   /** Whether this peer ever had an open mesh link. */
   private everLinked = false
   private publishing: Promise<void> = Promise.resolve()
+  /** Owner decisions, applied one at a time so each builds on the one before. */
+  private authQueue: Promise<void> = Promise.resolve()
   private publishQueued = false
   private left = false
 
@@ -311,6 +325,23 @@ export class Mesh<C extends PeerConn = MeshConn> {
     return 'none'
   }
 
+  /** Open links (ctl and media channels both open: what linkFor hands out). */
+  private openConns(): C[] {
+    return [...this.conns.values()].filter((c) => c.isOpen)
+  }
+
+  /** Links still connecting. */
+  private get connectingCount(): number {
+    let n = 0
+    for (const c of this.conns.values()) if (!c.isOpen) n++
+    return n
+  }
+
+  /**
+   * Peer ids of open links, for this peer's record. By state rather than isOpen on purpose: a
+   * real link's media channel can open a moment after its ctl channel, and the record published
+   * from onOpen should already list the link.
+   */
   private openLinkIds(): string[] {
     return [...this.conns.values()].filter((c) => c.state === 'open').map((c) => c.remoteId)
   }
@@ -390,21 +421,32 @@ export class Mesh<C extends PeerConn = MeshConn> {
   }
 
   /** Owner only: applies a change to the lobby's decisions, signs it and gossips it. */
-  async updateAuth(change: (doc: AuthDoc) => AuthDoc): Promise<void> {
-    if (this.selfId !== this.ownerId) throw new Error('only the owner decides')
-    const doc = change(this.auth)
-    if (doc === this.auth) return
-    const env = await seal(this.opts.identity, doc)
-    await this.acceptAuth(env)
+  updateAuth(change: (doc: AuthDoc) => AuthDoc): Promise<void> {
+    if (this.selfId !== this.ownerId) return Promise.reject(new Error('only the owner decides'))
+    // Queued: two decisions made at once must not both start from the same document (the later
+    // one would undo the earlier).
+    const run = this.authQueue.then(async () => {
+      const doc = change(this.auth)
+      if (doc === this.auth) return
+      const env = await seal(this.opts.identity, doc)
+      await this.acceptAuth(env)
+    })
+    // A failed change must not stall the ones after it.
+    this.authQueue = run.catch(() => {})
+    return run
   }
 
   private async acceptAuth(env: Envelope): Promise<void> {
     const opened = await open<AuthDoc>(env, 'auth')
     // Only the key pinned in the join code decides.
-    if (!opened || opened.author !== this.ownerId || opened.body.version <= this.auth.version) return
+    if (!opened || opened.author !== this.ownerId) return
+    const bannedIds = new Set(await Promise.all(opened.body.banned.map((k) => peerIdOf(k))))
+    // Checked and applied after the last await: of two documents in flight, the newer one wins
+    // whichever finishes first.
+    if (opened.body.version <= this.auth.version) return
     this.auth = opened.body
     this.authEnv = env
-    this.bannedIds = new Set(await Promise.all(this.auth.banned.map((k) => peerIdOf(k))))
+    this.bannedIds = bannedIds
     if (this.selfId === this.ownerId) this.storage.setItem(this.authStoreKey, JSON.stringify(env))
     for (const c of this.conns.values()) c.sendCtl({ t: 'auth', env })
     // Kicked peers: close our links to them, once the news had time to reach them.
@@ -487,6 +529,9 @@ export class Mesh<C extends PeerConn = MeshConn> {
       this.self.links = this.openLinkIds()
       this.selfEnv = await seal(this.opts.identity, this.self)
       for (const c of this.conns.values()) if (c.isOpen) c.sendCtl({ t: 'rec', env: this.selfEnv })
+    }).catch((err) => {
+      // Kept resolved: a rejected chain would skip every later publish (and leave it queued).
+      console.warn('mesh publish failed', err)
     })
     return this.publishing
   }
@@ -508,12 +553,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
     if (prev && prev !== conn) {
       // A fresh connection replaces a stale one (e.g. the remote reloaded).
-      const wasOpen = prev.isOpen
-      prev.onStateChange = () => {}
-      prev.close()
-      this.lanes.primaryClosed(prev)
-      this.pendingOffers.delete(id)
-      if (wasOpen) this.onLinkClose(id)
+      if (this.discardConn(prev)) this.onLinkClose(id)
     }
     this.conns.set(id, conn)
     conn.onCtl = (msg) => this.handle(msg as MeshMsg, id, conn)
@@ -540,11 +580,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
     if (this.selfEnv) conn.sendCtl({ t: 'rec', env: this.selfEnv })
     if (viaTracker) {
       // Door link: hand over everything we know, so the joiner can mesh in.
-      conn.sendCtl({ t: 'snapshot', recs: this.store.all().map((s) => s.env), chat: this.chatEnvs, auth: this.authEnv })
+      conn.sendCtl({ t: 'snapshot', recs: this.store.all().map((s) => s.env), chat: this.chatEnvelopes(), auth: this.authEnv })
       this.rendezvous.setSeeking(false)
-    } else if (this.chatEnvs.length) {
+    } else if (this.chatLog.length) {
       // Recent chat, so messages sent while this pair was apart still arrive (deduplicated by id).
-      conn.sendCtl({ t: 'snapshot', recs: [], chat: this.chatEnvs })
+      conn.sendCtl({ t: 'snapshot', recs: [], chat: this.chatEnvelopes() })
     }
     if (this.authEnv) conn.sendCtl({ t: 'auth', env: this.authEnv })
     conn.sendCtl({ t: 'digest', d: this.digest(), a: this.auth.version })
@@ -563,19 +603,38 @@ export class Mesh<C extends PeerConn = MeshConn> {
     if (conn.wasOpen) {
       this.updateRecord({ links: this.openLinkIds() })
       this.onLinkClose(id)
-      if (this.store.has(id)) this.retry.set(id, { attempts: 0, at: performance.now() + RELINK_MS })
+      if (this.store.has(id)) this.scheduleRetry(id, RELINK_MS, 0)
     } else if (this.store.has(id)) {
       // ICE was tried and failed: the pair can't connect. Otherwise signaling got lost: retry soon.
       if (conn.haveRemote) this.markUnreachable(id)
-      else this.retry.set(id, { attempts: this.retry.get(id)?.attempts ?? 0, at: performance.now() + RELINK_MS })
+      else this.scheduleRetry(id, RELINK_MS)
     }
     this.onChange()
   }
 
+  /**
+   * Closes and forgets a connection quietly: unlike onClosed, nothing is retried or marked
+   * unreachable. Returns whether it was open (the caller reports the link closed).
+   */
+  private discardConn(conn: C): boolean {
+    const id = conn.remoteId
+    const wasOpen = conn.isOpen
+    conn.onStateChange = () => {}
+    conn.close()
+    this.lanes.primaryClosed(conn)
+    if (this.conns.get(id) === conn) this.conns.delete(id)
+    if (this.pendingOffers.get(id)?.conn === conn) this.pendingOffers.delete(id)
+    return wasOpen
+  }
+
+  /** Next attempt to link to `id` no sooner than `delayMs` from now (attempts kept unless given). */
+  private scheduleRetry(id: string, delayMs: number, attempts = this.retry.get(id)?.attempts ?? 0): void {
+    this.retry.set(id, { attempts, at: performance.now() + delayMs })
+  }
+
   private markUnreachable(id: string): void {
-    const r = this.retry.get(id)
-    const attempts = (r?.attempts ?? 0) + 1
-    this.retry.set(id, { attempts, at: performance.now() + retryDelayMs(attempts) })
+    const attempts = (this.retry.get(id)?.attempts ?? 0) + 1
+    this.scheduleRetry(id, retryDelayMs(attempts), attempts)
     if (!this.self.unreachable.includes(id)) this.updateRecord({ unreachable: [...this.self.unreachable, id] })
   }
 
@@ -592,18 +651,12 @@ export class Mesh<C extends PeerConn = MeshConn> {
     // Joining (an owner coming back to a populated lobby too), or cut off from everyone: answer
     // the first offer.
     const fresh = !this.everLinked && performance.now() - this.seekingSince < ALONE_DOOR_MS * 2
-    if (!this.joined || fresh || this.isolatedSince !== null) return this.pendingDoorAnswers === 0
+    if (!this.joined || fresh || this.isolatedSince !== null) return this.connectingCount === 0
     // Otherwise a door answers doors of a lower id it has no link to: that merges groups that
     // formed apart, and re-links a pair whose link dropped when no neighbour can relay for it. A
     // pair whose ICE failed waits for its retry backoff, rather than trying every announce.
     const backoff = this.self.unreachable.includes(id) && (this.retry.get(id)?.at ?? 0) > performance.now()
     return this.rendezvous.isDoor && id < this.selfId && !this.conns.has(id) && !backoff
-  }
-
-  private get pendingDoorAnswers(): number {
-    let n = 0
-    for (const c of this.conns.values()) if (!c.isOpen) n++
-    return n
   }
 
   // --- periodic work ---------------------------------------------------------------------------
@@ -642,7 +695,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
       if (door) this.joined = true
     }
     this.rendezvous.setDoor(door)
-    const linked = [...this.conns.values()].some((c) => c.isOpen)
+    const linked = this.openConns().length > 0
     // A peer that dropped everyone (asleep, offline) has no members left but must look again.
     if (linked || (this.store.ids().length === 0 && !this.everLinked)) this.isolatedSince = null
     else if (this.isolatedSince === null) this.isolatedSince = now
@@ -653,8 +706,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
   /** Opens links to members we aren't connected to, at most CONNECT_BATCH at a time. */
   private connectMissing(now: number): void {
     if (!this.joined) return
-    let connecting = 0
-    for (const c of this.conns.values()) if (!c.isOpen) connecting++
+    let connecting = this.connectingCount
     for (const rec of this.members()) {
       if (connecting >= CONNECT_BATCH) break
       const id = rec.id
@@ -662,7 +714,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
       const r = this.retry.get(id)
       if (r && now < r.at) continue
       connecting++
-      this.retry.set(id, { attempts: r?.attempts ?? 0, at: now + CONNECT_ATTEMPT_MS })
+      this.scheduleRetry(id, CONNECT_ATTEMPT_MS)
       void this.initiate(id)
     }
   }
@@ -749,7 +801,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
       const offering = !!cur && this.pendingOffers.get(b.from)?.conn === cur && performance.now() - cur.createdAt < KNOCK_KEEP_OFFER_MS
       if (this.selfId < b.from && !cur?.isOpen && !offering) {
         cur?.close()
-        this.retry.set(b.from, { attempts: this.retry.get(b.from)?.attempts ?? 0, at: performance.now() + CONNECT_ATTEMPT_MS })
+        this.scheduleRetry(b.from, CONNECT_ATTEMPT_MS)
         void this.initiate(b.from)
       }
     } else if (b.kind === 'offer' && b.sdp) {
@@ -788,7 +840,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
   }
 
   private exchangeDigest(): void {
-    const open = [...this.conns.values()].filter((c) => c.isOpen)
+    const open = this.openConns()
     if (!open.length) return
     open[Math.floor(Math.random() * open.length)].sendCtl({ t: 'digest', d: this.digest(), a: this.auth.version })
   }
@@ -815,13 +867,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
     this.detector.heard(rec.id, performance.now())
     if (!known) {
       // Debug blocking by name: a link opened before the name was known is dropped now.
-      if (this.isBlocked(rec.id) && this.conns.has(rec.id)) {
-        const c = this.conns.get(rec.id)!
-        c.onStateChange = () => {}
-        c.close()
-        this.lanes.primaryClosed(c)
-        this.conns.delete(rec.id)
-        this.markUnreachable(rec.id)
+      const c = this.conns.get(rec.id)
+      if (c && this.isBlocked(rec.id)) {
+        const wasOpen = this.discardConn(c)
+        this.markUnreachable(rec.id) // republishes the record, without the link
+        if (wasOpen) this.onLinkClose(rec.id)
       }
       this.onMemberJoin(rec.id)
     }
@@ -867,6 +917,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
     const b = opened.body
     if (b.from !== opened.author || typeof b.id !== 'string' || typeof b.name !== 'string' || typeof b.at !== 'number') return
     if (typeof b.text !== 'string' || b.text.length > CHAT_MAX_LEN) return
+    if (!Number.isFinite(b.at) || b.at > Date.now() + CHAT_MAX_FUTURE_MS) return
     if (this.isBannedPeer(b.from)) return
     if (this.chat.some((m) => m.id === b.id)) return
     if (!history) {
@@ -875,18 +926,28 @@ export class Mesh<C extends PeerConn = MeshConn> {
       if (!limit) this.chatByAuthor.set(b.from, (limit = new RateWindow(CHAT_RATE)))
       if (!limit.take(performance.now())) return
     }
-    this.storeChat(b, env)
-    // Forward to neighbours the sender can't reach directly.
-    const unreachable = this.member(b.from)?.unreachable ?? []
-    for (const id of unreachable) if (id !== from) this.conns.get(id)?.sendCtl({ t: 'chat', env })
+    // One older than the whole log is dropped (and not handed on).
+    if (!this.storeChat(b, env)) return
+    // Forward to neighbours the sender can't reach directly (as either side of the pair says).
+    for (const c of this.openConns()) {
+      if (c.remoteId !== from && c.remoteId !== b.from && this.unreachablePair(b.from, c.remoteId)) c.sendCtl({ t: 'chat', env })
+    }
   }
 
-  private storeChat(b: ChatBody, env: Envelope): void {
-    const m: ChatMessage = { id: b.id, from: b.from, name: b.name, text: b.text, at: b.at }
-    this.chat = [...this.chat, m].sort((x, y) => x.at - y.at).slice(-CHAT_KEEP)
-    this.chatEnvs = [...this.chatEnvs, env].slice(-CHAT_KEEP)
-    this.onChat(m)
+  /** Adds a message to the log; false if it is older than all CHAT_KEEP kept ones (so not kept). */
+  private storeChat(b: ChatBody, env: Envelope): boolean {
+    const entry = { m: { id: b.id, from: b.from, name: b.name, text: b.text, at: b.at }, env }
+    // Stable sort: among equal times, the newcomer stays last (and so is kept).
+    this.chatLog = [...this.chatLog, entry].sort((x, y) => x.m.at - y.m.at).slice(-CHAT_KEEP)
+    this.chat = this.chatLog.map((e) => e.m)
+    if (!this.chatLog.includes(entry)) return false
+    this.onChat(entry.m)
     this.onChange()
+    return true
+  }
+
+  private chatEnvelopes(): Envelope[] {
+    return this.chatLog.map((e) => e.env)
   }
 
   // --- dispatch ----------------------------------------------------------------------------------

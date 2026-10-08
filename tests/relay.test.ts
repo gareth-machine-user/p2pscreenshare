@@ -81,6 +81,20 @@ describe('relay node', () => {
     expect(sent.map((s) => s.to)).toEqual(['b'])
   })
 
+  it('counts a verifier that throws as a rejection, without an unhandled rejection', async () => {
+    const { node, sent } = relay()
+    node.addChild(CH, 0, 'kid')
+    node.verifier = async () => {
+      throw new Error('bad key')
+    }
+    const played: number[] = []
+    node.onFragment = (f) => played.push(f.header.frameSeq)
+    await feed(node, [frag({ seq: 1, key: true })])
+    expect(node.rejected).toBe(1)
+    expect(played).toEqual([])
+    expect(sent).toEqual([])
+  })
+
   it('resets the GOP cache on a newer keyframe', async () => {
     const { node, sent } = relay()
     await feed(node, [frag({ seq: 10, key: true }), frag({ seq: 11, gop: 10 }), frag({ seq: 20, key: true }), frag({ seq: 21, gop: 20 })])

@@ -282,6 +282,9 @@ export class RelayNode {
       }
       this.newestCapture.set(ch, Math.max(newest, h.captureTime))
       this.handle(frag, from)
+    }, () => {
+      // A verifier that throws (e.g. an unusable key) rejects the fragment, as a bad signature would.
+      this.rejected++
     })
   }
 

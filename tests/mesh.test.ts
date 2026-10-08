@@ -1,9 +1,10 @@
 // Multi-peer Mesh tests on an in-memory network (tests/fakes/) under fake time.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { ban } from '../src/mesh/auth'
+import { ban, emptyAuth, grant } from '../src/mesh/auth'
 import { seal, type Envelope } from '../src/mesh/envelope'
-import { generateIdentity, type PeerIdentity } from '../src/mesh/identity'
-import { Mesh } from '../src/mesh/mesh'
+import { generateIdentity, peerIdOf, type PeerIdentity } from '../src/mesh/identity'
+import { toBase64Url } from '../src/net/lobby'
+import { Mesh, type MeshOptions } from '../src/mesh/mesh'
 import { GONE_MS, type MemberRecord } from '../src/mesh/records'
 import { advance, installClock, settle, uninstallClock, until } from './fakes/clock'
 import { FakeNetwork, type FakeConn } from './fakes/network'
@@ -20,7 +21,7 @@ function memoryStore() {
 }
 
 /** `n` peers; peer 0 owns the lobby. None is started yet. */
-async function makeLobby(n: number): Promise<Lobby> {
+async function makeLobby(n: number, extra: (i: number) => Partial<MeshOptions<FakeConn>> = () => ({})): Promise<Lobby> {
   const net = new FakeNetwork({ delayMs: 5 })
   const ids = await Promise.all(Array.from({ length: n }, async () => (await generateIdentity()).identity))
   const meshes = ids.map(
@@ -35,6 +36,7 @@ async function makeLobby(n: number): Promise<Lobby> {
         connectLane: net.laneFactory(identity.id),
         rendezvous: net.rendezvousFor(identity.id),
         storage: memoryStore(),
+        ...extra(i),
       }),
   )
   return { net, ids, meshes }
@@ -159,6 +161,76 @@ describe('mesh (in-memory network)', () => {
     expect(lobby.meshes[0].chat.map((c) => c.text)).toContain('later')
   })
 
+  it('drops chat dated far in the future, so it cannot pin itself over newer messages', async () => {
+    const lobby = await makeLobby(3)
+    await startAll(lobby)
+    const [p0, p1] = lobby.ids
+    lobby.net.inject(p1.id, p0.id, { t: 'chat', env: await chatEnv(p1, 'from the future', Date.now() + 10 * 60_000) })
+    lobby.net.inject(p1.id, p0.id, { t: 'chat', env: await chatEnv(p1, 'slightly ahead', Date.now() + 30_000) })
+    await advance(100)
+    const texts = lobby.meshes[0].chat.map((c) => c.text)
+    expect(texts).not.toContain('from the future')
+    expect(texts).toContain('slightly ahead')
+  })
+
+  it('a late message older than the whole log is neither shown nor handed on to joiners', async () => {
+    const lobby = await makeLobby(3)
+    const [m0, m1, joiner] = lobby.meshes
+    await m0.start()
+    await m1.start()
+    await until(() => meshed([m0, m1]), 15_000, 'pair meshed')
+    const [p0, p1] = lobby.ids
+    // A full log: 50 messages by 10 authors (5 each, within the per-author rate limit).
+    const authors = await Promise.all(Array.from({ length: 10 }, async () => (await generateIdentity()).identity))
+    for (const [i, author] of authors.entries()) {
+      for (let j = 0; j < 5; j++) lobby.net.inject(p1.id, p0.id, { t: 'chat', env: await chatEnv(author, `m${i}.${j}`) })
+    }
+    await advance(100)
+    expect(m0.chat).toHaveLength(50)
+    const shown: string[] = []
+    m0.onChat = (m) => shown.push(m.text)
+    lobby.net.inject(p1.id, p0.id, { t: 'chat', env: await chatEnv(p1, 'ancient', Date.now() - 3_600_000) })
+    await advance(100)
+    expect(shown).toEqual([])
+    expect(m0.chat.map((c) => c.text)).not.toContain('ancient')
+
+    await joiner.start()
+    await until(() => meshed(lobby.meshes), 15_000, 'joiner meshed')
+    await advance(500)
+    expect(joiner.chat.map((c) => c.text)).toEqual(m0.chat.map((c) => c.text))
+  })
+
+  it('concurrent owner decisions build on each other instead of one undoing the other', async () => {
+    const lobby = await makeLobby(3)
+    await startAll(lobby)
+    const [owner] = lobby.meshes
+    const [, a, b] = lobby.ids
+    const failing = owner.updateAuth(() => {
+      throw new Error('bad change')
+    })
+    await Promise.all([owner.updateAuth((doc) => grant(doc, a.pubKey)), owner.updateAuth((doc) => grant(doc, b.pubKey)), failing.catch(() => {})])
+    await expect(failing).rejects.toThrow('bad change')
+    expect(owner.auth.grants.map((g) => g.peerKey).sort()).toEqual([a.pubKey, b.pubKey].sort())
+  })
+
+  it('of two owner documents arriving together, the newer one decides who is banned', async () => {
+    const lobby = await makeLobby(3)
+    await startAll(lobby)
+    const [owner, other] = lobby.ids
+    const m2 = lobby.meshes[2]
+    // A key whose peer id isn't cached yet, so the older document takes longer to apply.
+    const pair = (await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])) as CryptoKeyPair
+    const key = toBase64Url(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)))
+    const base = lobby.meshes[0].auth.version
+    const older = await seal(owner, { ...emptyAuth(), version: base + 1, banned: [key] })
+    const newer = await seal(owner, { ...emptyAuth(), version: base + 2, banned: [] })
+    lobby.net.inject(other.id, m2.selfId, { t: 'auth', env: older })
+    lobby.net.inject(other.id, m2.selfId, { t: 'auth', env: newer })
+    await advance(100)
+    expect(m2.auth.version).toBe(base + 2)
+    expect(m2.isBannedPeer(await peerIdOf(key))).toBe(false)
+  })
+
   it('an owner kick closes links to the peer, drops its chat, and keeps it out', async () => {
     const lobby = await makeLobby(4)
     await startAll(lobby)
@@ -198,6 +270,38 @@ describe('mesh (in-memory network)', () => {
     expect(m1.chat.map((c) => c.text)).not.toContain('from kicked')
     expect(m1.chat.map((c) => c.text)).not.toContain('relayed by kicked')
     expect(p0).toBeDefined()
+  })
+
+  it('a link dropped once the peer turns out to be blocked by name is reported closed', async () => {
+    // p0 blocks p1 by name, which it only learns from p1's record, after their door link opened.
+    const lobby = await makeLobby(2, (i) => (i === 0 ? { block: ['p1'] } : {}))
+    const [m0, m1] = lobby.meshes
+    const p1 = lobby.ids[1].id
+    let opened = 0
+    let closed = 0
+    m0.onLinkOpen = (id) => void (id === p1 && opened++)
+    m0.onLinkClose = (id) => void (id === p1 && closed++)
+    await m0.start()
+    await m1.start()
+    await until(() => !!m0.member(p1) && opened > 0, 15_000, 'p1 known')
+    await advance(100)
+    expect(m0.linkFor(p1)).toBeUndefined()
+    expect(m0.linkStatus(p1)).toBe('unreachable')
+    expect(closed).toBe(opened)
+  })
+
+  it('chat reaches a peer that marked the sender unreachable, though the sender did not mark it', async () => {
+    // p1 refuses p2 (debug block by name), so only p1 lists the pair as unreachable: p2's attempts
+    // just go unanswered.
+    const lobby = await makeLobby(3, (i) => (i === 1 ? { block: ['p2'] } : {}))
+    const [m0, m1, m2] = lobby.meshes
+    const [, p1, p2] = lobby.ids
+    for (const m of lobby.meshes) await m.start()
+    await until(() => m1.record.unreachable.includes(p2.id) && !!m0.linkFor(p1.id) && !!m0.linkFor(p2.id), 30_000, 'p1 marks p2')
+    expect(m2.record.unreachable).not.toContain(p1.id)
+    expect(m2.sendChat('hello')).toBe(true)
+    await advance(500)
+    expect(m1.chat.map((c) => c.text)).toContain('hello')
   })
 
   it('a pair that cannot connect stays in the lobby, marked unreachable', async () => {
