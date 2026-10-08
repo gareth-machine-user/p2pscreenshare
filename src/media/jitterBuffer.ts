@@ -1,5 +1,6 @@
 import { NO_REF } from '../proto/framing'
 import type { AssembledFrame } from './reassembler'
+import { SortedWindow } from './sortedWindow'
 import { tuning } from '../tuning'
 
 export interface PlayoutClockOptions {
@@ -60,7 +61,8 @@ export function bufferingOptions(b: Buffering): Partial<PlayoutClockOptions> {
  * offset; rendering at captureTime + quantile(transit) + safety plays ~quantile of frames on time.
  */
 export class PlayoutClock {
-  private samples: { at: number; transit: number }[] = []
+  /** Transit samples of the last windowMs, kept sorted (a few hundred, updated on every frame). */
+  private samples = new SortedWindow()
   private delay: number | null = null
   private target = 0
   private lastUpdate = 0
@@ -87,17 +89,18 @@ export class PlayoutClock {
   }
 
   addSample(captureTime: number, completedAt: number): void {
-    this.samples.push({ at: completedAt, transit: completedAt - captureTime })
-    const cutoff = completedAt - this.opts.windowMs
-    while (this.samples.length && this.samples[0].at < cutoff) this.samples.shift()
+    const transit = completedAt - captureTime
+    // A NaN would corrupt the sorted window for good.
+    if (!Number.isFinite(transit)) return
+    this.samples.add(completedAt, transit)
+    this.samples.expire(completedAt - this.opts.windowMs)
     this.recompute(completedAt)
   }
 
   private recompute(now: number): void {
-    if (!this.samples.length) return
-    const sorted = this.samples.map((s) => s.transit).sort((a, b) => a - b)
-    const minT = sorted[0]
-    const q = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * this.opts.quantile))]
+    if (!this.samples.size) return
+    const minT = this.samples.min!
+    const q = this.samples.quantile(this.opts.quantile)!
     // Express bounds relative to the fastest observed transit (absolute offset is unknown).
     let extra = Math.min(Math.max(q - minT + this.opts.safetyMs, this.opts.minDelayMs), this.opts.maxDelayMs)
     // Keep the largest recent need for holdMs after it was last needed.
@@ -124,10 +127,8 @@ export class PlayoutClock {
 
   /** Current playout delay beyond the fastest observed path (ms). */
   get bufferMs(): number {
-    if (this.delay === null || !this.samples.length) return 0
-    let minT = Infinity
-    for (const s of this.samples) minT = Math.min(minT, s.transit)
-    return this.delay - minT
+    if (this.delay === null || !this.samples.size) return 0
+    return this.delay - this.samples.min!
   }
 
   get ready(): boolean {

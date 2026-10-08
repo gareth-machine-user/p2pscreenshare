@@ -189,6 +189,15 @@ describe('DecodeScheduler buffer cap', () => {
 })
 
 describe('PlayoutClock', () => {
+  it('ignores a sample with a non-finite capture time', () => {
+    const c = new PlayoutClock({ safetyMs: 0, minDelayMs: 0 })
+    c.addSample(NaN, 100)
+    expect(c.ready).toBe(false)
+    c.addSample(50, 100)
+    c.addSample(Infinity, 110)
+    expect(c.renderAt(0)).toBe(50)
+  })
+
   it('is not ready until it has a sample', () => {
     const c = new PlayoutClock()
     expect(c.ready).toBe(false)
