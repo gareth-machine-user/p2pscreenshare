@@ -3,6 +3,9 @@
 // for a channel are only accepted from that channel's publisher.
 import type { Topology } from '../topology/model'
 
+// Re-exported for the media pipeline (decoder descriptions).
+export { fromBase64, toBase64 } from '../util/base64'
+
 export interface StreamInfo {
   epoch: number
   codec: string
@@ -139,6 +142,8 @@ export type PeerMsg =
   | { t: 'publish-req' }
   /** The owner said no (or the policy is closed). */
   | { t: 'publish-deny' }
+  /** The member withdrew its request (the owner drops it). */
+  | { t: 'publish-cancel' }
   /**
    * A subscriber whose decode chain broke asks its parent on these stripes (a relay, or the
    * publisher) to replay its cached GOP, before escalating to `need-key` for everyone.
@@ -153,6 +158,7 @@ export const PEER_MSG_TYPES = [
   ...PUBLISHER_MSG_TYPES,
   'publish-req',
   'publish-deny',
+  'publish-cancel',
   'need-gop',
 ] as const satisfies readonly PeerMsg['t'][]
 
@@ -196,6 +202,17 @@ function isLossRates(v: unknown): v is LossRates {
 
 function isUplinkRates(v: unknown): v is UplinkRates {
   return isObj(v) && isNum(v.kbps) && isNumArray(v.drops, 3) && isNum(v.stalls) && isNum(v.queueMs)
+}
+
+const ENCODER_RATE_FIELDS = ['targetKbps', 'ceilingKbps', 'kbps', 'captureFps', 'encodedFps', 'droppedFps', 'keyframes', 'encodeMs', 'maxFrameKB'] as const
+
+function isEncoderRates(v: unknown): v is EncoderRates {
+  return isObj(v) && isStrOrNull(v.codec) && ENCODER_RATE_FIELDS.every((k) => isNum(v[k]))
+}
+
+/** A publisher's own link to a peer, as a TopologyReport carries it. */
+function isPeerLink(v: unknown): boolean {
+  return isObj(v) && isNum(v.drops) && isNum(v.queueMs) && typeof v.backlogged === 'boolean' && isNumOrNull(v.capKbps)
 }
 
 export function isSubscriberStats(v: unknown): v is SubscriberStats {
@@ -273,6 +290,7 @@ const shapes: { [T in PeerMsg['t']]: (m: Obj) => boolean } = {
   topo: (m) => isNum(m.ch) && typeof m.z === 'string',
   'publish-req': () => true,
   'publish-deny': () => true,
+  'publish-cancel': () => true,
   // Bounded: a parent serves at most one replay per stripe anyway.
   'need-gop': (m) => isNum(m.ch) && Array.isArray(m.stripes) && m.stripes.length > 0 && m.stripes.length <= MAX_STRIPES && m.stripes.every(isIndex),
 }
@@ -283,9 +301,13 @@ export function parsePeerMsg(v: unknown): PeerMsg | null {
   return shapes[v.t as PeerMsg['t']](v) ? (v as PeerMsg) : null
 }
 
-/** Minimal check of a decoded TopologyReport: the fields the Topology panel dereferences. */
+/**
+ * Checks a decoded TopologyReport: the fields the Topology panel dereferences. Display-only extras
+ * that are malformed (the publisher's own stats, a peer's link) are dropped in place rather than
+ * rejecting the report, as a NaN in them (null after JSON) is a hiccup, not an attack.
+ */
 export function isTopologyReport(v: unknown): v is TopologyReport {
-  return (
+  const ok =
     isObj(v) &&
     isNum(v.channel) &&
     typeof v.publisher === 'string' &&
@@ -293,6 +315,7 @@ export function isTopologyReport(v: unknown): v is TopologyReport {
     isNum(v.m) &&
     isNum(v.rootSlots) &&
     isNum(v.overcommitted) &&
+    isNum(v.changes) &&
     isObj(v.slots) &&
     isObj(v.topology) &&
     isObj(v.topology.parents) &&
@@ -301,19 +324,21 @@ export function isTopologyReport(v: unknown): v is TopologyReport {
     isObj(v.depth) &&
     Object.values(v.depth).every((d) => isNumArray(d)) &&
     Array.isArray(v.peers) &&
-    v.peers.every((p) => isObj(p) && typeof p.id === 'string' && Array.isArray(p.avoid) && (p.stats === null || isSubscriberStats(p.stats)))
-  )
-}
-
-export function toBase64(bytes: Uint8Array): string {
-  let s = ''
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i])
-  return btoa(s)
-}
-
-export function fromBase64(b64: string): Uint8Array {
-  const s = atob(b64)
-  const out = new Uint8Array(s.length)
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i)
-  return out
+    v.peers.every(
+      (p) =>
+        isObj(p) &&
+        typeof p.id === 'string' &&
+        isNum(p.failures) &&
+        Array.isArray(p.avoid) &&
+        p.avoid.every((a) => typeof a === 'string') &&
+        (p.stats === null || isSubscriberStats(p.stats)),
+    )
+  if (!ok) return false
+  for (const p of v.peers as Obj[]) if (p.link !== undefined && p.link !== null && !isPeerLink(p.link)) p.link = null
+  const ps = v.publisherStats
+  if (ps !== undefined) {
+    const good = isObj(ps) && (ps.encoder === null || isEncoderRates(ps.encoder)) && (ps.uplink === null || isUplinkRates(ps.uplink))
+    if (!good) delete v.publisherStats
+  }
+  return true
 }

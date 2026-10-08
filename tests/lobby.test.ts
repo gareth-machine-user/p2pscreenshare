@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { hostIdentity, hostKeyFromCode, lobbyKeys, newHostSeed, openSignal, sealSignal, signOffer, verifyOffer } from '../src/net/lobby'
+import { fromBase64Url, hostIdentity, hostKeyFromCode, lobbyKeys, newHostSeed, openJson, sealJson, toBase64Url } from '../src/net/lobby'
+import { fromBase64, toBase64 } from '../src/util/base64'
 
 describe('lobby', () => {
   it('generates 128-bit url-safe host seeds', () => {
@@ -19,26 +20,15 @@ describe('lobby', () => {
     expect(await hostKeyFromCode('secret.too-short')).toBeNull()
   })
 
-  it('only accepts offers signed by the pinned host', async () => {
-    const host = await hostIdentity('seed-a')
-    const impostor = await hostIdentity('seed-b')
-    const hostKey = (await hostKeyFromCode(host.joinCode))!
-    const body = { peerId: 'h'.repeat(20), sdp: 'v=0' }
-    const signed = await signOffer(host.signingKey, 'offer-1', body)
-    expect(await verifyOffer(hostKey, 'offer-1', signed)).toBe(true)
-    expect(await verifyOffer(hostKey, 'offer-2', signed)).toBe(false)
-    expect(await verifyOffer(hostKey, 'offer-1', { ...signed, sdp: 'v=1' })).toBe(false)
-    expect(await verifyOffer(hostKey, 'offer-1', { ...signed, peerId: 'x'.repeat(20) })).toBe(false)
-    expect(await verifyOffer(hostKey, 'offer-1', body)).toBe(false)
-    expect(await verifyOffer(hostKey, 'offer-1', await signOffer(impostor.signingKey, 'offer-1', body))).toBe(false)
-  })
-
-  it('carries the offer signature through sealing', async () => {
-    const host = await hostIdentity('seed-a')
-    const keys = await lobbyKeys(host.joinCode)
-    const signed = await signOffer(host.signingKey, 'offer-1', { peerId: 'h'.repeat(20), sdp: 'v=0' })
-    const opened = (await openSignal(keys, 'offer', 'offer-1', await sealSignal(keys, 'offer', 'offer-1', signed)))!
-    expect(await verifyOffer((await hostKeyFromCode(host.joinCode))!, 'offer-1', opened)).toBe(true)
+  it('round-trips bytes through base64 and base64url', () => {
+    const all = Uint8Array.from({ length: 256 }, (_, i) => i)
+    for (const n of [0, 1, 2, 3, 256]) {
+      const bytes = all.subarray(0, n)
+      expect(fromBase64(toBase64(bytes))).toEqual(bytes)
+      const url = toBase64Url(bytes)
+      expect(url).toMatch(/^[A-Za-z0-9_-]*$/)
+      expect(fromBase64Url(url)).toEqual(bytes)
+    }
   })
 
   it('derives a stable 20-byte info hash that differs per code', async () => {
@@ -48,23 +38,23 @@ describe('lobby', () => {
     expect((await lobbyKeys('code-b')).infoHash).not.toBe(a.infoHash)
   })
 
-  it('round-trips a sealed signal', async () => {
+  it('round-trips a sealed value', async () => {
     const keys = await lobbyKeys('code-a')
     const body = { peerId: 'p'.repeat(20), sdp: 'v=0\r\na=fingerprint:sha-256 AA:BB\r\n' }
-    const sealed = await sealSignal(keys, 'offer', 'offer-1', body)
+    const sealed = await sealJson(keys, 'offer', 'offer-1', body)
     expect(sealed).not.toContain('fingerprint')
-    expect(await openSignal(keys, 'offer', 'offer-1', sealed)).toEqual(body)
+    expect(await openJson(keys, 'offer', 'offer-1', sealed)).toEqual(body)
   })
 
   it('rejects signals sealed with another code, for another offer, direction, or tampered', async () => {
     const keys = await lobbyKeys('code-a')
     const body = { peerId: 'p'.repeat(20), sdp: 'v=0' }
-    const sealed = await sealSignal(keys, 'answer', 'offer-1', body)
-    expect(await openSignal(await lobbyKeys('code-b'), 'answer', 'offer-1', sealed)).toBeNull()
-    expect(await openSignal(keys, 'answer', 'offer-2', sealed)).toBeNull()
-    expect(await openSignal(keys, 'offer', 'offer-1', sealed)).toBeNull()
+    const sealed = await sealJson(keys, 'answer', 'offer-1', body)
+    expect(await openJson(await lobbyKeys('code-b'), 'answer', 'offer-1', sealed)).toBeNull()
+    expect(await openJson(keys, 'answer', 'offer-2', sealed)).toBeNull()
+    expect(await openJson(keys, 'offer', 'offer-1', sealed)).toBeNull()
     const flipped = sealed.slice(0, -2) + (sealed.at(-2) === 'A' ? 'B' : 'A') + sealed.at(-1)
-    expect(await openSignal(keys, 'answer', 'offer-1', flipped)).toBeNull()
-    expect(await openSignal(keys, 'answer', 'offer-1', 'v=0 plain sdp')).toBeNull()
+    expect(await openJson(keys, 'answer', 'offer-1', flipped)).toBeNull()
+    expect(await openJson(keys, 'answer', 'offer-1', 'v=0 plain sdp')).toBeNull()
   })
 })

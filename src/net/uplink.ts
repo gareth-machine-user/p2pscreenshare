@@ -15,6 +15,13 @@ const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
  */
 export const STALL_MS = 750
 
+/** How long a frame that lost a fragment on a link is remembered, so its other fragments are dropped too (ms). */
+const DEAD_FRAME_RETAIN_MS = 2000
+/** The upload cap's token bucket holds this much sending time as burst (ms). */
+const CAP_BURST_MS = 40
+/** While the cap's tokens are spent, drain again after this long (ms). */
+const TOKEN_RETRY_MS = 4
+
 /** Layers beyond the table (none on the wire: the layer is 2 bits) get the last entry's deadline. */
 function maxAgeForLayer(layer: number): number {
   return MAX_AGE_MS_BY_LAYER[Math.min(layer, MAX_AGE_MS_BY_LAYER.length - 1)]
@@ -316,7 +323,7 @@ export class Uplink {
 
   private refill(now: number): void {
     if (this.capKbps === null) return
-    const burst = this.rate * 40 // 40ms of burst
+    const burst = this.rate * CAP_BURST_MS
     this.tokens = Math.min(burst, this.tokens + (now - this.lastRefill) * this.rate)
     this.lastRefill = now
   }
@@ -334,7 +341,7 @@ export class Uplink {
         if (!q.length) continue
         const { background: bg, dead } = e
         for (const [f, until] of dead) if (now > until) dead.delete(f)
-        for (const it of q) if (it.frame && now - it.enqueuedAt > it.maxAge) dead.set(it.frame, now + 2000)
+        for (const it of q) if (it.frame && now - it.enqueuedAt > it.maxAge) dead.set(it.frame, now + DEAD_FRAME_RETAIN_MS)
         let kept = 0
         for (const it of q) {
           if (now - it.enqueuedAt > it.maxAge || (it.frame && dead.has(it.frame))) {
@@ -416,7 +423,7 @@ export class Uplink {
         this.timer = setTimeout(() => {
           this.timer = null
           this.drain()
-        }, 4)
+        }, TOKEN_RETRY_MS)
       }
     } finally {
       this.draining = false

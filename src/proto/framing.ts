@@ -13,6 +13,18 @@ const SIG_SIZE = 64
 // Keep messages comfortably under the 16KiB cross-browser SCTP message limit.
 export const MAX_FRAGMENT_PAYLOAD = 16 * 1024 - HEADER_SIZE - SIG_SIZE
 export const NO_REF = 0xffffffff
+/**
+ * Most pieces (k + m) a frame may have: the header numbers pieces in a byte, and fec.ts's Cauchy
+ * rows need k + m <= 256 (GF(256)).
+ */
+export const MAX_PIECES = 256
+
+/** Throws unless k data and m parity pieces form a codable layout (integers, k >= 1, m >= 0, k + m <= MAX_PIECES). */
+export function assertStripes(k: number, m: number): void {
+  if (!Number.isInteger(k) || !Number.isInteger(m) || k < 1 || m < 0 || k + m > MAX_PIECES) {
+    throw new RangeError(`bad stripe layout k=${k} m=${m} (need integers, k >= 1, m >= 0, k + m <= ${MAX_PIECES})`)
+  }
+}
 
 const FLAG_KEY = 1 << 0
 const FLAG_AUDIO = 1 << 1
@@ -54,6 +66,9 @@ export interface Fragment {
 }
 
 export function encodeFragment(h: FragmentHeader, payload: Uint8Array): Uint8Array {
+  // The header fields are u8: a bad layout would be silently truncated on the wire.
+  assertStripes(h.k, h.m)
+  if (!Number.isInteger(h.pieceIdx) || h.pieceIdx < 0 || h.pieceIdx >= h.k + h.m) throw new RangeError(`bad piece index ${h.pieceIdx}`)
   const buf = new Uint8Array(HEADER_SIZE + payload.byteLength + SIG_SIZE)
   const v = new DataView(buf.buffer)
   v.setUint8(0, WIRE_VERSION)

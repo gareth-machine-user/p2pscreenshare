@@ -7,9 +7,11 @@ import {
   PEER_MSG_TYPES,
   PUBLISHER_MSG_TYPES,
   SUBSCRIBER_MSG_TYPES,
+  type EncoderRates,
   type PeerMsg,
   type SubscriberStats,
   type TopologyReport,
+  type UplinkRates,
 } from '../src/proto/messages'
 
 const stats: SubscriberStats = {
@@ -50,6 +52,7 @@ const valid: PeerMsg[] = [
   { t: 'topo', ch: 1, z: 'abc' },
   { t: 'publish-req' },
   { t: 'publish-deny' },
+  { t: 'publish-cancel' },
   { t: 'need-gop', ch: 1, stripes: [0] },
   { t: 'need-gop', ch: 1, stripes: [0, 2, 3] },
 ]
@@ -160,5 +163,32 @@ describe('topology report validation', () => {
     expect(isTopologyReport({ ...report, depth: { a: 'deep' } })).toBe(false)
     expect(isTopologyReport({ ...report, topology: { parents: {} } })).toBe(false)
     expect(isTopologyReport({ ...report, peers: [{ id: 'a', avoid: [], stats: { fps: 1 } }] })).toBe(false)
+    expect(isTopologyReport({ ...report, changes: 'many' })).toBe(false)
+    expect(isTopologyReport({ ...report, peers: [{ id: 'a', failures: '0', avoid: [], stats: null }] })).toBe(false)
+    expect(isTopologyReport({ ...report, peers: [{ id: 'a', failures: 0, avoid: [7], stats: null }] })).toBe(false)
+  })
+
+  const encoder: EncoderRates = { codec: 'vp09', targetKbps: 5000, ceilingKbps: 5000, kbps: 4800, captureFps: 30, encodedFps: 30, droppedFps: 0, keyframes: 0.1, encodeMs: 4, maxFrameKB: 60 }
+  const uplink: UplinkRates = { kbps: 9000, drops: [0, 0, 1], stalls: 0, queueMs: 3 }
+
+  it("keeps the publisher's own stats and links when well formed", () => {
+    const full = roundTrip({ ...report, publisherStats: { encoder, uplink }, peers: [{ ...report.peers[0], link: { drops: 1, queueMs: 2, backlogged: false, capKbps: null } }] }) as TopologyReport
+    expect(isTopologyReport(full)).toBe(true)
+    expect(full.publisherStats).toEqual({ encoder, uplink })
+    expect(full.peers[0].link).toEqual({ drops: 1, queueMs: 2, backlogged: false, capKbps: null })
+  })
+
+  it('drops malformed display extras (the panel would crash on them) but keeps the report', () => {
+    const bad = roundTrip({
+      ...report,
+      publisherStats: { encoder: { ...encoder, captureFps: 'x' }, uplink },
+      peers: [{ ...report.peers[0], link: { drops: NaN, queueMs: 2, backlogged: false, capKbps: null } }],
+    }) as unknown as TopologyReport
+    expect(isTopologyReport(bad)).toBe(true)
+    expect(bad.publisherStats).toBeUndefined()
+    expect(bad.peers[0].link).toBeNull()
+    const noDrops = roundTrip({ ...report, publisherStats: { encoder: null, uplink: { ...uplink, drops: undefined } } }) as unknown as TopologyReport
+    expect(isTopologyReport(noDrops)).toBe(true)
+    expect(noDrops.publisherStats).toBeUndefined()
   })
 })

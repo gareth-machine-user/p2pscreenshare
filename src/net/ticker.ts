@@ -24,7 +24,8 @@ let maxLagMs = 0
 function run(): void {
   const now = performance.now()
   for (const t of [...tasks]) {
-    if (now < t.due) continue
+    // A task cancelled by an earlier one in this same tick must not run.
+    if (!tasks.has(t) || now < t.due) continue
     // The worker ticks every 50 ms whatever the tab's state: a task much later than that waited
     // for the main thread (a long task, GC, an overloaded machine).
     maxLagMs = Math.max(maxLagMs, now - t.due - BASE_MS)
@@ -96,11 +97,6 @@ export function takeMainThreadLag(): number {
   const lag = Math.max(0, maxLagMs)
   maxLagMs = 0
   return lag
-}
-
-/** Whether this page is hidden, so its main-thread timers may be throttled (false outside a browser). */
-export function tabHidden(): boolean {
-  return typeof document !== 'undefined' && document.visibilityState === 'hidden'
 }
 
 /**

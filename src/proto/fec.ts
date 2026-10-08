@@ -1,3 +1,5 @@
+import { assertStripes } from './framing'
+
 // Systematic erasure coding over GF(256): k data pieces + m parity pieces; any k of the k+m pieces
 // reconstruct the frame. m=1 uses plain XOR parity; m>1 uses a Cauchy matrix (every square
 // submatrix of [I; C] is invertible, so the code is MDS).
@@ -62,6 +64,7 @@ export function pieceLength(frameLen: number, k: number): number {
 
 /** Splits `frame` into k data pieces (zero padded) and computes m parity pieces. */
 export function encodePieces(frame: Uint8Array, k: number, m: number): Uint8Array[] {
+  assertStripes(k, m)
   const P = pieceLength(frame.byteLength, k)
   const pieces: Uint8Array[] = []
   for (let i = 0; i < k; i++) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { decodePieces, encodePieces } from '../src/proto/fec'
-import { decodeFragment, encodeFragment, HEADER_SIZE, NO_REF, peekChannel, withReplayFlag, type FragmentHeader } from '../src/proto/framing'
+import { decodeFragment, encodeFragment, HEADER_SIZE, isLegacyAudio, MAX_PIECES, NO_REF, peekChannel, withReplayFlag, type FragmentHeader } from '../src/proto/framing'
 import { packetize, type EncodedFrame } from '../src/media/packetizer'
 import { Reassembler, type AssembledFrame } from '../src/media/reassembler'
 
@@ -71,6 +71,29 @@ describe('framing', () => {
     expect(decodeFragment(new Uint8Array(5))).toBeNull()
     expect(decodeFragment(encodeFragment({ ...h, fragIdx: 5 }, new Uint8Array(1)))).toBeNull()
   })
+
+  it('refuses to encode a stripe layout the u8 header fields would truncate', () => {
+    expect(() => encodeFragment({ ...h, k: 2.5 }, new Uint8Array(1))).toThrow(RangeError)
+    expect(() => encodeFragment({ ...h, k: 0 }, new Uint8Array(1))).toThrow(RangeError)
+    expect(() => encodeFragment({ ...h, k: 300, m: 0 }, new Uint8Array(1))).toThrow(RangeError)
+    expect(() => encodeFragment({ ...h, k: MAX_PIECES, m: 1 }, new Uint8Array(1))).toThrow(RangeError)
+    expect(() => encodeFragment({ ...h, m: -1 }, new Uint8Array(1))).toThrow(RangeError)
+    expect(() => encodeFragment({ ...h, pieceIdx: 5, stripe: 5 }, new Uint8Array(1))).toThrow(RangeError)
+    expect(() => encodeFragment({ ...h, k: MAX_PIECES - 1, m: 1, pieceIdx: 0, stripe: 0 }, new Uint8Array(1))).not.toThrow()
+  })
+
+  it('treats only whole audio frames (audio, k=1, m=0) as legacy, and lets only those travel on any stripe', () => {
+    const audio = { ...h, audio: true, key: false, layer: 0, k: 1, m: 0, pieceIdx: 0, fragIdx: 0, fragCount: 1 }
+    expect(isLegacyAudio(audio)).toBe(true)
+    expect(isLegacyAudio({ ...audio, audio: false })).toBe(false)
+    expect(isLegacyAudio({ ...audio, k: 2 })).toBe(false)
+    expect(isLegacyAudio({ ...audio, m: 1 })).toBe(false)
+    // Legacy audio copies go out on every stripe under one signature.
+    expect(decodeFragment(encodeFragment({ ...audio, stripe: 3 }, new Uint8Array(4)))?.header.stripe).toBe(3)
+    // Anything else must be on its own piece's stripe.
+    expect(decodeFragment(encodeFragment({ ...audio, audio: false, stripe: 3 }, new Uint8Array(4)))).toBeNull()
+    expect(decodeFragment(encodeFragment({ ...audio, m: 1, stripe: 1 }, new Uint8Array(4)))).toBeNull()
+  })
 })
 
 describe('fec', () => {
@@ -91,6 +114,40 @@ describe('fec', () => {
       }
     })
   }
+
+  it('refuses layouts it cannot code', () => {
+    expect(() => encodePieces(randomBytes(10), 2.5, 1)).toThrow(RangeError)
+    expect(() => encodePieces(randomBytes(10), 0, 1)).toThrow(RangeError)
+    expect(() => encodePieces(randomBytes(10), 200, 100)).toThrow(RangeError)
+  })
+
+  it('k=16 m=8 (the largest settings) recovers from any 8 erasures', () => {
+    const k = 16
+    const m = 8
+    const frame = randomBytes(5000, 99)
+    const pieces = encodePieces(frame, k, m)
+    // C(24, 16) is too many to try them all: the worst cases (every data piece but the parity
+    // can cover lost) plus a deterministic sample of random ones.
+    const patterns: number[][] = [
+      [...Array(k + m).keys()].slice(m), // the first 8 data pieces lost
+      [...Array(k + m).keys()].filter((i) => i % 3 !== 0).slice(0, k), // spread losses
+    ]
+    let x = 12345
+    const rand = () => (x = (x * 1103515245 + 12345) >>> 0) / 2 ** 32
+    for (let n = 0; n < 300; n++) {
+      const idx = [...Array(k + m).keys()]
+      for (let i = idx.length - 1; i > 0; i--) {
+        const j = Math.floor(rand() * (i + 1))
+        ;[idx[i], idx[j]] = [idx[j], idx[i]]
+      }
+      patterns.push(idx.slice(0, k))
+    }
+    for (const keep of patterns) {
+      const avail = pieces.map((p, i) => (keep.includes(i) ? p : undefined))
+      expect(decodePieces(avail, k, m, frame.byteLength), `keep ${keep}`).toEqual(frame)
+    }
+    expect(decodePieces(pieces.map((p, i) => (i < k - 1 ? p : undefined)), k, m, frame.byteLength)).toBeNull()
+  })
 
   it('returns null with fewer than k pieces', () => {
     const pieces = encodePieces(randomBytes(100), 3, 1)

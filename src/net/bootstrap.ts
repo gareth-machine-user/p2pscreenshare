@@ -87,6 +87,8 @@ export class Rendezvous<C extends PeerConn = MeshConn> implements RendezvousPort
 
   async start(): Promise<void> {
     this.keys = await lobbyKeys(this.opts.joinCode)
+    // Closed while deriving the keys (the lobby was left at once): no tracker, no timers.
+    if (this.closed) return
     const urls = this.opts.trackers?.length ? this.opts.trackers : DEFAULT_TRACKERS
     this.tracker = new TrackerClient(urls, this.keys.infoHash, this.opts.identity.id)
     this.tracker.onStatus = (c, t) => this.onTrackerStatus(c, t)
@@ -194,7 +196,13 @@ export class Rendezvous<C extends PeerConn = MeshConn> implements RendezvousPort
     try {
       const sdp = await conn.acceptOffer(offer.sdp)
       const env = await seal<DoorOffer>(this.opts.identity, { type: 'door-answer', peerId: this.opts.identity.id, offerId, sdp }, Infinity)
-      reply(await sealJson(this.keys, 'answer', offerId, env))
+      const sealed = await sealJson(this.keys, 'answer', offerId, env)
+      // Closed while answering: nobody would own the connection.
+      if (this.closed) {
+        conn.close()
+        return
+      }
+      reply(sealed)
       this.onConnection(conn)
     } catch (err) {
       console.warn('answering offer failed', err)
@@ -214,6 +222,11 @@ export class Rendezvous<C extends PeerConn = MeshConn> implements RendezvousPort
     o.conn.remoteId = answer.peerId
     try {
       await o.conn.acceptAnswer(answer.sdp)
+      // Out of the pool, so close() didn't close it.
+      if (this.closed) {
+        o.conn.close()
+        return
+      }
       this.onConnection(o.conn)
     } catch {
       // a bad answer SDP: this offer is spent either way

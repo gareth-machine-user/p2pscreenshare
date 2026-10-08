@@ -27,7 +27,21 @@ interface Socket {
   ws: WebSocket | null
   retryMs: number
   timer: ReturnType<typeof setTimeout> | null
+  /** When the current socket opened, or null while it isn't open. */
+  openedAt: number | null
 }
+
+/** Reconnect backoff: first delay, and the most it doubles up to (ms). */
+const RETRY_MIN_MS = 1000
+const RETRY_MAX_MS = 30_000
+/**
+ * A socket must stay open this long before the backoff resets (ms): a tracker that accepts and
+ * then drops the connection (rate limiting, a failing proxy) would otherwise be redialled every
+ * RETRY_MIN_MS forever.
+ */
+export const STABLE_OPEN_MS = 10_000
+/** Reconnect delays are spread by up to ± this share, so many clients don't redial in lockstep. */
+const RETRY_JITTER = 0.25
 
 export class TrackerClient {
   onOffer: (o: IncomingOffer) => void = () => {}
@@ -42,8 +56,10 @@ export class TrackerClient {
     urls: string[],
     private infoHash: string,
     private peerId: string,
+    /** Uniform in [0, 1): the reconnect jitter (tests make it deterministic). */
+    private random: () => number = Math.random,
   ) {
-    this.sockets = urls.map((url) => ({ url, ws: null, retryMs: 1000, timer: null }))
+    this.sockets = urls.map((url) => ({ url, ws: null, retryMs: RETRY_MIN_MS, timer: null, openedAt: null }))
     this.sockets.forEach((s) => this.connect(s))
   }
 
@@ -63,13 +79,16 @@ export class TrackerClient {
     }
     s.ws = ws
     ws.onopen = () => {
-      s.retryMs = 1000
+      s.openedAt = performance.now()
       this.onStatus(this.connectedCount, this.sockets.length)
       // Re-send the latest announce so a reconnecting tracker learns about us.
       if (this.lastAnnounce) this.sendTo(s, this.lastAnnounce)
     }
     ws.onclose = () => {
-      if (s.ws === ws) s.ws = null
+      if (s.ws !== ws) return // a socket this one already replaced
+      s.ws = null
+      if (s.openedAt !== null && performance.now() - s.openedAt >= STABLE_OPEN_MS) s.retryMs = RETRY_MIN_MS
+      s.openedAt = null
       this.onStatus(this.connectedCount, this.sockets.length)
       this.scheduleReconnect(s)
     }
@@ -79,11 +98,12 @@ export class TrackerClient {
 
   private scheduleReconnect(s: Socket): void {
     if (this.closed || s.timer) return
+    const jitter = 1 + RETRY_JITTER * (2 * this.random() - 1)
     s.timer = setTimeout(() => {
       s.timer = null
       this.connect(s)
-    }, s.retryMs)
-    s.retryMs = Math.min(s.retryMs * 2, 30_000)
+    }, s.retryMs * jitter)
+    s.retryMs = Math.min(s.retryMs * 2, RETRY_MAX_MS)
   }
 
   private handle(s: Socket, raw: unknown): void {
