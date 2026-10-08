@@ -1,4 +1,5 @@
 import { wallClock } from '../net/clock'
+import { after, every } from '../net/ticker'
 import { fromBase64, type StreamInfo } from '../proto/messages'
 import { AudioPlayer } from './audio'
 import { closeCodec } from './codecs'
@@ -60,7 +61,7 @@ export class Player {
   private early: AssembledFrame[] = []
   private retiredEpoch: number | null = null
   private raf = 0
-  private interval: ReturnType<typeof setInterval>
+  private stopDrain: () => void
   private renderedTimes: number[] = []
   private latencySamples: number[] = []
   private lastRendered: VideoFrame | null = null
@@ -79,8 +80,9 @@ export class Player {
       if (!this.closed) this.raf = requestAnimationFrame(loop)
     }
     this.raf = requestAnimationFrame(loop)
-    // rAF pauses in background tabs; keep the pipeline draining anyway.
-    this.interval = setInterval(() => this.tick(), 50)
+    // rAF pauses in background tabs, and their main-thread timers are throttled (to a minute
+    // after a while): keep the pipeline draining on the ticker's worker instead.
+    this.stopDrain = every(50, () => this.tick())
   }
 
   /** Extra canvases drawing the same frames (a preview shows in its tile and on the stage). */
@@ -154,10 +156,10 @@ export class Player {
 
   /** Rebuilds a failed decoder after a backoff, unless it has been replaced meanwhile. */
   private scheduleRebuild(decoder: VideoDecoder): void {
-    setTimeout(() => {
+    after(this.rebuilds.next(wallClock()), () => {
       if (this.closed || this.decoder !== decoder || !this.info) return
       this.rebuildDecoder(this.info, this.info)
-    }, this.rebuilds.next(wallClock()))
+    })
   }
 
   push(f: AssembledFrame): void {
@@ -268,7 +270,7 @@ export class Player {
   close(): void {
     this.closed = true
     cancelAnimationFrame(this.raf)
-    clearInterval(this.interval)
+    this.stopDrain()
     this.renderQueue.forEach((p) => p.frame.close())
     this.lastRendered?.close()
     this.early = []
