@@ -1,9 +1,9 @@
 import { wallClock } from '../net/clock'
 import { sleep } from '../net/ticker'
-import { NO_REF } from '../proto/framing'
 import { toBase64, type StreamInfo } from '../proto/messages'
 import { frameReader } from './capture'
 import { closeCodec } from './codecs'
+import { LayerRefs } from './layerRefs'
 import type { EncodedFrame } from './packetizer'
 import { bitsPerPixel, HIGH_BPP } from './quality'
 
@@ -97,9 +97,8 @@ export class VideoPipeline {
   private encoder: VideoEncoder | null = null
   private config: VideoEncoderConfig | null = null
   private epoch = 0
-  private seq = 0
-  private gopId = 0
-  private lastSeqByLayer: number[] = []
+  /** Frame numbering and references (L1Tn). */
+  private refs = new LayerRefs()
   private lastKeyAt = -Infinity
   private keyRequested = true
   /** Set by setTarget: the next frame picks the codec and config afresh. */
@@ -358,26 +357,10 @@ export class VideoPipeline {
     }
 
     const key = chunk.type === 'key'
-    const layer = key ? 0 : (meta?.svc?.temporalLayerId ?? 0)
-    const seq = this.seq
-    this.seq = (this.seq + 1) >>> 0
-    let refSeq = NO_REF
-    if (key) {
-      this.gopId = seq
-      this.lastSeqByLayer = []
-    } else {
-      // L1Tn: Tn references the most recent frame of a lower layer; T0 references the previous T0.
-      const lower = layer === 0 ? [this.lastSeqByLayer[0]] : this.lastSeqByLayer.slice(0, layer)
-      const refs = lower.filter((x) => x !== undefined)
-      refSeq = refs.length ? Math.max(...refs) : seq - 1
-    }
-    this.lastSeqByLayer[layer] = seq
-    // A frame of layer L invalidates higher layers' references to older frames.
-    this.lastSeqByLayer.length = layer + 1
-
+    const refs = this.refs.next(key, meta?.svc?.temporalLayerId ?? 0)
     const data = new Uint8Array(chunk.byteLength)
     chunk.copyTo(data)
-    this.onFrame({ epoch: this.epoch, seq, gopId: this.gopId, refSeq, key, layer, audio: false, captureTime, data })
+    this.onFrame({ epoch: this.epoch, ...refs, key, audio: false, captureTime, data })
   }
 
   stop(): void {
