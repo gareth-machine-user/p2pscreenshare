@@ -5,6 +5,7 @@ import { seal, type Envelope } from '../src/mesh/envelope'
 import { generateIdentity, peerIdOf, type PeerIdentity } from '../src/mesh/identity'
 import { toBase64Url } from '../src/net/lobby'
 import { Mesh, type MeshOptions } from '../src/mesh/mesh'
+import { CHAT_KEEP, ChatLog } from '../src/mesh/chatLog'
 import { GONE_MS, type MemberRecord } from '../src/mesh/records'
 import { advance, installClock, settle, uninstallClock, until } from './fakes/clock'
 import { FakeNetwork, type FakeConn } from './fakes/network'
@@ -351,5 +352,50 @@ describe('mesh (in-memory network)', () => {
     await until(() => meshed(lobby.meshes), 15_000, 'liar meshed in')
     await advance(1000)
     expect(doors()).toEqual(before)
+  })
+})
+
+describe('chat log', () => {
+  async function log(banned: string[] = []) {
+    const { identity } = await generateIdentity()
+    const shown: string[] = []
+    const chat = new ChatLog({ identity, isBanned: (id) => banned.includes(id), onChat: (m) => shown.push(m.text) })
+    return { identity, chat, shown }
+  }
+
+  it('keeps the newest CHAT_KEEP by time, refusing duplicates and messages older than all kept', async () => {
+    const { chat, shown } = await log()
+    const { identity: author } = await generateIdentity()
+    const t0 = Date.now()
+    const envs = await Promise.all(Array.from({ length: CHAT_KEEP }, (_, i) => chatEnv(author, `m${i}`, t0 - CHAT_KEEP + i)))
+    // A snapshot's history isn't rate limited.
+    for (const env of envs.reverse()) expect(await chat.receive(env, true)).toBe(author.id)
+    expect(chat.messages.map((m) => m.text)).toEqual(Array.from({ length: CHAT_KEEP }, (_, i) => `m${i}`))
+    expect(await chat.receive(envs[0], true)).toBeNull()
+    expect(await chat.receive(await chatEnv(author, 'ancient', t0 - 1e6), true)).toBeNull()
+    expect(await chat.receive(await chatEnv(author, 'new', t0), true)).toBe(author.id)
+    expect(chat.messages.at(-1)!.text).toBe('new')
+    expect(chat.messages[0].text).toBe('m1')
+    expect(chat.envelopes()).toHaveLength(CHAT_KEEP)
+    expect(shown).toHaveLength(CHAT_KEEP + 1)
+  })
+
+  it('refuses banned authors and envelopes signed by someone other than the named sender', async () => {
+    const { identity: bad } = await generateIdentity()
+    const { identity: other } = await generateIdentity()
+    const { chat } = await log([bad.id])
+    expect(await chat.receive(await chatEnv(bad, 'hi'))).toBeNull()
+    const forged = await seal(other, { type: 'chat', id: 'x', from: bad.id, name: 'x', text: 'hi', at: Date.now() })
+    expect(await chat.receive(forged)).toBeNull()
+    expect(chat.messages).toEqual([])
+  })
+
+  it("rate limits this peer's own messages and trims them", async () => {
+    const { chat } = await log()
+    expect(chat.send('   ', 'me')).toBeNull()
+    for (let i = 0; i < 5; i++) expect(chat.send(` a${i} `, 'me')).not.toBeNull()
+    expect(chat.send('a5', 'me')).toBeNull()
+    await advance(10)
+    expect(chat.messages.map((m) => m.text)).toEqual(['a0', 'a1', 'a2', 'a3', 'a4'])
   })
 })

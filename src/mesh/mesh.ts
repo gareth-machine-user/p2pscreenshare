@@ -19,6 +19,7 @@
 // signaled over the link's ctl channel (lanes.ts). connFor picks the one carrying a tree.
 import { Rendezvous, type RendezvousOptions, type RendezvousPort } from '../net/bootstrap'
 import { emptyAuth, isBanned, type AuthDoc } from './auth'
+import { CHAT_KEEP, ChatLog, type ChatMessage } from './chatLog'
 import { open, seal, type Envelope, type Typed } from './envelope'
 import { peerIdOf, type PeerIdentity } from './identity'
 import { MeshConn, type ConnFactory, type PeerConn } from './meshConn'
@@ -60,20 +61,14 @@ const ISOLATED_MS = 3000
  */
 const SIG_MAX_AGE_MS = 10 * 60_000
 /** A knock doesn't restart an offer to the knocker made this recently (it is likely in flight). */
+export { CHAT_MAX_LEN, type ChatMessage } from './chatLog'
+
 const KNOCK_KEEP_OFFER_MS = 5000
 /**
  * Members learned of this soon after this peer joined were in the lobby before it, so their claimed
  * join time is taken as is. Later ones joined after, so this peer vouches no earlier than first sight.
  */
 const JOIN_VOUCH_GRACE_MS = 5000
-const CHAT_KEEP = 50
-export const CHAT_MAX_LEN = 500
-/**
- * Most a chat message's (sender-chosen) time may be ahead of this peer's clock. The log is ordered
- * by it, so a message dated far ahead would never be evicted and would push every newer one out.
- */
-const CHAT_MAX_FUTURE_MS = 60_000
-const CHAT_RATE = { count: 5, perMs: 5000 }
 
 interface SigBody extends Typed {
   type: 'sig'
@@ -82,23 +77,6 @@ interface SigBody extends Typed {
   kind: 'offer' | 'answer' | 'knock'
   sdp?: string
   nonce: string
-  at: number
-}
-
-interface ChatBody extends Typed {
-  type: 'chat'
-  id: string
-  from: string
-  name: string
-  text: string
-  at: number
-}
-
-export interface ChatMessage {
-  id: string
-  from: string
-  name: string
-  text: string
   at: number
 }
 
@@ -145,21 +123,6 @@ interface KeyValueStore {
 
 const localStore: KeyValueStore = { getItem: storageGet, setItem: storageSet }
 
-/** Sliding-window rate limit. */
-class RateWindow {
-  private times: number[] = []
-
-  constructor(private rate: { count: number; perMs: number }) {}
-
-  /** Counts an event at `now`; false (and not counted) if the window is already full. */
-  take(now: number): boolean {
-    this.times = this.times.filter((t) => now - t < this.rate.perMs)
-    if (this.times.length >= this.rate.count) return false
-    this.times.push(now)
-    return true
-  }
-}
-
 export class Mesh<C extends PeerConn = MeshConn> {
   readonly selfId: string
   readonly ownerId: string
@@ -167,7 +130,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
   /** Open or connecting links, by remote peer id. */
   readonly conns = new Map<string, C>()
   readonly detector = new FailureDetector(GONE_MS)
-  chat: ChatMessage[] = []
   /** The owner's latest signed decisions (publish policy, grants, revocations, bans). */
   auth: AuthDoc = emptyAuth()
   trackersConnected = 0
@@ -204,10 +166,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
   private connect: ConnFactory<C>
   /** Extra media connections per pair. */
   readonly lanes: Lanes
-  /** The chat log with each message's envelope (to hand on), ordered by time like `chat`. */
-  private chatLog: { m: ChatMessage; env: Envelope }[] = []
-  private chatSent = new RateWindow(CHAT_RATE)
-  private chatByAuthor = new Map<string, RateWindow>()
+  private chatLog: ChatLog
   /** Links whose first snapshot (and its chat history) has arrived. */
   private snapshotted = new WeakSet<C>()
   /** Per remote: failed attempts and when to try again. */
@@ -273,6 +232,14 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
     this.rendezvous.shouldAnswer = (id) => this.shouldAnswerDoor(id)
     this.rendezvous.admit = (id) => !this.offline && !this.isBlocked(id) && !this.isBannedPeer(id)
+    this.chatLog = new ChatLog({
+      identity: opts.identity,
+      isBanned: (id) => this.isBannedPeer(id),
+      onChat: (m) => {
+        this.onChat(m)
+        this.onChange()
+      },
+    })
     const connectLane = opts.connectLane ?? ((ice, id, i) => new Lane(ice, id, i))
     this.lanes = new Lanes({
       selfId: this.selfId,
@@ -303,6 +270,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
     this.timers.push(every(HEARTBEAT_MS, () => void this.publish()))
     this.timers.push(every(DIGEST_MS, () => this.exchangeDigest()))
     this.timers.push(every(RTT_SAMPLE_MS, () => this.sampleRtts()))
+  }
+
+  /** The recent chat, ordered by time. */
+  get chat(): ChatMessage[] {
+    return this.chatLog.messages
   }
 
   get record(): MemberRecord {
@@ -476,11 +448,9 @@ export class Mesh<C extends PeerConn = MeshConn> {
   }
 
   sendChat(text: string): boolean {
-    const trimmed = text.trim().slice(0, CHAT_MAX_LEN)
-    if (!trimmed || !this.chatSent.take(performance.now())) return false
-    const body: ChatBody = { type: 'chat', id: crypto.randomUUID(), from: this.selfId, name: this.self.name, text: trimmed, at: Date.now() }
-    void seal(this.opts.identity, body).then((env) => {
-      this.storeChat(body, env)
+    const sealing = this.chatLog.send(text, this.self.name)
+    if (!sealing) return false
+    void sealing.then((env) => {
       for (const c of this.conns.values()) c.sendCtl({ t: 'chat', env })
     })
     return true
@@ -593,11 +563,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
     if (this.selfEnv) conn.sendCtl({ t: 'rec', env: this.selfEnv })
     if (viaTracker) {
       // Door link: hand over everything we know, so the joiner can mesh in.
-      conn.sendCtl({ t: 'snapshot', recs: this.store.all().map((s) => s.env), chat: this.chatEnvelopes(), auth: this.authEnv })
+      conn.sendCtl({ t: 'snapshot', recs: this.store.all().map((s) => s.env), chat: this.chatLog.envelopes(), auth: this.authEnv })
       this.rendezvous.setSeeking(false)
     } else if (this.chatLog.length) {
       // Recent chat, so messages sent while this pair was apart still arrive (deduplicated by id).
-      conn.sendCtl({ t: 'snapshot', recs: [], chat: this.chatEnvelopes() })
+      conn.sendCtl({ t: 'snapshot', recs: [], chat: this.chatLog.envelopes() })
     }
     if (this.authEnv) conn.sendCtl({ t: 'auth', env: this.authEnv })
     conn.sendCtl({ t: 'digest', d: this.digest(), a: this.auth.version })
@@ -944,42 +914,12 @@ export class Mesh<C extends PeerConn = MeshConn> {
 
   /** `history`: part of a link's initial snapshot, so not rate limited by arrival time. */
   private async onChatEnv(env: Envelope, from: string, history = false): Promise<void> {
-    const opened = await open<ChatBody>(env, 'chat')
-    if (!opened) return
-    const b = opened.body
-    if (b.from !== opened.author || typeof b.id !== 'string' || typeof b.name !== 'string' || typeof b.at !== 'number') return
-    if (typeof b.text !== 'string' || b.text.length > CHAT_MAX_LEN) return
-    if (!Number.isFinite(b.at) || b.at > Date.now() + CHAT_MAX_FUTURE_MS) return
-    if (this.isBannedPeer(b.from)) return
-    if (this.chat.some((m) => m.id === b.id)) return
-    if (!history) {
-      // Senders are rate limited by everyone, so a flooding member can't drown the chat.
-      let limit = this.chatByAuthor.get(b.from)
-      if (!limit) this.chatByAuthor.set(b.from, (limit = new RateWindow(CHAT_RATE)))
-      if (!limit.take(performance.now())) return
-    }
-    // One older than the whole log is dropped (and not handed on).
-    if (!this.storeChat(b, env)) return
+    const author = await this.chatLog.receive(env, history)
+    if (!author) return
     // Forward to neighbours the sender can't reach directly (as either side of the pair says).
     for (const c of this.openConns()) {
-      if (c.remoteId !== from && c.remoteId !== b.from && this.unreachablePair(b.from, c.remoteId)) c.sendCtl({ t: 'chat', env })
+      if (c.remoteId !== from && c.remoteId !== author && this.unreachablePair(author, c.remoteId)) c.sendCtl({ t: 'chat', env })
     }
-  }
-
-  /** Adds a message to the log; false if it is older than all CHAT_KEEP kept ones (so not kept). */
-  private storeChat(b: ChatBody, env: Envelope): boolean {
-    const entry = { m: { id: b.id, from: b.from, name: b.name, text: b.text, at: b.at }, env }
-    // Stable sort: among equal times, the newcomer stays last (and so is kept).
-    this.chatLog = [...this.chatLog, entry].sort((x, y) => x.m.at - y.m.at).slice(-CHAT_KEEP)
-    this.chat = this.chatLog.map((e) => e.m)
-    if (!this.chatLog.includes(entry)) return false
-    this.onChat(entry.m)
-    this.onChange()
-    return true
-  }
-
-  private chatEnvelopes(): Envelope[] {
-    return this.chatLog.map((e) => e.env)
   }
 
   // --- dispatch ----------------------------------------------------------------------------------
