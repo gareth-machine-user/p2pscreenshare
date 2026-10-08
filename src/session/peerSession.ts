@@ -7,7 +7,7 @@
 // - Publish rights: requests to publish and the owner's answers (session/publishRights.ts).
 // - Relay: one RelayNode for every channel, forwarding over the mesh links' media channels.
 // - Capacity: each connection's delivered rate (session/connMetrics.ts, capacity.ts), split into
-//   relay slots per watched channel; the presenter's bitrate follows it (session/congestion.ts).
+//   relay slots per watched channel; the presenter's bitrate follows it (session/presenterRate.ts).
 import type { PublishPolicy } from '../mesh/auth'
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
@@ -19,14 +19,14 @@ import { Uplink } from '../net/uplink'
 import { isTopologyReport, parsePeerMsg, type EncoderRates, type PeerMsg, type TopologyReport, type UplinkRates } from '../proto/messages'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
-import { FROZEN_LAG_MS, rebalanceWeights, splitBudget, stripeKbpsFor, type CapacityModel } from './capacity'
-import { AudienceCap, audienceLimit, BitrateController, rateTarget, type RateTarget } from './congestion'
+import { FROZEN_LAG_MS, rebalanceWeights, splitBudget, type CapacityModel } from './capacity'
 import type { ChannelPublisher, PublisherContext } from './channelPublisher'
 import { PublishedStream, type ShareOptions } from './publishedStream'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { AutoFallback, liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { HeadroomProbe } from './headroom'
+import { PresenterRate, type RateStatus } from './presenterRate'
 import { ConnMetrics, type LinkRow } from './connMetrics'
 import { PublishRights, type PublishRequest, type PublishRightsContext, type RequestState } from './publishRights'
 import { debounce, every, takeMainThreadLag } from '../net/ticker'
@@ -112,8 +112,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
   revokedNotice = false
   /** Set when the owner removed this peer from the lobby. */
   kicked = false
-  /** The publisher's stream adapts its bitrate to what the audience can carry (Auto quality). */
-  autoBitrate = false
+  /** The presenter's bitrate control: what its stream should run at, and why (session/presenterRate.ts). */
+  readonly rateControl: PresenterRate
   /** Budget weight per watched channel (deficit-driven). */
   readonly weights = new Map<number, number>()
   /** Debug/e2e: keep publishing after a revocation (relays must still drop the stream). */
@@ -137,16 +137,11 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
   /** Set by leave(): no more reconciles (they would re-create subscriptions). */
   private left = false
   private topoWatching = new Set<number>()
-  private rateCtl = new BitrateController()
-  /** The bitrate the presenter's stream should run at, and what limits it (session/congestion.ts). */
-  rate: RateTarget | null = null
   /**
    * This computer can't keep up (last window, display only): the page stalled for `stallMs` (main
    * thread busy; such windows don't count towards capacity) or the encoder dropped frames.
    */
   localLoad: { stallMs: number; encoderDroppedFps: number } | null = null
-  /** Auto quality's cap for the presenter's stream, apart from the chosen quality (session/congestion.ts). */
-  private audienceCap = new AudienceCap()
   /** Auto quality's stall detector for the stage stream (session/stage.ts). */
   private autoStall = new AutoFallback()
 
@@ -170,6 +165,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     })
     this.metrics = new ConnMetrics(this.mesh, this.uplink)
     this.capacity = this.metrics.capacity
+    this.rateControl = new PresenterRate(this.selfId, this.capacity)
     // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
     this.relay = new RelayNode(
       this.uplink,
@@ -218,7 +214,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     this.timers.push(every(HEADROOM_CHECK_MS, () => this.maybeDiscover()))
     this.timers.push(every(AUTO_QUALITY_CHECK_MS, () => this.checkAutoQuality()))
     this.timers.push(every(REBALANCE_MS, () => this.rebalance()))
-    this.timers.push(every(AUTO_BITRATE_CHECK_MS, () => this.checkAutoBitrate()))
+    this.timers.push(every(AUTO_BITRATE_CHECK_MS, () => this.rateControl.checkAudience(this.publishing, performance.now())))
     this.timers.push(every(STAGE_LOG_MS, () => this.logStage()))
     this.timers.push(every(LINK_STATS_MS, () => void this.metrics.pollLinkStats()))
   }
@@ -439,7 +435,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     if (!this.canShare) throw new Error('You need the owner’s permission to share.')
     this.revokedNotice = false
     this.stopSharing()
-    this.audienceCap = new AudienceCap()
+    this.rateControl.newStream()
     const stream = new PublishedStream(opts, this)
     stream.onEnded = () => {
       if (this.publishing === stream) this.stopSharing()
@@ -540,96 +536,18 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     this.updateOffers()
   }
 
-  /**
-   * Auto quality for a presenter: when the audience's upload can't carry the stream for 10 s, the
-   * publisher's sharing controls warn, and with Auto quality the bitrate is capped at what it can
-   * carry (adaptBitrate applies it). The chosen quality stays the ceiling, so the cap lifts once
-   * the audience carries the stream again.
-   */
-  private checkAutoBitrate(): void {
-    const full = this.publishing?.full
-    if (!this.publishing || !full) return
-    this.audienceCap.step(performance.now(), this.autoBitrate, full.limited, this.publishing.ceilingKbps)
+  /** The publisher's stream adapts its bitrate to what the audience can carry (Auto quality). */
+  get autoBitrate(): boolean {
+    return this.rateControl.autoBitrate
   }
 
-  /**
-   * The presenter's bitrate (session/congestion.ts): 85% of what the wire budget per direct child
-   * carries, the budget being the smaller of the uplink's capacity shared by the direct children
-   * and the median capacity of the peers it feeds directly. Runs on each 2 s window.
-   */
-  private adaptBitrate(now: number): void {
-    const s = this.publishing
-    const full = s?.full
-    if (!s || !full) {
-      this.rate = null
-      return
-    }
-    const edges = this.directEdges(full)
-    const stripes = full.stripes
-    const peerKbps = [...edges.byPeer].map(([peer, e]) => {
-      const c = this.capacity.peer(peer)
-      // A peer fed only some stripes needs only that share of a full copy.
-      return c.bound && c.kbps !== null ? (c.kbps * stripes) / e : null
-    })
-    const t = rateTarget({
-      chosenKbps: s.ceilingKbps,
-      // The audience's relay slots: never climb past what they carry (Auto quality cuts to it).
-      audienceKbps: audienceLimit(this.autoBitrate ? this.audienceCap.kbps : null, full.limited, full.kbps),
-      uplinkKbps: this.capacity.uplinkKbps,
-      directChildren: edges.children,
-      peerKbps,
-      wireAt: (v) => stripes * stripeKbpsFor(v, full.k, full.withAudio),
-    })
-    this.rate = t
-    const next = this.rateCtl.step(now, full.kbps, t)
-    if (next !== null) s.adaptBitrate(next)
+  set autoBitrate(on: boolean) {
+    this.rateControl.autoBitrate = on
   }
 
-  /**
-   * This peer's direct children in its own full channel: (child, stripe) edges per child, and
-   * edges / stripes (at least one full copy once anyone watches).
-   */
-  private directEdges(full: ChannelPublisher): { byPeer: Map<string, number>; children: number } {
-    const byPeer = new Map<string, number>()
-    let n = 0
-    for (const [child, ps] of Object.entries(full.topology.parents)) {
-      for (const p of ps) {
-        if (p !== this.selfId) continue
-        n++
-        byPeer.set(child, (byPeer.get(child) ?? 0) + 1)
-      }
-    }
-    return { byPeer, children: Math.max(n, full.subscribers.size ? full.stripes : 0) / full.stripes }
-  }
-
-  /**
-   * The presenter's bitrate and what sets it, in numbers (presenter bar, Stats). Null when not
-   * presenting.
-   */
-  rateStatus(): {
-    currentKbps: number
-    chosenKbps: number
-    limit: RateTarget['limit']
-    targetKbps: number
-    uplinkKbps: number | null
-    medianPeerKbps: number | null
-    feasibleKbps: number | null
-    stalledLanes: number
-  } | null {
-    const s = this.publishing
-    const full = s?.full
-    if (!s || !full) return null
-    const t = this.rate
-    return {
-      currentKbps: full.kbps,
-      chosenKbps: s.ceilingKbps,
-      limit: t?.limit ?? 'chosen',
-      targetKbps: Math.round(t?.kbps ?? s.ceilingKbps),
-      uplinkKbps: this.capacity.uplinkKbps === null ? null : Math.round(this.capacity.uplinkKbps),
-      medianPeerKbps: t?.medianPeerKbps == null ? null : Math.round(t.medianPeerKbps),
-      feasibleKbps: full.limited?.feasibleKbps ?? null,
-      stalledLanes: this.metrics.stalledLanes(),
-    }
+  /** The presenter's bitrate and what sets it, in numbers (presenter bar, Stats). Null when not presenting. */
+  rateStatus(): RateStatus | null {
+    return this.rateControl.status(this.publishing, this.metrics.stalledLanes())
   }
 
   // --- control messages --------------------------------------------------------------------------
@@ -718,7 +636,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     this.metrics.sampleLinks(now, lagMs)
     const encoderDroppedFps = this.encoderStatsNow?.droppedFps ?? 0
     this.localLoad = lagMs >= FROZEN_LAG_MS || encoderDroppedFps >= ENCODER_BEHIND_FPS ? { stallMs: lagMs, encoderDroppedFps } : null
-    this.adaptBitrate(now)
+    this.rateControl.adapt(this.publishing, now)
     this.updateOffers()
   }
 
@@ -732,7 +650,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     const now = performance.now()
     // Held below the chosen quality by a capacity estimate, with nothing backlogged to show it: the
     // estimate may be stale or low, and only a probe raises it.
-    const limited = this.rate !== null && (this.rate.limit === 'uplink' || this.rate.limit === 'viewers')
+    const limit = this.rateControl.target?.limit
+    const limited = limit === 'uplink' || limit === 'viewers'
     const every = limited ? HEADROOM_LIMITED_MS : HEADROOM_EVERY_MS
     const due = this.headroom.lastAt === -Infinity ? now - this.firstLinkAt >= HEADROOM_FIRST_MS : now - this.headroom.lastAt >= every
     if (due && !this.metrics.backloggedNow) void this.discover()

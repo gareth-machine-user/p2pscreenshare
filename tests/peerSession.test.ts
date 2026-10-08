@@ -66,7 +66,14 @@ function sent(net: FakeNetwork, from: string, to: string, t: string): unknown[] 
 /** Makes `s` present a channel of k + m stripes without capture or encoding. */
 function present(s: PeerSession, k = 2, m = 1): ChannelPublisher {
   const cp = new ChannelPublisher(0x1234, 'full', k, m, 1000, false, s, () => {})
-  const stream = { channels: [cp], full: cp, ceilingKbps: 1000, stop: () => cp.stop(), sampleEncoder: () => null }
+  const stream = {
+    channels: [cp],
+    full: cp,
+    ceilingKbps: 1000,
+    stop: () => cp.stop(),
+    sampleEncoder: () => null,
+    adaptBitrate: (kbps: number) => void (cp.kbps = kbps),
+  }
   s.publishing = stream as unknown as PublishedStream
   // Announces the channel with what decoders configure from.
   cp.setStream({ epoch: 1, codec: 'vp8', codedWidth: 16, codedHeight: 16 })
@@ -218,5 +225,9 @@ describe('PeerSession (in-memory network)', () => {
       emit(false)
     }
     await until(() => decodes > 0, 3000, 'frames decoded')
+    // The bitrate control ran on the uplink windows meanwhile.
+    await advance(2000)
+    expect(presenter.rateStatus()).toMatchObject({ chosenKbps: 1000, stalledLanes: 0 })
+    expect(viewer.rateStatus()).toBeNull()
   })
 })
