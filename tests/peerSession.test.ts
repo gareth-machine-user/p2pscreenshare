@@ -22,8 +22,8 @@ function memoryStore() {
   return { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v) }
 }
 
-/** `n` sessions, started and meshed; session 0 owns the lobby. */
-async function makeLobby(n: number): Promise<Lobby> {
+/** `n` sessions, not started; session 0 owns the lobby. */
+async function makeSessions(n: number): Promise<Lobby> {
   const net = new FakeNetwork({ delayMs: 5 })
   const ids = await Promise.all(Array.from({ length: n }, async () => (await generateIdentity()).identity))
   const sessions = ids.map(
@@ -44,6 +44,12 @@ async function makeLobby(n: number): Promise<Lobby> {
         } as unknown as PeerSessionOptions['meshDeps'],
       }),
   )
+  return { net, ids, sessions }
+}
+
+/** `n` sessions, started and meshed; session 0 owns the lobby. */
+async function makeLobby(n: number): Promise<Lobby> {
+  const { net, ids, sessions } = await makeSessions(n)
   for (const s of sessions) await s.start()
   await until(() => sessions.every((s) => sessions.every((o) => o === s || !!s.mesh.linkFor(o.selfId))), 15_000, 'full mesh')
   return { net, ids, sessions }
@@ -155,6 +161,27 @@ describe('PeerSession (in-memory network)', () => {
     expect(member.requestState).toBe('idle')
     expect(sent(lobby.net, member.selfId, owner.selfId, 'publish-cancel')).toHaveLength(1)
     await until(() => !owner.requests.has(member.selfId), 3000, 'request withdrawn')
+  })
+
+  it("measures the uplink's first window from construction", async () => {
+    lobby = await makeSessions(1)
+    const [s] = lobby.sessions
+    const stats = s.uplink.stats
+    await advance(1000)
+    await s.start()
+    stats.sentBytes = 75_000
+    stats.sentItems = 30
+    stats.droppedItems = 10
+    stats.queueDelaySum = 600
+    stats.queueDelayN = 20
+    // The first sample, 2 s after start: 3 s after construction.
+    await advance(2000)
+    expect(s.uplinkSample()).toEqual({ kbps: (75_000 * 8) / 1000 / 3, dropRate: 0.25 })
+    expect(s.uplinkRates()).toMatchObject({ kbps: 200, queueMs: 30 })
+    stats.sentBytes += 50_000
+    await advance(2000)
+    expect(s.uplinkSample()).toEqual({ kbps: 200, dropRate: 0 })
+    expect(s.uplinkRates()).toMatchObject({ kbps: 200, queueMs: 0 })
   })
 
   it('a viewer joins a presenter’s channel and decodes its frames', async () => {

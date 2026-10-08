@@ -131,6 +131,25 @@ interface LaneRate {
   stalled: boolean
 }
 
+/** The uplink's cumulative counters that sampleUplink turns into rates. */
+interface UplinkCounters {
+  bytes: number
+  items: number
+  dropped: number
+  /** Drops by layer: 0, 1, and 2 and above. */
+  t0: number
+  t1: number
+  t2: number
+  stalls: number
+  queueSum: number
+  queueN: number
+}
+
+function uplinkCounters(s: Uplink['stats']): UplinkCounters {
+  const d = s.droppedByLayer
+  return { bytes: s.sentBytes, items: s.sentItems, dropped: s.droppedItems, t0: d[0], t1: d[1], t2: d[2] + d[3], stalls: s.bufferStalls, queueSum: s.queueDelaySum, queueN: s.queueDelayN }
+}
+
 /** What the session keeps per open connection (a mesh link or a lane), in one place. */
 interface ConnRecord {
   peer: string
@@ -193,13 +212,12 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private firstLinkAt: number | null = null
   /** Some media connection was backlogged in the last window (no headroom probe then). */
   private backloggedNow = false
-  private uplinkSampleAt = { at: performance.now(), sent: 0, sentItems: 0, dropped: 0 }
   private uplinkNow = { kbps: 0, dropRate: 0 }
   /** This peer's uplink and (when presenting) encoder, per second over the last 2 s window. */
   uplinkStatsNow: UplinkRates | null = null
   encoderStatsNow: EncoderRates | null = null
-  private uplinkWindow = new RateWindow<{ bytes: number; t0: number; t1: number; t2: number; stalls: number }>()
-  private lastQueueDelay = { sum: 0, n: 0 }
+  /** The uplink's counters per second; the first window runs from construction (all zero then). */
+  private uplinkWindow = new RateWindow<UplinkCounters>()
   private reconcileTimer: (() => void) | null = null
   private timers: (() => void)[] = []
   /** Set by leave(): no more reconciles (they would re-create subscriptions). */
@@ -248,6 +266,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.relay.verifier = (raw, ch) => this.verify(raw, ch)
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
     this.headroom = new HeadroomProbe(this.uplink)
+    this.uplinkWindow.sample(uplinkCounters(this.uplink.stats))
 
     const m = this.mesh
     m.onMedia = (data, from) => this.relay.receive(data, from)
@@ -821,26 +840,16 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   private sampleUplink(): void {
     const now = performance.now()
-    const s = this.uplink.stats
-    const last = this.uplinkSampleAt
-    const dt = (now - last.at) / 1000
-    if (dt <= 0) return
-    const items = s.sentItems - last.sentItems
-    const dropped = s.droppedItems - last.dropped
+    const r = this.uplinkWindow.sample(uplinkCounters(this.uplink.stats), now)
     this.uplinkNow = {
-      kbps: ((s.sentBytes - last.sent) * 8) / 1000 / dt,
-      dropRate: items + dropped > 0 ? dropped / (items + dropped) : 0,
+      kbps: (r.bytes * 8) / 1000,
+      dropRate: r.items + r.dropped > 0 ? r.dropped / (r.items + r.dropped) : 0,
     }
-    this.uplinkSampleAt = { at: now, sent: s.sentBytes, sentItems: s.sentItems, dropped: s.droppedItems }
-    const r = this.uplinkWindow.sample({ bytes: s.sentBytes, t0: s.droppedByLayer[0], t1: s.droppedByLayer[1], t2: s.droppedByLayer[2] + s.droppedByLayer[3], stalls: s.bufferStalls })
-    const dSum = s.queueDelaySum - this.lastQueueDelay.sum
-    const dN = s.queueDelayN - this.lastQueueDelay.n
-    this.lastQueueDelay = { sum: s.queueDelaySum, n: s.queueDelayN }
     this.uplinkStatsNow = {
       kbps: Math.round((r.bytes * 8) / 1000),
       drops: [round1(r.t0), round1(r.t1), round1(r.t2)],
       stalls: round1(r.stalls),
-      queueMs: dN > 0 ? Math.round(dSum / dN) : 0,
+      queueMs: r.queueN > 0 ? Math.round(r.queueSum / r.queueN) : 0,
     }
     this.encoderStatsNow = this.publishing?.sampleEncoder() ?? null
     const lagMs = Math.round(takeMainThreadLag())
