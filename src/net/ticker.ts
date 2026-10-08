@@ -69,6 +69,31 @@ export function after(ms: number, fn: () => void): () => void {
   return () => tasks.delete(t)
 }
 
+/**
+ * One delayed call of `fn` that coalesces requests: while one is pending, `schedule(delay)` keeps
+ * it, except that delay 0 replaces it (now, rather than whenever the pending one was due).
+ */
+export function debounce(fn: () => void): { schedule(delay: number): void; cancel(): void } {
+  let pending: (() => void) | null = null
+  const cancel = () => {
+    pending?.()
+    pending = null
+  }
+  return {
+    schedule(delay) {
+      if (pending !== null) {
+        if (delay > 0) return
+        cancel()
+      }
+      pending = after(delay, () => {
+        pending = null
+        fn()
+      })
+    },
+    cancel,
+  }
+}
+
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => after(ms, r))
 }

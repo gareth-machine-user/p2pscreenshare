@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { after, every, resetTicker } from '../src/net/ticker'
+import { after, debounce, every, resetTicker } from '../src/net/ticker'
 
 describe('ticker', () => {
   beforeEach(() => {
@@ -36,6 +36,34 @@ describe('ticker', () => {
     vi.advanceTimersByTime(150)
     cancel()
     vi.advanceTimersByTime(500)
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+
+  it('debounce: keeps a pending call, unless asked again with delay 0', () => {
+    const fn = vi.fn()
+    const d = debounce(fn)
+    d.schedule(200)
+    vi.advanceTimersByTime(100)
+    d.schedule(200) // still due at 200, not pushed back
+    vi.advanceTimersByTime(150)
+    expect(fn).toHaveBeenCalledTimes(1)
+    d.schedule(500)
+    d.schedule(0) // replaces it: runs now, once
+    vi.advanceTimersByTime(100)
+    expect(fn).toHaveBeenCalledTimes(2)
+    vi.advanceTimersByTime(1000)
+    expect(fn).toHaveBeenCalledTimes(2)
+  })
+
+  it('debounce: cancel drops the pending call, and scheduling works again after', () => {
+    const fn = vi.fn()
+    const d = debounce(fn)
+    d.schedule(100)
+    d.cancel()
+    vi.advanceTimersByTime(500)
+    expect(fn).not.toHaveBeenCalled()
+    d.schedule(100)
+    vi.advanceTimersByTime(200)
     expect(fn).toHaveBeenCalledTimes(1)
   })
 })
