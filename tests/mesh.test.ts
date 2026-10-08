@@ -319,4 +319,37 @@ describe('mesh (in-memory network)', () => {
     expect(m1.member(p2.id)).toBeDefined()
     expect(m3.linked(p1.id, p2.id)).toBe(false)
   })
+
+  it("a member can't claim an earlier join time later on to take door duty from an older one", async () => {
+    const lobby = await makeLobby(5)
+    await startAll(lobby)
+    await advance(1000)
+    // The non-owner with the highest id: not a door (all joined at once, so ties go by id).
+    const liar = lobby.meshes.slice(1).reduce((a, b) => (a.selfId > b.selfId ? a : b))
+    const honest = lobby.meshes.filter((m) => m !== liar)
+    const doors = () => honest.filter((m) => m.isDoor).map((m) => m.selfId).sort()
+    const before = doors()
+    expect(before).toHaveLength(3)
+    liar.updateRecord({ joinedAt: 0 })
+    await until(() => honest.every((m) => m.member(liar.selfId)?.joinedAt === 0), 3000, 'claim gossiped')
+    await advance(1000)
+    expect(doors()).toEqual(before)
+  })
+
+  it("a newcomer claiming to have joined long ago doesn't take door duty from older members", async () => {
+    const lobby = await makeLobby(5)
+    const honest = lobby.meshes.slice(0, 4)
+    const liar = lobby.meshes[4]
+    for (const m of honest) await m.start()
+    await until(() => meshed(honest), 15_000, 'mesh of four')
+    await advance(6000)
+    const doors = () => honest.filter((m) => m.isDoor).map((m) => m.selfId).sort()
+    const before = doors()
+    expect(before).toHaveLength(3)
+    liar.updateRecord({ joinedAt: 0 })
+    await liar.start()
+    await until(() => meshed(lobby.meshes), 15_000, 'liar meshed in')
+    await advance(1000)
+    expect(doors()).toEqual(before)
+  })
 })

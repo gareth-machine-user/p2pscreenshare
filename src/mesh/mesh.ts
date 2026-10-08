@@ -61,6 +61,11 @@ const ISOLATED_MS = 3000
 const SIG_MAX_AGE_MS = 10 * 60_000
 /** A knock doesn't restart an offer to the knocker made this recently (it is likely in flight). */
 const KNOCK_KEEP_OFFER_MS = 5000
+/**
+ * Members learned of this soon after this peer joined were in the lobby before it, so their claimed
+ * join time is taken as is. Later ones joined after, so this peer vouches no earlier than first sight.
+ */
+const JOIN_VOUCH_GRACE_MS = 5000
 const CHAT_KEEP = 50
 export const CHAT_MAX_LEN = 500
 /**
@@ -220,6 +225,13 @@ export class Mesh<C extends PeerConn = MeshConn> {
   private isolatedSince: number | null = null
   /** Whether this peer ever had an open mesh link. */
   private everLinked = false
+  /** Wall-clock time this peer joined (first link, or started the lobby). */
+  private joinedWallAt: number | null = null
+  /**
+   * Per member: the earliest join time this peer accepts for it (see vouchJoin). A record's
+   * joinedAt is self-signed, and an old one buys door duty and first pick as a relay.
+   */
+  private joinVouch = new Map<string, number>()
   private publishing: Promise<void> = Promise.resolve()
   /** Owner decisions, applied one at a time so each builds on the one before. */
   private authQueue: Promise<void> = Promise.resolve()
@@ -572,6 +584,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
   private onOpen(conn: C, viaTracker: boolean): void {
     const id = conn.remoteId
     this.joined = true
+    this.joinedWallAt ??= Date.now()
     this.everLinked = true
     this.retry.delete(id)
     this.detector.heard(id, performance.now())
@@ -688,11 +701,15 @@ export class Mesh<C extends PeerConn = MeshConn> {
   private updateDoorDuty(): void {
     if (this.left) return
     const now = performance.now()
-    let door = doorPeers([...this.members(), this.self], this.ownerId).has(this.selfId)
+    const members = this.members().map((r) => ({ id: r.id, joinedAt: this.joinedAtOf(r.id) }))
+    let door = doorPeers([...members, this.self], this.ownerId).has(this.selfId)
     // Nobody answered: this peer is alone, so it opens the lobby itself.
     if (!this.joined && this.store.ids().length === 0) {
       door = this.selfId === this.ownerId || now - this.seekingSince > ALONE_DOOR_MS
-      if (door) this.joined = true
+      if (door) {
+        this.joined = true
+        this.joinedWallAt ??= Date.now()
+      }
     }
     this.rendezvous.setDoor(door)
     const linked = this.openConns().length > 0
@@ -774,9 +791,23 @@ export class Mesh<C extends PeerConn = MeshConn> {
     return 2
   }
 
-  /** When a member joined (unknown ones sort last among relays). */
+  /** When a member joined, as far as this peer can vouch (unknown ones sort last among relays). */
   private joinedAtOf(id: string): number {
-    return this.store.get(id)?.rec.joinedAt ?? Infinity
+    const rec = this.store.get(id)?.rec
+    if (!rec) return Infinity
+    return Math.max(rec.joinedAt, this.joinVouch.get(id) ?? rec.joinedAt)
+  }
+
+  /**
+   * Fixes the earliest join time accepted for a member, when its record is first seen: its claim
+   * while this peer is still joining (it was there first), else no earlier than now. Later records
+   * can only move it later. Kept after the member leaves, so a blip doesn't make it newer.
+   */
+  private vouchJoin(rec: MemberRecord): void {
+    if (this.joinVouch.has(rec.id)) return
+    const now = Date.now()
+    const joining = this.joinedWallAt === null || now - this.joinedWallAt < JOIN_VOUCH_GRACE_MS
+    this.joinVouch.set(rec.id, joining ? rec.joinedAt : Math.max(rec.joinedAt, now))
   }
 
   private async onSig(env: Envelope, to: string, from: string): Promise<void> {
@@ -865,6 +896,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
       return
     }
     this.detector.heard(rec.id, performance.now())
+    this.vouchJoin(rec)
     if (!known) {
       // Debug blocking by name: a link opened before the name was known is dropped now.
       const c = this.conns.get(rec.id)
