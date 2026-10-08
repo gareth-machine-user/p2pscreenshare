@@ -1,5 +1,5 @@
-import { decodePieces, pieceLength } from '../proto/fec'
-import { MAX_FRAGMENT_PAYLOAD, type Fragment } from '../proto/framing'
+import { decodePieces } from '../proto/fec'
+import { MAX_FRAGMENT_PAYLOAD, pieceLength, type Fragment } from '../proto/framing'
 import type { EncodedFrame } from './packetizer'
 
 export interface AssembledFrame extends EncodedFrame {
@@ -32,24 +32,6 @@ interface FrameState {
 }
 
 const RETAIN_MS = 6000
-/** Largest frame accepted (bytes); bounds what a bogus header can make us allocate. */
-export const MAX_FRAME_BYTES = 16 * 1024 * 1024
-
-/**
- * Checks a fragment's header is self-consistent with how the packetizer splits frames, so a
- * corrupt or hostile header can't make us allocate huge buffers or write out of bounds.
- */
-function wellFormed(frag: Fragment): boolean {
-  const h = frag.header
-  if (h.k === 0 || h.frameLen > MAX_FRAME_BYTES || h.pieceIdx >= h.k + h.m) return false
-  const P = pieceLength(h.frameLen, h.k)
-  const fragCount = Math.max(1, Math.ceil(P / MAX_FRAGMENT_PAYLOAD))
-  if (h.fragCount !== fragCount || h.fragIdx >= fragCount) return false
-  const len = frag.payload.byteLength
-  if (h.fragIdx * MAX_FRAGMENT_PAYLOAD + len > P) return false
-  return h.fragIdx === fragCount - 1 || len === MAX_FRAGMENT_PAYLOAD
-}
-
 /** A frame still missing pieces this long after its first fragment counts as incomplete. */
 const INCOMPLETE_MS = 1000
 
@@ -79,9 +61,9 @@ export class Reassembler {
     this.repairUntil = now + ms
   }
 
+  /** `frag` must come from decodeFragment, which checks its shape (lengths, counts, indices). */
   push(frag: Fragment, now: number): void {
     if (now - this.lastPrune > 250) this.prune(now)
-    if (!wellFormed(frag)) return
     const h = frag.header
     let id = `${h.channel}:${h.audio ? 'a' : 'v'}:${h.epoch}:${h.frameSeq}`
     let st = this.frames.get(id)

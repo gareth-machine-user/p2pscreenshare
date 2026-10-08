@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { decodePieces, encodePieces } from '../src/proto/fec'
-import { decodeFragment, encodeFragment, HEADER_SIZE, isLegacyAudio, MAX_PIECES, NO_REF, peekChannel, withReplayFlag, type FragmentHeader } from '../src/proto/framing'
+import { decodeFragment, encodeFragment, HEADER_SIZE, isLegacyAudio, MAX_FRAGMENT_PAYLOAD, MAX_PIECES, NO_REF, peekChannel, withReplayFlag, type FragmentHeader } from '../src/proto/framing'
 import { packetize, type EncodedFrame } from '../src/media/packetizer'
 import { Reassembler, type AssembledFrame } from '../src/media/reassembler'
 
@@ -25,6 +25,7 @@ function combinations(n: number, r: number): number[][] {
 }
 
 describe('framing', () => {
+  // Last of 5 fragments of piece 3 of a 4+1 coded frame, its pieces 4 * MAX + 500 bytes long.
   const h: FragmentHeader = {
     channel: 0xdeadbeef,
     key: true,
@@ -40,14 +41,15 @@ describe('framing', () => {
     m: 1,
     pieceIdx: 3,
     stripe: 3,
-    frameLen: 99999,
-    fragIdx: 2,
+    frameLen: 4 * (4 * MAX_FRAGMENT_PAYLOAD + 500),
+    fragIdx: 4,
     fragCount: 5,
   }
 
   it('round-trips headers and payload', () => {
     const payload = randomBytes(500)
     const f = decodeFragment(encodeFragment(h, payload))!
+    expect(f).not.toBeNull()
     expect(f.header).toEqual(h)
     expect(f.payload).toEqual(payload)
   })
@@ -61,7 +63,7 @@ describe('framing', () => {
   })
 
   it('sets the replay flag without touching the original', () => {
-    const raw = encodeFragment(h, randomBytes(10))
+    const raw = encodeFragment(h, randomBytes(500))
     const replayed = withReplayFlag(raw)
     expect(decodeFragment(raw)!.header.replay).toBe(false)
     expect(decodeFragment(replayed)!.header).toEqual({ ...h, replay: true })
@@ -69,7 +71,8 @@ describe('framing', () => {
 
   it('rejects malformed input', () => {
     expect(decodeFragment(new Uint8Array(5))).toBeNull()
-    expect(decodeFragment(encodeFragment({ ...h, fragIdx: 5 }, new Uint8Array(1)))).toBeNull()
+    expect(decodeFragment(encodeFragment({ ...h, fragIdx: 5 }, new Uint8Array(500)))).toBeNull()
+    expect(decodeFragment(encodeFragment(h, new Uint8Array(499)))).toBeNull()
   })
 
   it('refuses to encode a stripe layout the u8 header fields would truncate', () => {
@@ -83,7 +86,7 @@ describe('framing', () => {
   })
 
   it('treats only whole audio frames (audio, k=1, m=0) as legacy, and lets only those travel on any stripe', () => {
-    const audio = { ...h, audio: true, key: false, layer: 0, k: 1, m: 0, pieceIdx: 0, fragIdx: 0, fragCount: 1 }
+    const audio = { ...h, audio: true, key: false, layer: 0, k: 1, m: 0, pieceIdx: 0, frameLen: 4, fragIdx: 0, fragCount: 1 }
     expect(isLegacyAudio(audio)).toBe(true)
     expect(isLegacyAudio({ ...audio, audio: false })).toBe(false)
     expect(isLegacyAudio({ ...audio, k: 2 })).toBe(false)

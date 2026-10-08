@@ -34,7 +34,7 @@ function frag(o: { seq: number; gop?: number; key?: boolean; epoch?: number; str
       m: 1,
       pieceIdx: stripe,
       stripe,
-      frameLen: 8,
+      frameLen: 16,
       fragIdx: 0,
       fragCount: 1,
     },

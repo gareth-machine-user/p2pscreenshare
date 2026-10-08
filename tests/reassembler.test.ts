@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { packetize, type EncodedFrame } from '../src/media/packetizer'
-import { MAX_FRAME_BYTES, Reassembler, type AssembledFrame } from '../src/media/reassembler'
-import { decodeFragment, encodeFragment, MAX_FRAGMENT_PAYLOAD, NO_REF, type FragmentHeader } from '../src/proto/framing'
+import { Reassembler, type AssembledFrame } from '../src/media/reassembler'
+import { decodeFragment, encodeFragment, MAX_FRAGMENT_PAYLOAD, MAX_FRAME_BYTES, NO_REF, type FragmentHeader } from '../src/proto/framing'
 
 function frame(seq: number, len: number): EncodedFrame {
   const data = new Uint8Array(len)
@@ -54,16 +54,14 @@ describe('Reassembler', () => {
     expect(out[0].data).toEqual(f.data)
   })
 
-  it('drops fragments whose header disagrees with the frame', () => {
+  it('drops well-formed fragments whose layout disagrees with the frame', () => {
     const out: AssembledFrame[] = []
     const r = new Reassembler((f) => out.push(f))
     const len = MAX_FRAGMENT_PAYLOAD + 10
     r.push(frag({ frameLen: len, fragCount: 2 }, MAX_FRAGMENT_PAYLOAD), 0)
-    // Same frame id, different frameLen / k / fragCount / oversized chunk.
-    expect(() => r.push(frag({ fragIdx: 1, fragCount: 2, frameLen: 999_999 }, 1200), 0)).not.toThrow()
-    expect(() => r.push(frag({ fragIdx: 1, fragCount: 2, frameLen: len, k: 2 }, 10), 0)).not.toThrow()
-    expect(() => r.push(frag({ fragIdx: 1, fragCount: 3, frameLen: len }, 10), 0)).not.toThrow()
-    expect(() => r.push(frag({ fragIdx: 1, fragCount: 2, frameLen: len }, 5000), 0)).not.toThrow()
+    // Same frame id, each fragment consistent on its own but with another frameLen / k.
+    r.push(frag({ fragIdx: 1, fragCount: 2, frameLen: MAX_FRAGMENT_PAYLOAD + 20 }, 20), 0)
+    r.push(frag({ frameLen: 2 * len, k: 2, fragIdx: 1, fragCount: 2 }, 10), 0)
     expect(out).toHaveLength(0)
     // The genuine last fragment still completes the frame.
     r.push(frag({ fragIdx: 1, fragCount: 2, frameLen: len }, 10), 0)
@@ -71,11 +69,22 @@ describe('Reassembler', () => {
     expect(out[0].data.byteLength).toBe(len)
   })
 
-  it('rejects absurd frame lengths without allocating', () => {
-    const r = new Reassembler(() => {})
-    expect(() => r.push(frag({ frameLen: 0xffffffff }, 10), 0)).not.toThrow()
-    expect(() => r.push(frag({ frameLen: MAX_FRAME_BYTES + 1 }, 10), 0)).not.toThrow()
-    expect(r.pending).toBe(0)
+  it('never sees misshapen fragments: decodeFragment, which relays run too, rejects them', () => {
+    const len = MAX_FRAGMENT_PAYLOAD + 10
+    const raw = (h: Partial<FragmentHeader>, payloadLen: number) => encodeFragment({ ...header, ...h }, new Uint8Array(payloadLen))
+    // Each of these passed decodeFragment before and was only caught in the reassembler.
+    expect(decodeFragment(raw({ frameLen: 0xffffffff }, 10))).toBeNull()
+    expect(decodeFragment(raw({ frameLen: MAX_FRAME_BYTES + 1 }, 10))).toBeNull()
+    expect(decodeFragment(raw({ fragIdx: 1, fragCount: 3, frameLen: len }, 10))).toBeNull() // wrong fragCount
+    expect(decodeFragment(raw({ fragIdx: 1, fragCount: 2, frameLen: len }, 5000))).toBeNull() // oversized last chunk
+    expect(decodeFragment(raw({ fragIdx: 1, fragCount: 2, frameLen: len }, 9))).toBeNull() // short last chunk
+    expect(decodeFragment(raw({ fragIdx: 0, fragCount: 2, frameLen: len }, 100))).toBeNull() // short middle chunk
+    expect(decodeFragment(raw({ frameLen: 10 }, 0))).toBeNull()
+    // The packetizer's own output still decodes, down to the 1-byte piece of an empty frame.
+    for (const [n, k, m] of [[0, 1, 0], [1, 3, 1], [len, 1, 0], [MAX_FRAGMENT_PAYLOAD * 5 + 3, 4, 2]]) {
+      for (const s of packetize(frame(1, n), k, m, 1)) for (const f of s) expect(decodeFragment(f), `${n} ${k}+${m}`).not.toBeNull()
+    }
+    expect(decodeFragment(raw({ fragIdx: 1, fragCount: 2, frameLen: len }, 10))).not.toBeNull()
   })
 
   it('never throws on byte-flipped fragments', () => {

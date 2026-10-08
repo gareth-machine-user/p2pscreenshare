@@ -18,6 +18,13 @@ export const NO_REF = 0xffffffff
  * rows need k + m <= 256 (GF(256)).
  */
 export const MAX_PIECES = 256
+/** Largest frame accepted (bytes); bounds what a bogus header can make a receiver allocate. */
+export const MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+/** Bytes per erasure-coded piece of a frameLen-byte frame split k ways (at least 1). */
+export function pieceLength(frameLen: number, k: number): number {
+  return Math.max(1, Math.ceil(frameLen / k))
+}
 
 /** Throws unless k data and m parity pieces form a codable layout (integers, k >= 1, m >= 0, k + m <= MAX_PIECES). */
 export function assertStripes(k: number, m: number): void {
@@ -28,6 +35,11 @@ export function assertStripes(k: number, m: number): void {
 
 const FLAG_KEY = 1 << 0
 const FLAG_AUDIO = 1 << 1
+// Left out of the signature (see signedRegion) because relays set it on bytes the publisher already
+// signed, when replaying from their GOP cache. So any relay can set or clear it: that only moves a
+// frame in or out of latency stats and lets a seen frame reassemble again during a requested repair
+// (Reassembler.expectReplay); relayNode refuses "replays" more than a GOP old. It can't change
+// what is decoded.
 const FLAG_REPLAY = 1 << 2
 const LAYER_SHIFT = 3
 const LAYER_MASK = 0b11 << LAYER_SHIFT
@@ -118,12 +130,25 @@ export function decodeFragment(raw: Uint8Array): Fragment | null {
     fragIdx: v.getUint16(32, true),
     fragCount: v.getUint16(34, true),
   }
-  if (header.fragCount === 0 || header.fragIdx >= header.fragCount) return null
-  if (header.k === 0 || header.pieceIdx >= header.k + header.m) return null
+  const payload = raw.subarray(HEADER_SIZE, raw.byteLength - SIG_SIZE)
+  return wellFormed(header, payload.byteLength) ? { header, payload, raw } : null
+}
+
+/**
+ * Checks a header is self-consistent with how the packetizer splits frames, so a corrupt or
+ * hostile one (signed or not) can't make a receiver allocate huge buffers or write out of bounds,
+ * and relays don't forward fragments no receiver would accept.
+ */
+function wellFormed(h: FragmentHeader, payloadLen: number): boolean {
+  if (h.k === 0 || h.pieceIdx >= h.k + h.m || h.frameLen > MAX_FRAME_BYTES) return false
   // Piece i only travels on stripe i (the stripe byte isn't signed, see signedRegion). Older
   // publishers sent each audio frame whole (k=1, m=0) on every stripe: still accepted from them.
-  if (header.stripe !== header.pieceIdx && !isLegacyAudio(header)) return null
-  return { header, payload: raw.subarray(HEADER_SIZE, raw.byteLength - SIG_SIZE), raw }
+  if (h.stripe !== h.pieceIdx && !isLegacyAudio(h)) return false
+  const P = pieceLength(h.frameLen, h.k)
+  const fragCount = Math.max(1, Math.ceil(P / MAX_FRAGMENT_PAYLOAD))
+  if (h.fragCount !== fragCount || h.fragIdx >= fragCount) return false
+  // Every fragment but the last is full; the last carries exactly the rest of the piece.
+  return payloadLen === Math.min(MAX_FRAGMENT_PAYLOAD, P - h.fragIdx * MAX_FRAGMENT_PAYLOAD)
 }
 
 /** An audio frame sent whole on every stripe, the format before audio was erasure coded. */

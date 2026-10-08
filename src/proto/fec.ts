@@ -1,4 +1,6 @@
-import { assertStripes } from './framing'
+import { assertStripes, pieceLength } from './framing'
+
+export { pieceLength }
 
 // Systematic erasure coding over GF(256): k data pieces + m parity pieces; any k of the k+m pieces
 // reconstruct the frame. m=1 uses plain XOR parity; m>1 uses a Cauchy matrix (every square
@@ -56,10 +58,6 @@ function mulAddInto(dst: Uint8Array, src: Uint8Array, coef: number): void {
   }
   const base = coef * 256
   for (let i = 0; i < n; i++) dst[i] ^= MUL[base + src[i]]
-}
-
-export function pieceLength(frameLen: number, k: number): number {
-  return Math.max(1, Math.ceil(frameLen / k))
 }
 
 /** Splits `frame` into k data pieces (zero padded) and computes m parity pieces. */

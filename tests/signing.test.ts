@@ -60,6 +60,7 @@ describe('fragment signatures', () => {
     const raw = (await signed(frame({ audio: true, key: false, data: new Uint8Array(120) })))[0][0].slice()
     raw[24] = 1 // k
     raw[25] = 0 // m
+    raw[28] = 60 // frameLen: the 60-byte piece is now the whole frame
     raw.set(await signedCopy(raw), raw.length - 64)
     for (const stripe of [0, 1, 2]) {
       const copy = raw.slice()

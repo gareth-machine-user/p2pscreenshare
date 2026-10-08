@@ -277,7 +277,7 @@ describe('lane throughput', () => {
           m: 1,
           pieceIdx: stripe,
           stripe,
-          frameLen: 1100,
+          frameLen: 3300,
           fragIdx: 0,
           fragCount: 1,
         },
