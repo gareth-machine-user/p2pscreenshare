@@ -18,10 +18,11 @@
 // Once a pair's mesh link is open, it may add media lanes: extra connections for its media only,
 // signaled over the link's ctl channel (lanes.ts). connFor picks the one carrying a tree.
 import { Rendezvous, type RendezvousOptions, type RendezvousPort } from '../net/bootstrap'
-import { emptyAuth, isBanned, type AuthDoc } from './auth'
+import type { AuthDoc } from './auth'
+import { AuthState, type KeyValueStore } from './authState'
 import { CHAT_KEEP, ChatLog, type ChatMessage } from './chatLog'
 import { open, seal, type Envelope, type Typed } from './envelope'
-import { peerIdOf, type PeerIdentity } from './identity'
+import type { PeerIdentity } from './identity'
 import { MeshConn, type ConnFactory, type PeerConn } from './meshConn'
 import { Lane, type LaneFactory } from './lane'
 import type { PairConn } from './dataConn'
@@ -116,11 +117,6 @@ export interface MeshOptions<C extends PeerConn = MeshConn> {
 
 type LinkStatus = 'open' | 'connecting' | 'unreachable' | 'none'
 
-interface KeyValueStore {
-  getItem(key: string): string | null
-  setItem(key: string, value: string): void
-}
-
 const localStore: KeyValueStore = { getItem: storageGet, setItem: storageSet }
 
 export class Mesh<C extends PeerConn = MeshConn> {
@@ -130,8 +126,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
   /** Open or connecting links, by remote peer id. */
   readonly conns = new Map<string, C>()
   readonly detector = new FailureDetector(GONE_MS)
-  /** The owner's latest signed decisions (publish policy, grants, revocations, bans). */
-  auth: AuthDoc = emptyAuth()
   trackersConnected = 0
   /** Joined: connected to at least one member, or started the lobby. */
   joined = false
@@ -159,9 +153,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
 
   private self: MemberRecord
   private selfEnv: Envelope | null = null
-  private authEnv: Envelope | null = null
-  /** Peer ids of banned keys, so a kicked peer is refused even before its record is known. */
-  private bannedIds = new Set<string>()
+  private authState: AuthState
   private rendezvous: RendezvousPort<C>
   private connect: ConnFactory<C>
   /** Extra media connections per pair. */
@@ -192,8 +184,6 @@ export class Mesh<C extends PeerConn = MeshConn> {
    */
   private joinVouch = new Map<string, number>()
   private publishing: Promise<void> = Promise.resolve()
-  /** Owner decisions, applied one at a time so each builds on the one before. */
-  private authQueue: Promise<void> = Promise.resolve()
   private publishQueued = false
   private left = false
 
@@ -232,6 +222,13 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
     this.rendezvous.shouldAnswer = (id) => this.shouldAnswerDoor(id)
     this.rendezvous.admit = (id) => !this.offline && !this.isBlocked(id) && !this.isBannedPeer(id)
+    this.authState = new AuthState({
+      identity: opts.identity,
+      ownerId: opts.ownerId,
+      joinCode: opts.joinCode,
+      storage: opts.storage ?? localStore,
+      onAccept: (env) => this.onAuthAccepted(env),
+    })
     this.chatLog = new ChatLog({
       identity: opts.identity,
       isBanned: (id) => this.isBannedPeer(id),
@@ -253,15 +250,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
   }
 
   async start(): Promise<void> {
-    // The owner keeps its decisions across reloads.
-    if (this.selfId === this.ownerId) {
-      const saved = this.storage.getItem(this.authStoreKey)
-      try {
-        if (saved) await this.acceptAuth(JSON.parse(saved) as Envelope)
-      } catch {
-        // corrupt entry: start without it
-      }
-    }
+    await this.authState.restore()
     await this.rendezvous.start()
     await this.publish()
     this.rendezvous.setSeeking(true)
@@ -275,6 +264,15 @@ export class Mesh<C extends PeerConn = MeshConn> {
   /** The recent chat, ordered by time. */
   get chat(): ChatMessage[] {
     return this.chatLog.messages
+  }
+
+  /** The owner's latest signed decisions (publish policy, grants, revocations, bans). */
+  get auth(): AuthDoc {
+    return this.authState.doc
+  }
+
+  private get authEnv(): Envelope | null {
+    return this.authState.env
   }
 
   get record(): MemberRecord {
@@ -387,51 +385,25 @@ export class Mesh<C extends PeerConn = MeshConn> {
     return this.conns.get(to)?.sendCtl({ t: 'app', m }) ?? false
   }
 
-  private get authStoreKey(): string {
-    return `p2pss:auth:${this.opts.joinCode}`
-  }
-
-  private get storage(): KeyValueStore {
-    return this.opts.storage ?? localStore
-  }
-
   /** A peer's public key: from its signed record (or this peer's own). */
   pubKeyOf(id: string): string | undefined {
     return id === this.selfId ? this.opts.identity.pubKey : this.store.get(id)?.env.k
   }
 
   isBannedPeer(id: string): boolean {
-    return this.bannedIds.has(id) || isBanned(this.auth, this.pubKeyOf(id))
+    return this.authState.isBanned(id, this.pubKeyOf(id))
   }
 
   /** Owner only: applies a change to the lobby's decisions, signs it and gossips it. */
   updateAuth(change: (doc: AuthDoc) => AuthDoc): Promise<void> {
-    if (this.selfId !== this.ownerId) return Promise.reject(new Error('only the owner decides'))
-    // Queued: two decisions made at once must not both start from the same document (the later
-    // one would undo the earlier).
-    const run = this.authQueue.then(async () => {
-      const doc = change(this.auth)
-      if (doc === this.auth) return
-      const env = await seal(this.opts.identity, doc)
-      await this.acceptAuth(env)
-    })
-    // A failed change must not stall the ones after it.
-    this.authQueue = run.catch(() => {})
-    return run
+    return this.authState.update(change)
   }
 
-  private async acceptAuth(env: Envelope): Promise<void> {
-    const opened = await open<AuthDoc>(env, 'auth')
-    // Only the key pinned in the join code decides.
-    if (!opened || opened.author !== this.ownerId) return
-    const bannedIds = new Set(await Promise.all(opened.body.banned.map((k) => peerIdOf(k))))
-    // Checked and applied after the last await: of two documents in flight, the newer one wins
-    // whichever finishes first.
-    if (opened.body.version <= this.auth.version) return
-    this.auth = opened.body
-    this.authEnv = env
-    this.bannedIds = bannedIds
-    if (this.selfId === this.ownerId) this.storage.setItem(this.authStoreKey, JSON.stringify(env))
+  private acceptAuth(env: Envelope): Promise<void> {
+    return this.authState.accept(env)
+  }
+
+  private onAuthAccepted(env: Envelope): void {
     for (const c of this.conns.values()) c.sendCtl({ t: 'auth', env })
     // Kicked peers: close our links to them, once the news had time to reach them.
     after(KICK_CLOSE_DELAY_MS, () => {
