@@ -4,10 +4,11 @@
 // - Membership: the mesh (mesh/mesh.ts): links, gossip records, chat.
 // - Publisher: PublishedStream + one ChannelPublisher per channel (session/publishedStream.ts, session/channelPublisher.ts).
 // - Subscriber: one Subscription per watched channel (session/subscription.ts).
+// - Publish rights: requests to publish and the owner's answers (session/publishRights.ts).
 // - Relay: one RelayNode for every channel, forwarding over the mesh links' media channels.
 // - Capacity: each connection's delivered rate (session/capacity.ts), split into relay slots per
 //   watched channel; the presenter's bitrate follows it (session/congestion.ts).
-import { ban, grant, isBanned, mayPublish as mayPublishDoc, revoke, setPolicy, type PublishPolicy } from '../mesh/auth'
+import type { PublishPolicy } from '../mesh/auth'
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
 import { Mesh, type MeshOptions } from '../mesh/mesh'
@@ -29,6 +30,7 @@ import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { AutoFallback, liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { HeadroomProbe } from './headroom'
+import { PublishRights, type PublishRequest, type PublishRightsContext, type RequestState } from './publishRights'
 import { debounce, every, takeMainThreadLag } from '../net/ticker'
 import type { Buffering } from '../media/jitterBuffer'
 
@@ -87,13 +89,7 @@ export interface LiveChannel {
 }
 
 export type { StageSource, ViewQuality } from './stage'
-/** A member's request to publish, as the requester sees it. */
-export type RequestState = 'idle' | 'waiting' | 'owner-away' | 'denied' | 'granted'
-
-export interface PublishRequest {
-  id: string
-  at: number
-}
+export type { PublishRequest, RequestState } from './publishRights'
 
 /** Budget weights shift towards channels with a deficit this often. */
 const REBALANCE_MS = 10_000
@@ -160,7 +156,7 @@ interface ConnRecord {
   rate: LaneRate | null
 }
 
-export class PeerSession implements PublisherContext, SubscriptionContext {
+export class PeerSession implements PublisherContext, SubscriptionContext, PublishRightsContext {
   readonly mesh: Mesh
   readonly uplink: Uplink
   readonly relay: RelayNode
@@ -183,10 +179,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   buffering: Buffering = 'auto'
   /** Auto quality is showing the preview because the full stream stalled. */
   autoFallback = false
-  /** This member's request to publish. */
-  requestState: RequestState = 'idle'
-  /** Owner: pending publish requests. */
-  readonly requests = new Map<string, PublishRequest>()
+  /** Publish rights: this member's request, the owner's pending ones and decisions (session/publishRights.ts). */
+  readonly rights: PublishRights
   /** Set when the owner revoked this peer's stream. */
   revokedNotice = false
   /** Set when the owner removed this peer from the lobby. */
@@ -265,6 +259,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     this.relay.verifier = (raw, ch) => this.verify(raw, ch)
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
     this.headroom = new HeadroomProbe(this.uplink)
+    this.rights = new PublishRights(this)
     this.uplinkWindow.sample(uplinkCounters(this.uplink.stats))
 
     const m = this.mesh
@@ -283,8 +278,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     m.onRecord = () => this.scheduleReconcile()
     m.onMemberJoin = () => this.scheduleReconcile()
     m.onMemberLeave = (id) => {
-      this.requests.delete(id)
-      if (id === this.ownerId && this.requestState === 'waiting') this.requestState = 'owner-away'
+      this.rights.onMemberLeave(id)
       for (const c of this.ownChannels()) c.removeSubscriber(id)
       this.relay.removePeer(id)
       this.scheduleReconcile(0)
@@ -292,7 +286,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     m.onAuth = () => this.onAuthChange()
     m.onLinkOpen = (id) => {
       this.firstLinkAt ??= performance.now()
-      if (id === this.ownerId && this.requestState === 'owner-away') this.requestPublish()
+      this.rights.onLinkOpen(id)
       // A publisher we watch is reachable again: make sure it still has us.
       for (const sub of this.subs.values()) if (sub.publisher === id) sub.subscribe()
       for (const ch of this.topoWatching) if (this.channels.get(ch)?.publisher === id) this.sendTo(id, { t: 'topo-req', ch, on: true })
@@ -317,19 +311,19 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   /** Whether a peer may publish: the owner, a granted key, or anyone under an open policy. */
   mayPublish(id: string): boolean {
-    return mayPublishDoc(this.mesh.auth, this.mesh.pubKeyOf(id), id === this.ownerId)
+    return this.rights.mayPublish(id)
   }
 
   get isOwner(): boolean {
-    return this.selfId === this.ownerId
+    return this.rights.isOwner
   }
 
   get policy(): PublishPolicy {
-    return this.mesh.auth.policy
+    return this.rights.policy
   }
 
   get canShare(): boolean {
-    return this.mayPublish(this.selfId)
+    return this.rights.canShare
   }
 
   private ownChannels(): ChannelPublisher[] {
@@ -462,66 +456,46 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   // --- publish rights ----------------------------------------------------------------------------
 
+  /** This member's request to publish. */
+  get requestState(): RequestState {
+    return this.rights.requestState
+  }
+
+  /** Owner: pending publish requests. */
+  get requests(): ReadonlyMap<string, PublishRequest> {
+    return this.rights.requests
+  }
+
   /** Asks the owner for the right to publish (or notes that it's already there). */
   requestPublish(): void {
-    if (this.canShare) {
-      this.requestState = 'granted'
-      this.onGranted()
-    } else if (!this.mesh.linkFor(this.ownerId)) {
-      this.requestState = 'owner-away'
-    } else {
-      this.requestState = 'waiting'
-      this.sendTo(this.ownerId, { t: 'publish-req' })
-    }
-    this.onChange()
+    this.rights.requestPublish()
   }
 
   cancelRequest(): void {
-    // Withdrawn at the owner too, or it could still allow a request nobody is waiting on.
-    if (this.requestState === 'waiting') this.sendTo(this.ownerId, { t: 'publish-cancel' })
-    this.requestState = 'idle'
-    this.onChange()
+    this.rights.cancelRequest()
   }
 
   /** Owner: answers a request (or all of them). */
-  async respond(id: string, answer: 'allow' | 'allow-all' | 'deny' | 'deny-all'): Promise<void> {
-    if (!this.isOwner) return
-    const pending = answer.endsWith('-all') ? [...this.requests.keys()] : [id]
-    for (const p of pending) this.requests.delete(p)
-    if (answer === 'allow' || answer === 'allow-all') {
-      await this.mesh.updateAuth((doc) => {
-        let d = answer === 'allow-all' ? setPolicy(doc, 'open') : doc
-        for (const p of pending) {
-          const key = this.mesh.pubKeyOf(p)
-          if (key) d = grant(d, key)
-        }
-        return d
-      })
-    } else {
-      if (answer === 'deny-all') await this.mesh.updateAuth((doc) => setPolicy(doc, 'closed'))
-      for (const p of pending) this.sendTo(p, { t: 'publish-deny' })
-    }
-    this.onChange()
+  respond(id: string, answer: 'allow' | 'allow-all' | 'deny' | 'deny-all'): Promise<void> {
+    return this.rights.respond(id, answer)
   }
 
   /** Owner: stops a member's stream and takes away its right to publish. */
-  async revokePublisher(id: string): Promise<void> {
-    const key = this.mesh.pubKeyOf(id)
-    if (!this.isOwner || !key || id === this.ownerId) return
-    await this.mesh.updateAuth((doc) => revoke(doc, key))
+  revokePublisher(id: string): Promise<void> {
+    return this.rights.revokePublisher(id)
   }
 
-  async setPolicy(policy: PublishPolicy): Promise<void> {
-    if (!this.isOwner) return
-    // 'deny-all' and 'allow-all' set the policy in the same auth update that answers the pending
-    // requests: one version, one gossip round.
-    if (policy === 'closed') await this.respond('', 'deny-all')
-    else if (policy === 'open') await this.respond('', 'allow-all')
-    else await this.mesh.updateAuth((doc) => setPolicy(doc, policy))
+  setPolicy(policy: PublishPolicy): Promise<void> {
+    return this.rights.setPolicy(policy)
+  }
+
+  /** Owner: removes a member (members close their links, doors refuse it). */
+  kick(id: string): Promise<void> {
+    return this.rights.kick(id)
   }
 
   private onAuthChange(): void {
-    if (!this.kicked && isBanned(this.mesh.auth, this.mesh.pubKeyOf(this.selfId))) {
+    if (!this.kicked && this.rights.banned) {
       this.kicked = true
       void this.leave()
       this.onChange()
@@ -531,10 +505,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       this.stopSharing()
       this.revokedNotice = true
     }
-    if (this.requestState === 'waiting' && this.canShare) {
-      this.requestState = 'granted'
-      this.onGranted()
-    }
+    this.rights.onAuthChange()
     this.scheduleReconcile(0)
   }
 
@@ -740,13 +711,6 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     }
   }
 
-  /** Owner: removes a member (members close their links, doors refuse it). */
-  async kick(id: string): Promise<void> {
-    const key = this.mesh.pubKeyOf(id)
-    if (!this.isOwner || !key || id === this.ownerId) return
-    await this.mesh.updateAuth((doc) => ban(doc, key))
-  }
-
   // --- control messages --------------------------------------------------------------------------
 
   private sendTo(to: string, msg: PeerMsg): void {
@@ -756,18 +720,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   private handle(msg: PeerMsg, from: string): void {
     switch (msg.t) {
       case 'publish-req':
-        if (!this.isOwner || this.mayPublish(from)) return
-        if (this.policy === 'closed') this.sendTo(from, { t: 'publish-deny' })
-        else if (this.policy === 'open') void this.respond(from, 'allow')
-        else this.requests.set(from, { id: from, at: Date.now() })
-        this.onChange()
-        return
       case 'publish-cancel':
-        if (this.isOwner && this.requests.delete(from)) this.onChange()
-        return
       case 'publish-deny':
-        if (from === this.ownerId && this.requestState === 'waiting') this.requestState = 'denied'
-        this.onChange()
+        this.rights.handle(msg, from)
         return
       case 'need-gop':
         // From a child on our trees (as a relay, or as the channel's publisher): the relay checks.
