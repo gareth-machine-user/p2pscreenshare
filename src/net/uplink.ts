@@ -1,5 +1,6 @@
 import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type MediaLink } from './link'
 import { tuning } from '../tuning'
+import { after } from './ticker'
 
 // Per-layer queueing deadlines (see tuning.ts): when the uplink can't keep up, enhancement layers
 // (T2, then T1) expire first, so overloaded relays degrade frame rate instead of stalling the
@@ -19,7 +20,11 @@ export const STALL_MS = 750
 const DEAD_FRAME_RETAIN_MS = 2000
 /** The upload cap's token bucket holds this much sending time as burst (ms). */
 const CAP_BURST_MS = 40
-/** While the cap's tokens are spent, drain again after this long (ms). */
+/**
+ * While the cap's tokens are spent, drain again after this long (ms): on a main-thread timer, with
+ * the ticker (50 ms resolution) as the fallback for a hidden tab, where that timer can be held back
+ * for a second or more.
+ */
 const TOKEN_RETRY_MS = 4
 
 /** Layers beyond the table (none on the wire: the layer is 2 bits) get the last entry's deadline. */
@@ -125,7 +130,8 @@ export class Uplink {
   private links = new Map<MediaLink, LinkEntry>()
   private tokens = 0
   private lastRefill = performance.now()
-  private timer: ReturnType<typeof setTimeout> | null = null
+  /** Pending token-wait retry, if any. */
+  private retry: (() => void) | null = null
   private draining = false
   /** Where the next drain pass starts (round-robin across drains). */
   private cursor = 0
@@ -419,11 +425,16 @@ export class Uplink {
         if (waitingOnTokens) break
       }
       for (const e of this.links.values()) if (!e.queue.length) this.markBusy(e.counters, false, now)
-      if (waitingOnTokens && this.timer === null) {
-        this.timer = setTimeout(() => {
-          this.timer = null
+      if (waitingOnTokens && !this.retry) {
+        const fire = () => {
+          clearTimeout(t)
+          cancel()
+          this.retry = null
           this.drain()
-        }, TOKEN_RETRY_MS)
+        }
+        const t = setTimeout(fire, TOKEN_RETRY_MS)
+        const cancel = after(TOKEN_RETRY_MS, fire)
+        this.retry = fire
       }
     } finally {
       this.draining = false

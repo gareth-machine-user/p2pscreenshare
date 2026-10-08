@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type LinkState, type MediaLink } from '../src/net/link'
+import { resetTicker } from '../src/net/ticker'
 import { STALL_MS, Uplink } from '../src/net/uplink'
 import { tuning } from '../src/tuning'
 
@@ -325,6 +326,27 @@ describe('Uplink stall detection', () => {
 })
 
 describe('Uplink cap', () => {
+  it('keeps waiting off token debt in a hidden tab, where main-thread timers stall', () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] })
+    resetTicker()
+    // Hidden: a main-thread timeout doesn't fire (for a second or more); the ticker's worker still ticks.
+    vi.stubGlobal('setTimeout', () => 0)
+    vi.stubGlobal('clearTimeout', () => {})
+    try {
+      const u = new Uplink(80)
+      const a = new StubLink('a')
+      u.send(a, msg(1, 1000), 0)
+      u.send(a, msg(2, 1000), 0)
+      vi.advanceTimersByTime(50)
+      expect(sentBy('a')).toEqual([1])
+      vi.advanceTimersByTime(150)
+      expect(sentBy('a')).toEqual([1, 2])
+    } finally {
+      vi.unstubAllGlobals()
+      resetTicker()
+    }
+  })
+
   it('lets a message larger than the burst through on token debt, then waits it off', () => {
     // 80 kbps = 10 bytes/ms; 1000-byte messages exceed the 40 ms (400 byte) burst.
     const u = new Uplink(80)
