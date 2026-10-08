@@ -96,6 +96,20 @@ describe('Player epoch switching', () => {
     p.close()
   })
 
+  it('decodes held frames as soon as their StreamInfo configures the decoder, once each and in order', () => {
+    const { p } = player()
+    announce(p, info(1))
+    p.push(frame(2, 0, true))
+    p.push(frame(2, 1))
+    // No drain tick in between: they must not wait up to 50 ms for one.
+    p.setStreamInfo(info(2))
+    expect(decoded).toEqual([[2, 0], [2, 1]])
+    p.push(frame(2, 2))
+    vi.advanceTimersByTime(60)
+    expect(decoded).toEqual([[2, 0], [2, 1], [2, 2]])
+    p.close()
+  })
+
   it('drops late frames of the epoch it just replaced instead of holding them', () => {
     const { p } = player()
     announce(p, info(1))

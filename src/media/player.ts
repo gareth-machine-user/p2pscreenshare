@@ -152,6 +152,8 @@ export class Player {
       console.warn('VideoDecoder configure failed', err)
       this.scheduleRebuild(decoder)
     }
+    // Frames held for this epoch decode now, not on the next drain tick (up to 50 ms later).
+    this.pump()
   }
 
   /** Rebuilds a failed decoder after a backoff, unless it has been replaced meanwhile. */
