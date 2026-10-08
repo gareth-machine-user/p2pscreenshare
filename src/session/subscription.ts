@@ -90,7 +90,7 @@ export class Subscription {
     this.setAnnouncement(ann)
     this.subscribe()
     this.timers.push(every(HEALTH_INTERVAL_MS, () => this.checkHealth()))
-    this.timers.push(every(STATS_INTERVAL_MS, () => void this.sendStats()))
+    this.timers.push(every(STATS_INTERVAL_MS, () => this.sendStats()))
     this.timers.push(every(RESUBSCRIBE_MS, () => this.subscribe()))
     this.timers.push(every(15_000, () => void this.syncClock()))
     void this.syncClock()
@@ -287,7 +287,7 @@ export class Subscription {
     }
   }
 
-  private async sendStats(): Promise<void> {
+  private sendStats(): void {
     this.loss = this.sampleLoss()
     const stats = this.stats
     this.lastStats = stats

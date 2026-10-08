@@ -2,6 +2,7 @@
 // the publisher of the channel they watch, plus the upload probe between neighbours. Tree commands
 // for a channel are only accepted from that channel's publisher.
 import type { Topology } from '../topology/model'
+import { MAX_PIECES } from './framing'
 
 // Re-exported for the media pipeline (decoder descriptions).
 export { fromBase64, toBase64 } from '../util/base64'
@@ -172,17 +173,6 @@ type Missing<All, Listed> = Exclude<All, Listed> extends never ? true : Exclude<
 const _listsComplete: [Missing<SubscriberMsg['t'], (typeof SUBSCRIBER_MSG_TYPES)[number]>, Missing<PublisherMsg['t'], (typeof PUBLISHER_MSG_TYPES)[number]>, Missing<PeerMsg['t'], (typeof PEER_MSG_TYPES)[number]>] = [true, true, true]
 void _listsComplete
 
-const subscriberTypes: ReadonlySet<string> = new Set(SUBSCRIBER_MSG_TYPES)
-const publisherTypes: ReadonlySet<string> = new Set(PUBLISHER_MSG_TYPES)
-
-export function isSubscriberMsg(msg: PeerMsg): msg is SubscriberMsg {
-  return subscriberTypes.has(msg.t)
-}
-
-export function isPublisherMsg(msg: PeerMsg): msg is PublisherMsg {
-  return publisherTypes.has(msg.t)
-}
-
 // --- validation of untrusted peer input ------------------------------------------------------------
 // Peers are only as trusted as their signature: a message is dispatched only if it has the shape its
 // handlers rely on. Extra fields are ignored; fields only shown in the UI are checked loosely.
@@ -193,8 +183,6 @@ const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFin
 const isIndex = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0
 const isNumOrNull = (v: unknown) => v === null || isNum(v)
 const isStrOrNull = (v: unknown) => v === null || typeof v === 'string'
-/** More stripes than any channel has (k + m); bounds lists of stripe indices. */
-const MAX_STRIPES = 64
 const isNumArray = (v: unknown, len?: number) => Array.isArray(v) && (len === undefined || v.length === len) && v.every(isNum)
 
 function isStripeStat(v: unknown): v is StripeStat {
@@ -220,7 +208,7 @@ function isPeerLink(v: unknown): boolean {
   return isObj(v) && isNum(v.drops) && isNum(v.queueMs) && typeof v.backlogged === 'boolean' && isNumOrNull(v.capKbps)
 }
 
-export function isSubscriberStats(v: unknown): v is SubscriberStats {
+function isSubscriberStats(v: unknown): v is SubscriberStats {
   return (
     isObj(v) &&
     Array.isArray(v.stripes) &&
@@ -296,8 +284,9 @@ const shapes: { [T in PeerMsg['t']]: (m: Obj) => boolean } = {
   'publish-req': () => true,
   'publish-deny': () => true,
   'publish-cancel': () => true,
-  // Bounded: a parent serves at most one replay per stripe anyway.
-  'need-gop': (m) => isNum(m.ch) && Array.isArray(m.stripes) && m.stripes.length > 0 && m.stripes.length <= MAX_STRIPES && m.stripes.every(isIndex),
+  // Bounded by the most stripes a channel can have (as announcements are, mesh/records.ts); a parent
+  // serves at most one replay per stripe anyway.
+  'need-gop': (m) => isNum(m.ch) && Array.isArray(m.stripes) && m.stripes.length > 0 && m.stripes.length <= MAX_PIECES && m.stripes.every(isIndex),
 }
 
 /** Returns the message if it is a well-formed PeerMsg, else null (a buggy or hostile peer). */

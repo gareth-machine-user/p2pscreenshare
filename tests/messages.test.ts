@@ -1,12 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
-  isPublisherMsg,
-  isSubscriberMsg,
   isTopologyReport,
   parsePeerMsg,
   PEER_MSG_TYPES,
-  PUBLISHER_MSG_TYPES,
-  SUBSCRIBER_MSG_TYPES,
   type EncoderRates,
   type PeerMsg,
   type SubscriberStats,
@@ -55,6 +51,8 @@ const valid: PeerMsg[] = [
   { t: 'publish-cancel' },
   { t: 'need-gop', ch: 1, stripes: [0] },
   { t: 'need-gop', ch: 1, stripes: [0, 2, 3] },
+  // A channel may have up to 256 stripes (the UI offers fewer, other clients may not).
+  { t: 'need-gop', ch: 1, stripes: Array.from({ length: 100 }, (_, i) => i) },
 ]
 
 const roundTrip = (v: unknown): unknown => JSON.parse(JSON.stringify(v))
@@ -123,15 +121,6 @@ describe('peer message validation', () => {
     expect(s.uplinkDropRate).toBe(0)
     expect(s.loss).toBeUndefined()
     expect(s.stripes).toEqual([{ parent: 'p', lastRecvAgoMs: null, rttMs: null, lateMs: 0 }])
-  })
-
-  it('classifies subscriber and publisher messages', () => {
-    for (const m of valid) {
-      expect(isSubscriberMsg(m)).toBe((SUBSCRIBER_MSG_TYPES as readonly string[]).includes(m.t))
-      expect(isPublisherMsg(m)).toBe((PUBLISHER_MSG_TYPES as readonly string[]).includes(m.t))
-    }
-    expect(isSubscriberMsg({ t: 'publish-req' })).toBe(false)
-    expect(isPublisherMsg({ t: 'publish-req' })).toBe(false)
   })
 })
 
