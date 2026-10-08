@@ -10,7 +10,8 @@
 import { ban, grant, isBanned, mayPublish as mayPublishDoc, revoke, setPolicy, type PublishPolicy } from '../mesh/auth'
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
 import { gunzip } from '../mesh/envelope'
-import { Mesh } from '../mesh/mesh'
+import { Mesh, type MeshOptions } from '../mesh/mesh'
+import type { PeerConn } from '../mesh/meshConn'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { fromBase64Url } from '../net/lobby'
 import { Uplink } from '../net/uplink'
@@ -44,6 +45,8 @@ export interface PeerSessionOptions {
   block?: string[]
   /** Connections per pair (media lanes, mesh/lanes.ts): 1..4, default 2; 1 = the mesh link only. */
   lanes?: number
+  /** Tests: the mesh's connection, lane, rendezvous and storage factories (tests/fakes/network.ts). */
+  meshDeps?: Pick<MeshOptions<PeerConn>, 'connect' | 'connectLane' | 'rendezvous' | 'storage'>
 }
 
 /** One connection to a peer, as the Peers panel shows it (PeerSession.linkStatsFor). */
@@ -233,6 +236,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       iceServers: opts.iceServers,
       block: opts.block,
       lanes: opts.lanes,
+      // The fakes implement PeerConn, not MeshConn: all the session relies on.
+      ...(opts.meshDeps as Partial<MeshOptions>),
     })
     // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
     this.relay = new RelayNode(
