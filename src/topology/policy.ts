@@ -2,7 +2,7 @@
 // reattach requests are batched, when a late parent loses its children, which keyframe requests
 // are honoured, and when a child's complaint counts against its parent. ChannelPublisher
 // (session/channelPublisher.ts) runs it for real; the simulator (sim/simulator.ts) runs the same code.
-import type { PlannerConfig } from './model'
+import { subtree, type PlannerConfig, type Topology } from './model'
 
 /** Peers must have subscribed this long before they are trusted as relays (ms). */
 export const MIN_UPTIME_MS_FOR_RELAY = 4000
@@ -39,11 +39,112 @@ export const PARENT_GRACE_MS = 3000
 
 /** A child whose linkOpen parent forwarded nothing avoids that parent this long (ms). */
 export const SILENT_PARENT_AVOID_MS = 15_000
+/** A child that could not link to its parent at all avoids that pair this long (ms). */
+export const LINK_FAILED_AVOID_MS = 60_000
 /**
  * After a relay fails, its whole subtree goes silent on that stripe. Descendants' reattach requests
  * within this window blame the upstream failure, not their (healthy) parent (ms).
  */
 export const UPSTREAM_DISRUPTION_MS = 6000
+
+/** Which peers' feeds of which stripes are known to be broken upstream, and until when. */
+export class DisruptionTracker {
+  /** edgeKey(peer, stripe) -> until when (ms). */
+  private until = new Map<string, number>()
+
+  /** `root`'s subtree on `stripe` (with `includeRoot`, root too) is about to go silent: not their parents' fault. */
+  markSubtree(topology: Topology, root: string, stripe: number, now: number, includeRoot = false): void {
+    const until = now + UPSTREAM_DISRUPTION_MS
+    const nodes = subtree(topology, root, stripe)
+    if (includeRoot) nodes.push(root)
+    for (const n of nodes) {
+      const key = edgeKey(n, stripe)
+      this.until.set(key, Math.max(this.until.get(key) ?? 0, until))
+    }
+  }
+
+  isDisrupted(peer: string, stripe: number, now: number): boolean {
+    const key = edgeKey(peer, stripe)
+    const until = this.until.get(key)
+    if (until === undefined) return false
+    if (now < until) return true
+    this.until.delete(key)
+    return false
+  }
+
+  /** The stripes (of `stripes`) on which `peer` is starved: PlannerPeer.starved. */
+  starved(peer: string, stripes: number, now: number): number[] {
+    return [...Array(stripes).keys()].filter((s) => this.isDisrupted(peer, s, now))
+  }
+
+  /** Drops expired entries. */
+  prune(now: number): void {
+    for (const [key, until] of this.until) if (now > until) this.until.delete(key)
+  }
+}
+
+/** A child's reattach request: its parent on `stripe` forwarded nothing (`linkOpen`) or never linked. */
+export interface ReattachRequest {
+  child: string
+  stripe: number
+  linkOpen: boolean
+  /** When the publisher received it (ms). */
+  at: number
+}
+
+export interface ReattachBatchContext {
+  hostId: string
+  topology: Topology
+  /** The last plan's depth[peer][stripe], to handle complaints shallowest-first. */
+  depth: Record<string, number[]>
+  /** In the current plan (subscribed, linked and answering). */
+  isActive(child: string): boolean
+  /** A subscriber of this channel (only those can be blamed as parents). */
+  isPeer(id: string): boolean
+  /** When `child`'s parent on `stripe` last changed (ms). */
+  parentChangedAt(child: string, stripe: number): number | undefined
+  disruption: DisruptionTracker
+  now: number
+}
+
+/**
+ * Handles one batch of reattach requests (ChannelPublisher's, and the simulator's), shallowest
+ * first: requests about a parent that was replaced since, or about a parent whose own feed is
+ * broken upstream, are dropped. Each remaining child's subtree (and the child) is marked disrupted,
+ * so deeper complaints in the same batch are recognized as collateral. Returns whether to replan,
+ * the linkOpen complaints to judge (judgeComplaints), and the parents each child should avoid.
+ */
+export function handleReattaches(
+  batch: readonly ReattachRequest[],
+  ctx: ReattachBatchContext,
+): { replan: boolean; accused: Accusation[]; avoid: { child: string; parent: string; until: number }[] } {
+  const depth = (r: ReattachRequest) => ctx.depth[r.child]?.[r.stripe] ?? 0
+  const sorted = [...batch].sort((a, b) => depth(a) - depth(b))
+  const { now } = ctx
+  let replan = false
+  const accused: Accusation[] = []
+  const avoid: { child: string; parent: string; until: number }[] = []
+  for (const { child, stripe, linkOpen, at } of sorted) {
+    if (!ctx.isActive(child)) continue
+    // Sent before the child heard of its new parent: it is about the old one, and handled.
+    if (at - (ctx.parentChangedAt(child, stripe) ?? -Infinity) < PARENT_GRACE_MS) continue
+    const parent = ctx.topology.parents[child]?.[stripe] ?? null
+    // The parent is itself starved by an upstream failure that is already being handled:
+    // keep this child where it is (the parent's feed will resume).
+    if (linkOpen && parent && ctx.disruption.isDisrupted(parent, stripe, now)) continue
+    // This child's feed is broken, and everything below it is going silent as well.
+    ctx.disruption.markSubtree(ctx.topology, child, stripe, now, true)
+    if (parent && parent !== ctx.hostId) {
+      // Link up but nothing forwarded: the parent may be unreliable (judged by the caller).
+      // Link not up: this pair can't connect (avoid it for longer).
+      // Either way, pick a different parent for this stripe.
+      if (linkOpen && ctx.isPeer(parent)) accused.push({ child, parent, stripe, now })
+      avoid.push({ child, parent, until: now + (linkOpen ? SILENT_PARENT_AVOID_MS : LINK_FAILED_AVOID_MS) })
+    }
+    replan = true
+  }
+  return { replan, accused, avoid }
+}
 
 // Subscriber timing (session/subscription.ts), which the publisher's policy and the simulator assume.
 /** A subscriber asks to reattach a stripe at most once per this long (ms). */

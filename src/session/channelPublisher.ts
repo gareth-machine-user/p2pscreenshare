@@ -11,22 +11,22 @@ import { toBase64Url } from '../net/lobby'
 import { signFrame } from '../proto/signing'
 import type { EncoderRates, PublisherMsg, StreamInfo, SubscriberMsg, SubscriberStats, TopologyReport, UplinkRates } from '../proto/messages'
 import type { RelayNode } from '../relay/relayNode'
-import { emptyTopology, subtree, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
+import { emptyTopology, type ParentChange, type PlannerConfig, type PlannerPeer, type PlanResult, type Topology } from '../topology/model'
 import { plan } from '../topology/planner'
 import {
   ComplaintLog,
   defaultPlannerConfig,
+  DisruptionTracker,
   edgeKey,
+  handleReattaches,
   judgeComplaints,
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
   LateParentTracker,
-  PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
-  SILENT_PARENT_AVOID_MS,
-  UPSTREAM_DISRUPTION_MS,
   type Accusation,
   type LatenessSample,
+  type ReattachRequest,
   type StatsSnapshot,
 } from '../topology/policy'
 import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
@@ -52,7 +52,6 @@ export interface PublisherContext {
 
 const REPLAN_INTERVAL_MS = 2000
 const REMOVAL_TIMEOUT_MS = 4000
-const LINK_FAILED_AVOID_MS = 60_000
 /** A parent that children report as silent must answer a ping within this time. */
 const LIVENESS_TIMEOUT_MS = 1200
 /** A peer that failed a liveness ping stays out of the plan this long (or until it answers again). */
@@ -98,11 +97,11 @@ export class ChannelPublisher {
   /** Recent "parent forwards nothing" complaints, to corroborate each other. */
   private complaints = new ComplaintLog()
   private lastPositions = new Map<string, string>()
-  /** edgeKey(peer, stripe) -> until when that peer's feed is known to be broken upstream. */
-  private disruptedUntil = new Map<string, number>()
+  /** Which peers' feeds are known to be broken upstream. */
+  private disruption = new DisruptionTracker()
   /** Frames are signed in order, so fragments leave in capture order. */
   private signing: Promise<void> = Promise.resolve()
-  private reattachQueue: { child: string; stripe: number; linkOpen: boolean; at: number }[] = []
+  private reattachQueue: ReattachRequest[] = []
   /** edgeKey(peer, stripe) -> when that peer's parent there last changed. */
   private parentChangedAt = new Map<string, number>()
   private reattachTimer: (() => void) | null = null
@@ -314,7 +313,7 @@ export class ChannelPublisher {
     parents.forEach((parent, stripe) => {
       if (parent) this.removeEdge(parent, id, stripe)
       // Its subtree is about to go silent; that's not their parents' fault.
-      this.markSubtreeDisrupted(id, stripe)
+      this.disruption.markSubtree(this.topology, id, stripe, performance.now())
     })
     for (const [key, pr] of this.pendingRemovals) {
       if (pr.child === id || pr.oldParent === id) {
@@ -343,35 +342,20 @@ export class ChannelPublisher {
 
   private processReattaches(): void {
     this.reattachTimer = null
-    const batch = this.reattachQueue.splice(0)
-    const depth = (r: { child: string; stripe: number }) => this.lastPlan?.depth[r.child]?.[r.stripe] ?? 0
-    batch.sort((a, b) => depth(a) - depth(b))
-    const now = performance.now()
-    let changed = false
-    /** linkOpen complaints about relays, judged once the whole batch is known. */
-    const accused: Accusation[] = []
-    for (const { child, stripe, linkOpen, at } of batch) {
-      const sub = this.subscribers.get(child)
-      if (!sub?.active) continue
-      // Sent before the child heard of its new parent: it is about the old one, and handled.
-      if (at - (this.parentChangedAt.get(edgeKey(child, stripe)) ?? -Infinity) < PARENT_GRACE_MS) continue
-      const parent = this.topology.parents[child]?.[stripe]
-      // The parent is itself starved by an upstream failure that is already being handled:
-      // keep this child where it is (the parent's feed will resume).
-      if (linkOpen && parent && this.isDisrupted(parent, stripe)) continue
-      // This child's feed is broken, and everything below it is going silent as well.
-      this.markSubtreeDisrupted(child, stripe, true)
-      if (parent && parent !== this.ctx.selfId) {
-        // Link up but nothing forwarded: the parent may be unreliable (judged below).
-        // Link not up: this pair can't connect (avoid it for longer).
-        // Either way, pick a different parent for this stripe.
-        if (linkOpen && this.subscribers.has(parent)) accused.push({ child, parent, stripe, now })
-        sub.avoid.set(parent, now + (linkOpen ? SILENT_PARENT_AVOID_MS : LINK_FAILED_AVOID_MS))
-      }
-      changed = true
-    }
+    const { replan, accused, avoid } = handleReattaches(this.reattachQueue.splice(0), {
+      hostId: this.ctx.selfId,
+      topology: this.topology,
+      depth: this.lastPlan?.depth ?? {},
+      isActive: (id) => !!this.subscribers.get(id)?.active,
+      isPeer: (id) => this.subscribers.has(id),
+      parentChangedAt: (child, stripe) => this.parentChangedAt.get(edgeKey(child, stripe)),
+      disruption: this.disruption,
+      now: performance.now(),
+    })
+    for (const a of avoid) this.subscribers.get(a.child)!.avoid.set(a.parent, a.until)
+    // linkOpen complaints about relays, judged once the whole batch is known.
     const suspects = this.judgeParents(accused)
-    if (changed) this.scheduleReplan(0)
+    if (replan) this.scheduleReplan(0)
     for (const p of suspects) void this.checkAlive(p)
   }
 
@@ -414,25 +398,6 @@ export class ChannelPublisher {
         this.scheduleReplan(0)
       }
     }
-  }
-
-  private markSubtreeDisrupted(root: string, stripe: number, includeRoot = false): void {
-    const until = performance.now() + UPSTREAM_DISRUPTION_MS
-    const nodes = subtree(this.topology, root, stripe)
-    if (includeRoot) nodes.push(root)
-    for (const n of nodes) {
-      const key = edgeKey(n, stripe)
-      this.disruptedUntil.set(key, Math.max(this.disruptedUntil.get(key) ?? 0, until))
-    }
-  }
-
-  private isDisrupted(peer: string, stripe: number): boolean {
-    const key = edgeKey(peer, stripe)
-    const until = this.disruptedUntil.get(key)
-    if (until === undefined) return false
-    if (performance.now() < until) return true
-    this.disruptedUntil.delete(key)
-    return false
   }
 
   // --- planning ----------------------------------------------------------------------------------
@@ -521,7 +486,7 @@ export class ChannelPublisher {
     const now = performance.now()
     this.updateLateness(now)
     this.updateFeasibility(now)
-    for (const [key, until] of this.disruptedUntil) if (now > until) this.disruptedUntil.delete(key)
+    this.disruption.prune(now)
     const mesh = this.ctx.mesh
     const peers: PlannerPeer[] = []
     for (const sub of this.subscribers.values()) {
@@ -541,7 +506,7 @@ export class ChannelPublisher {
         joinedAt: sub.joinedAt,
         failures: sub.failures,
         avoid: [...sub.avoid.keys(), ...unreachable],
-        starved: [...Array(this.stripes).keys()].filter((st) => this.isDisrupted(sub.id, st)),
+        starved: this.disruption.starved(sub.id, this.stripes, now),
       })
     }
     const result = plan(peers, this.topology, this.plannerConfig, now)

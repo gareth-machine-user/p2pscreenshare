@@ -28,7 +28,9 @@ import { plan } from '../src/topology/planner'
 import {
   ComplaintLog,
   defaultPlannerConfig,
+  DisruptionTracker,
   edgeKey,
+  handleReattaches,
   KEY_REQUEST_INTERVAL_MS,
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
@@ -37,11 +39,9 @@ import {
   PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
   REATTACH_COOLDOWN_MS,
-  SILENT_PARENT_AVOID_MS,
   STATS_INTERVAL_MS,
-  UPSTREAM_DISRUPTION_MS,
-  type Accusation,
   type LatenessSample,
+  type ReattachRequest,
   type StatsSnapshot,
 } from '../src/topology/policy'
 import { tuning } from '../src/tuning'
@@ -248,20 +248,23 @@ class Simulation {
   private readonly avoidUntil = new Map<string, Map<string, number>>()
   private nextId = 0
   private topo: Topology = emptyTopology()
+  private depth: Record<string, number[]> = {}
+  /** edgeKey(peer, stripe) -> when that peer's parent there last changed. */
+  private readonly parentChangedAt = new Map<string, number>()
   private lastPlan = -Infinity
   /** outage[peer][stripe] = time until which the stripe is missing. */
   private readonly outage = new Map<string, number[]>()
   /** When each of those outages began (lossy runs only, for relays' stats). */
   private readonly outageFrom = new Map<string, number[]>()
-  /** edgeKey(peer, stripe) -> until when the publisher knows that feed is starved by a departure. */
-  private readonly disruptedUntil = new Map<string, number>()
+  /** Feeds the publisher knows are starved upstream (by a departure, or a complaint above them). */
+  private readonly disruption = new DisruptionTracker()
 
   // Lossy viewers and the publisher policy they exercise (simulateLossy only).
   private readonly lossy = new Map<string, LossyViewer>()
   private readonly failures = new Map<string, number>()
   private readonly keyGate = new KeyframeGate()
   private readonly complaints = new ComplaintLog()
-  private readonly reattachQueue: { child: string; parent: string; stripe: number }[] = []
+  private readonly reattachQueue: ReattachRequest[] = []
   private reattachDueAt = Infinity
   private lastKeyAt = 0
   /** When encoded keyframes reach the lossy viewers. */
@@ -404,7 +407,7 @@ class Simulation {
         if (parent && now - v.setAt[s] >= PARENT_GRACE_MS && now - v.lastRecv[s] >= tuning.stripeSilenceMs && now - v.lastReattach[s] >= REATTACH_COOLDOWN_MS) {
           v.lastReattach[s] = now
           this.complaintsSent++
-          this.reattachQueue.push({ child: v.id, parent, stripe: s })
+          this.reattachQueue.push({ child: v.id, stripe: s, linkOpen: true, at: now })
           if (this.reattachDueAt === Infinity) this.reattachDueAt = now + REATTACH_BATCH_MS
         }
       }
@@ -447,19 +450,20 @@ class Simulation {
     this.keyArrivals.push(now + KEYFRAME_ARRIVAL_MS)
   }
 
-  /** ChannelPublisher.processReattaches for linkOpen complaints: move the child, maybe blame the parent. */
+  /** ChannelPublisher.processReattaches (the same policy): move the child, maybe blame the parent. */
   private processReattaches(now: number): void {
     this.reattachDueAt = Infinity
-    const accused: Accusation[] = []
-    for (const { child, parent, stripe } of this.reattachQueue.splice(0)) {
-      if (this.topo.parents[child]?.[stripe] !== parent || parent === HOST) continue
-      // The parent is starved by a departure being repaired: the child stays (as the publisher does).
-      if ((this.disruptedUntil.get(edgeKey(parent, stripe)) ?? -Infinity) > now) continue
-      if (this.live.has(parent)) accused.push({ child, parent, stripe, now })
-      const m = this.avoidUntil.get(child) ?? new Map<string, number>()
-      m.set(parent, now + SILENT_PARENT_AVOID_MS)
-      this.avoidUntil.set(child, m)
-    }
+    const { replan, accused, avoid } = handleReattaches(this.reattachQueue.splice(0), {
+      hostId: HOST,
+      topology: this.topo,
+      depth: this.depth,
+      isActive: (id) => this.live.has(id),
+      isPeer: (id) => this.live.has(id),
+      parentChangedAt: (child, stripe) => this.parentChangedAt.get(edgeKey(child, stripe)),
+      disruption: this.disruption,
+      now,
+    })
+    for (const a of avoid) this.avoid(a.child, a.parent, a.until)
     if (this.o.lossy!.policy === 'new') {
       // The publisher's own judgement (topology/policy.ts), one entry per blamed complaint.
       const blamed = judgeComplaints(accused, this.complaints, (id) => this.statsOf(id, now), now, tuning.stripeSilenceMs / 2)
@@ -468,7 +472,13 @@ class Simulation {
       // Before corroboration: every complaint counted against the parent.
       for (const c of accused) this.failures.set(c.parent, (this.failures.get(c.parent) ?? 0) + 1)
     }
-    this.replan(now)
+    if (replan) this.replan(now)
+  }
+
+  private avoid(child: string, parent: string, until: number): void {
+    const m = this.avoidUntil.get(child) ?? new Map<string, number>()
+    m.set(parent, until)
+    this.avoidUntil.set(child, m)
   }
 
   /** A peer's latest stats as the publisher has them (sent every 2 s). */
@@ -529,13 +539,14 @@ class Simulation {
     for (const p of [...this.live.values()]) {
       if (p.leaveAt > now) continue
       for (let s = 0; s < this.S; s++) {
+        // The publisher sees the departure on its own link: the subtree is starved, not to blame.
+        this.disruption.markSubtree(this.topo, p.id, s, now)
         for (const d of subtree(this.topo, p.id, s)) {
           const o = this.outage.get(d) ?? new Array(this.S).fill(-Infinity)
           if (this.lossy.size) {
             const from = this.outageFrom.get(d) ?? new Array(this.S).fill(-Infinity)
             if (o[s] <= now) from[s] = now
             this.outageFrom.set(d, from)
-            this.disruptedUntil.set(edgeKey(d, s), now + UPSTREAM_DISRUPTION_MS)
           }
           o[s] = Math.max(o[s], now + this.o.repairMs)
           this.outage.set(d, o)
@@ -547,6 +558,7 @@ class Simulation {
       this.failures.delete(p.id)
       this.offerHistory.delete(p.id)
       this.stalled.delete(p.id)
+      for (let s = 0; s < this.S; s++) this.parentChangedAt.delete(edgeKey(p.id, s))
       departed = true
     }
     // Arrivals keep the audience roughly stable.
@@ -558,6 +570,7 @@ class Simulation {
   private replan(now: number): void {
     if (this.o.handleLate) this.updateLateness(now)
     for (const [id, f] of this.failures) this.failures.set(id, f * 0.95)
+    this.disruption.prune(now)
     // Departures are seen at once (the publisher's own mesh links); joins and offers through gossip.
     const peers: PlannerPeer[] = [...this.live.values()]
       .filter((p) => now - p.joinedAt >= this.o.gossipMs)
@@ -567,11 +580,14 @@ class Simulation {
         joinedAt: p.joinedAt,
         failures: this.failures.get(p.id) ?? 0,
         avoid: [...(this.avoidUntil.get(p.id) ?? new Map<string, number>())].filter(([, t]) => t > now).map(([a]) => a),
+        starved: this.disruption.starved(p.id, this.S, now),
       }))
     const r = plan(peers, this.topo, this.cfg, now)
     // With lossy viewers, count only the other viewers' changes.
     this.changes += r.changes.filter((c) => !this.lossy.has(c.peer)).length
+    for (const c of r.changes) this.parentChangedAt.set(edgeKey(c.peer, c.stripe), now)
     this.topo = r.topology
+    this.depth = r.depth
     this.lastPlan = now
   }
 
@@ -588,12 +604,7 @@ class Simulation {
       })
     }
     for (const { parent, stripe } of this.late.update(samples, now)) {
-      for (const [child, ps] of Object.entries(this.topo.parents)) {
-        if (ps[stripe] !== parent) continue
-        const m = this.avoidUntil.get(child) ?? new Map<string, number>()
-        m.set(parent, now + LATE_PARENT_AVOID_MS)
-        this.avoidUntil.set(child, m)
-      }
+      for (const [child, ps] of Object.entries(this.topo.parents)) if (ps[stripe] === parent) this.avoid(child, parent, now + LATE_PARENT_AVOID_MS)
     }
   }
 
