@@ -29,7 +29,7 @@ import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { AutoFallback, liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
 import { HeadroomProbe } from './headroom'
-import { after, every, takeMainThreadLag } from '../net/ticker'
+import { debounce, every, takeMainThreadLag } from '../net/ticker'
 import type { Buffering } from '../media/jitterBuffer'
 
 export interface PeerSessionOptions {
@@ -120,8 +120,7 @@ const AUTO_QUALITY_CHECK_MS = 500
 const STAGE_LOG_MS = 100
 const STAGE_LOG_MAX = 100
 
-/** One connection's figures over the last window (Peers panel, Topology). */
-/** One connection's last capacity window (session/capacity.ts linkWindow), rounded for display. */
+/** One connection's last capacity window (session/capacity.ts linkWindow), rounded for display (Peers panel, Topology). */
 interface LaneRate {
   mediaKbps: number
   deliveredKbps: number
@@ -218,7 +217,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
   encoderStatsNow: EncoderRates | null = null
   /** The uplink's counters per second; the first window runs from construction (all zero then). */
   private uplinkWindow = new RateWindow<UplinkCounters>()
-  private reconcileTimer: (() => void) | null = null
+  private reconcileSoon = debounce(() => this.reconcile())
   private timers: (() => void)[] = []
   /** Set by leave(): no more reconciles (they would re-create subscriptions). */
   private left = false
@@ -356,21 +355,17 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
       own: this.ownChannels().map((c) => c.announcement()),
       members: this.mesh.members(),
     })
-    for (const ch of this.channels.keys()) if (!next.has(ch)) this.topologyReports.delete(ch)
+    for (const ch of this.channels.keys()) {
+      if (next.has(ch)) continue
+      this.topologyReports.delete(ch)
+      this.topoWatching.delete(ch)
+    }
     this.channels = next
   }
 
   private scheduleReconcile(delay = 50): void {
     // After leave(): a reconcile would re-create subscriptions that nobody closes.
-    if (this.left) return
-    if (this.reconcileTimer !== null) {
-      if (delay > 0) return
-      this.reconcileTimer()
-    }
-    this.reconcileTimer = after(delay, () => {
-      this.reconcileTimer = null
-      this.reconcile()
-    })
+    if (!this.left) this.reconcileSoon.schedule(delay)
   }
 
   /** The preview channel of a publisher's stream, if announced. */
@@ -820,7 +815,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
 
   /** Asks a channel's publisher for topology reports while the panel is open. */
   watchTopology(ch: number, on: boolean): void {
-    const live = this.channels.get(ch >>> 0)
+    ch >>>= 0
+    const live = this.channels.get(ch)
     if (on) this.topoWatching.add(ch)
     else this.topoWatching.delete(ch)
     if (live && live.publisher !== this.selfId) this.sendTo(live.publisher, { t: 'topo-req', ch, on })
@@ -1102,8 +1098,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext {
     // First, so nothing below (stopSharing announces) or after (mesh callbacks until its links
     // close) schedules a reconcile that would watch channels again.
     this.left = true
-    this.reconcileTimer?.()
-    this.reconcileTimer = null
+    this.reconcileSoon.cancel()
     this.timers.forEach((cancel) => cancel())
     this.timers = []
     this.stopSharing()

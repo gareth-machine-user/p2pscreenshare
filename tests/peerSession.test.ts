@@ -74,8 +74,8 @@ function present(s: PeerSession, k = 2, m = 1): ChannelPublisher {
 }
 
 /** A fake channel announcement in the owner's record (the owner may always publish). */
-function announceFake(s: PeerSession): ChannelAnnouncement {
-  const ann: ChannelAnnouncement = { id: 0x77, kind: 'full', k: 2, m: 1, kbps: 1000, stripeKbps: 500, stream: null, deficit: 0, startedAt: 1 }
+function announceFake(s: PeerSession, id = 0x77): ChannelAnnouncement {
+  const ann: ChannelAnnouncement = { id, kind: 'full', k: 2, m: 1, kbps: 1000, stripeKbps: 500, stream: null, deficit: 0, startedAt: 1 }
   s.mesh.updateRecord({ channels: [ann] })
   return ann
 }
@@ -129,6 +129,22 @@ describe('PeerSession (in-memory network)', () => {
     owner.mesh.updateRecord({ capacityKbps: 1234 })
     await advance(3000)
     expect(viewer.subs.size).toBe(0)
+  })
+
+  it('stops watching a channel’s topology when the channel ends, whatever sign its id came with', async () => {
+    lobby = await makeLobby(2)
+    const [owner, viewer] = lobby.sessions
+    const ann = announceFake(owner, 0x8000_0077)
+    await until(() => viewer.liveChannels().length === 1, 5000, 'channel seen')
+    const watching = (viewer as unknown as { topoWatching: Set<number> }).topoWatching
+    viewer.watchTopology(ann.id | 0, true) // the same id, as a signed int32
+    viewer.watchTopology(ann.id, false)
+    expect(watching.size).toBe(0)
+    viewer.watchTopology(ann.id, true)
+    expect(sent(lobby.net, viewer.selfId, owner.selfId, 'topo-req')).toHaveLength(3)
+    owner.mesh.updateRecord({ channels: [] })
+    await until(() => viewer.liveChannels().length === 0, 5000, 'channel ended')
+    expect(watching.size).toBe(0)
   })
 
   it("setPolicy('open' | 'closed') makes one auth update, answering pending requests in it", async () => {
