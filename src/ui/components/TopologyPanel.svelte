@@ -50,6 +50,8 @@
     <div><span>Publisher slots</span><b>{report.rootSlots}</b></div>
     <div><span>Max depth</span><b>{Math.max(0, ...rows.flatMap((r) => r.depth))}</b></div>
     <div><span>Overcommitted</span><b>{report.overcommitted}</b></div>
+    <!-- Older publishers don't send it. -->
+    <div><span title="Peer stripes the last plan left without a parent, because nothing could link to the peer">Unattached</span><b>{report.unattached ?? '—'}</b></div>
     <div><span>Parent changes</span><b>{report.changes}</b></div>
   </div>
   {#if report.publisherStats}
