@@ -30,7 +30,7 @@ import {
   type StatsSnapshot,
 } from '../topology/policy'
 import { feasibilityRatio, feasibleBitrate, MAX_FANOUT, stripeKbpsFor } from './capacity'
-import { after, every } from '../net/ticker'
+import { after, debounce, every } from '../net/ticker'
 import { tuning } from '../tuning'
 
 /** What a publisher needs from the session it belongs to. */
@@ -90,7 +90,8 @@ export class ChannelPublisher {
 
   /** edgeKey(child, stripe) -> the parent kept feeding until the new one delivers (make-before-break). */
   private pendingRemovals = new Map<string, { child: string; stripe: number; oldParent: string; cancel: () => void }>()
-  private replanTimer: (() => void) | null = null
+  /** A replan soon; scheduleReplan(0) brings a pending one forward. */
+  private replanSoon = debounce(() => this.replan())
   private timers: (() => void)[] = []
   /** Which subscribers' keyframe requests the encoder honours (one lossy viewer can't force many). */
   private keyGate = new KeyframeGate()
@@ -403,14 +404,7 @@ export class ChannelPublisher {
   // --- planning ----------------------------------------------------------------------------------
 
   private scheduleReplan(delay = 50): void {
-    if (this.replanTimer !== null) {
-      if (delay > 0) return
-      this.replanTimer()
-    }
-    this.replanTimer = after(delay, () => {
-      this.replanTimer = null
-      this.replan()
-    })
+    this.replanSoon.schedule(delay)
   }
 
   /** Slots a subscriber offered for this channel in its gossip record. */
@@ -616,7 +610,7 @@ export class ChannelPublisher {
   stop(): void {
     this.stopped = true
     this.timers.forEach((cancel) => cancel())
-    this.replanTimer?.()
+    this.replanSoon.cancel()
     this.reattachTimer?.()
     for (const pr of this.pendingRemovals.values()) pr.cancel()
     this.ctx.relay.dropChannel(this.id)
