@@ -201,6 +201,8 @@ export class VideoPipeline {
     // Screen capture only delivers frames when pixels change. Re-encode the last frame while idle so
     // stripes stay alive (silence means "dead parent" to viewers) and keyframes keep flowing.
     let last: VideoFrame | null = null
+    /** When `last` was captured (performance.now), to stamp its re-encodes on the capture's clock. */
+    let lastAt = 0
     let reader = this.reader
     let pending = reader.next()
     for (;;) {
@@ -224,7 +226,9 @@ export class VideoPipeline {
       let frame: VideoFrame
       if (res === null) {
         if (!last) continue
-        frame = new VideoFrame(last, { timestamp: Math.round(performance.now() * 1000) })
+        // The capture's timestamps aren't on performance.now()'s clock: a re-encode stamped with
+        // that would make timestamps jump when real frames resume (encoders want them monotonic).
+        frame = new VideoFrame(last, { timestamp: last.timestamp + Math.round((performance.now() - lastAt) * 1000) })
       } else {
         if (!res.f) {
           // The track ended. Either a new one is on its way (replaceTrack, e.g. between cameras),
@@ -236,6 +240,7 @@ export class VideoPipeline {
         frame = res.f
         last?.close()
         last = frame.clone()
+        lastAt = performance.now()
       }
       this.framesIn++
       try {
@@ -293,7 +298,14 @@ export class VideoPipeline {
       }
     }
     this.repick = false
-    const config = await pickConfig(width, height, this.opts)
+    let config: VideoEncoderConfig
+    try {
+      config = await pickConfig(width, height, this.opts)
+    } catch (err) {
+      // Wait before probing again: each attempt runs a dozen isConfigSupported checks.
+      this.failedAt = wallClock()
+      throw err
+    }
     if (this.stopped) return
     this.config = config
     this.epoch = (this.epoch + 1) & 0xffff

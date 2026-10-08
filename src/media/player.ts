@@ -2,6 +2,7 @@ import { wallClock } from '../net/clock'
 import { fromBase64, type StreamInfo } from '../proto/messages'
 import { AudioPlayer } from './audio'
 import { DecodeScheduler, PlayoutClock } from './jitterBuffer'
+import { RebuildBackoff } from './rebuildBackoff'
 import type { AssembledFrame } from './reassembler'
 
 /** Most frames of a not-yet-announced epoch kept while waiting for its StreamInfo. */
@@ -48,6 +49,8 @@ export class Player {
   clockOffset: number | null = null
 
   private decoder: VideoDecoder | null = null
+  /** Paces rebuilds of a failing decoder (an unsupported config fails on every attempt). */
+  private rebuilds = new RebuildBackoff()
   private info: StreamInfo | null = null
   private renderQueue: Pending[] = []
   private renderAtByTs = new Map<number, number>()
@@ -133,10 +136,7 @@ export class Player {
       error: (e) => {
         console.warn('VideoDecoder error; resetting', e)
         // A decoder error closes the decoder: rebuild it and resume from the next keyframe.
-        setTimeout(() => {
-          if (this.closed || this.decoder !== decoder || !this.info) return
-          this.rebuildDecoder(this.info, this.info)
-        }, 0)
+        this.scheduleRebuild(decoder)
       },
     })
     this.decoder = decoder
@@ -150,8 +150,18 @@ export class Player {
     try {
       decoder.configure(config)
     } catch (err) {
+      // Left unconfigured, the decoder would never decode and the scheduler would buffer forever.
       console.warn('VideoDecoder configure failed', err)
+      this.scheduleRebuild(decoder)
     }
+  }
+
+  /** Rebuilds a failed decoder after a backoff, unless it has been replaced meanwhile. */
+  private scheduleRebuild(decoder: VideoDecoder): void {
+    setTimeout(() => {
+      if (this.closed || this.decoder !== decoder || !this.info) return
+      this.rebuildDecoder(this.info, this.info)
+    }, this.rebuilds.next(wallClock()))
   }
 
   push(f: AssembledFrame): void {

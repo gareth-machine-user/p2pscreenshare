@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DecodeScheduler, EXTRA_BUFFER_MS, PlayoutClock } from '../src/media/jitterBuffer'
+import { DecodeScheduler, EXTRA_BUFFER_MS, MAX_BUFFERED_FRAMES, PlayoutClock } from '../src/media/jitterBuffer'
 import type { AssembledFrame } from '../src/media/reassembler'
 import { NO_REF } from '../src/proto/framing'
 
@@ -167,6 +167,24 @@ describe('DecodeScheduler', () => {
     expect(s.poll(10_000).map((f) => f.seq)).toEqual([8, 9])
     expect(s.stats.droppedUndecodable).toBe(3)
     expect(s.waitingForKeyframe).toBe(false)
+  })
+})
+
+describe('DecodeScheduler buffer cap', () => {
+  it('drops the oldest frames beyond the cap while no keyframe arrives', () => {
+    const s = new DecodeScheduler(readyClock())
+    // Delta frames only (the keyframe was lost): nothing can be decoded, nothing drains.
+    const seqs: number[] = []
+    for (let seq = 1; seqs.length < MAX_BUFFERED_FRAMES + 50; seq++) if (seq % 8 !== 0) seqs.push(seq)
+    for (const seq of seqs) s.push(makeFrame(seq))
+    expect(s.poll(0)).toEqual([])
+    expect(s.buffered).toBe(MAX_BUFFERED_FRAMES)
+    expect(s.stats.droppedUndecodable).toBe(50)
+    // The newest frames were kept: a keyframe after them starts decoding at once.
+    const next = seqs[seqs.length - 1] + 1
+    const key = Math.ceil(next / 8) * 8
+    s.push(makeFrame(key))
+    expect(s.poll(1e9).map((f) => f.seq)[0]).toBe(key)
   })
 })
 

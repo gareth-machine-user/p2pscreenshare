@@ -135,6 +135,13 @@ export class PlayoutClock {
   }
 }
 
+/**
+ * Most frames the decode scheduler holds. Normal playback holds at most the playout delay's worth
+ * (a few hundred frames at 60 fps); this bounds the buffer while it waits for a keyframe that is
+ * slow to come, or while nothing polls it (a decoder that failed to configure).
+ */
+export const MAX_BUFFERED_FRAMES = 1024
+
 export interface SchedulerStats {
   decoded: number
   droppedLate: number
@@ -176,6 +183,16 @@ export class DecodeScheduler {
       return
     }
     this.buffer.set(frame.seq, frame)
+    if (this.buffer.size > MAX_BUFFERED_FRAMES) this.dropOldest(this.buffer.size - MAX_BUFFERED_FRAMES)
+  }
+
+  /** Drops the `n` lowest-numbered buffered frames. */
+  private dropOldest(n: number): void {
+    const seqs = [...this.buffer.keys()].sort((a, b) => a - b)
+    for (const s of seqs.slice(0, n)) {
+      this.buffer.delete(s)
+      this.stats.droppedUndecodable++
+    }
   }
 
   /** Forces a wait for the next keyframe (e.g. after a decoder reset). */

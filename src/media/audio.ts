@@ -3,6 +3,7 @@ import { NO_REF } from '../proto/framing'
 import type { StreamInfo } from '../proto/messages'
 import type { EncodedFrame } from './packetizer'
 import { Playout, type PlayoutStats } from './playout'
+import { RebuildBackoff } from './rebuildBackoff'
 import { AUDIO_FRAME_MS, AUDIO_KBPS } from '../session/capacity'
 
 type AudioInfo = NonNullable<StreamInfo['audio']>
@@ -37,11 +38,26 @@ class P2PPlayout extends AudioWorkletProcessor {
 registerProcessor('p2p-playout', P2PPlayout)
 `
 
+/** An Opus config for audio at this rate and channel count; throws if Opus isn't supported. */
+async function opusConfig(sampleRate: number, numberOfChannels: number): Promise<AudioEncoderConfig> {
+  // Tuned for music and game audio rather than speech. `application` and `signal` are newer than
+  // the DOM typings; browsers that don't know them ignore them.
+  const opus = { application: 'audio', signal: 'music', complexity: 10, frameDuration: AUDIO_FRAME_MS * 1000 } as OpusEncoderConfig
+  const base: AudioEncoderConfig = { codec: 'opus', sampleRate, numberOfChannels, bitrate: AUDIO_KBPS * 1000 }
+  for (const config of [{ ...base, opus }, base]) {
+    if ((await AudioEncoder.isConfigSupported(config)).supported) return config
+  }
+  throw new Error('Opus encoding not supported')
+}
+
 /** Encodes an audio track to Opus (Chromium: needs MediaStreamTrackProcessor). */
 export class AudioPipeline {
   onFrame: (f: EncodedFrame) => void = () => {}
   info: AudioInfo | null = null
   private encoder: AudioEncoder | null = null
+  private config: AudioEncoderConfig | null = null
+  /** Paces rebuilds of an encoder that errored (an error closes it). */
+  private rebuilds = new RebuildBackoff()
   private seq = 0
   private stopped = false
   private reader: ReadableStreamDefaultReader<AudioData> | null = null
@@ -64,19 +80,39 @@ export class AudioPipeline {
   }
 
   async start(): Promise<void> {
-    const settings = this.track.getSettings()
-    const sampleRate = settings.sampleRate ?? 48000
-    const numberOfChannels = Math.min(2, settings.channelCount ?? 2)
-    // Tuned for music and game audio rather than speech. `application` and `signal` are newer than
-    // the DOM typings; browsers that don't know them ignore them.
-    const opus = { application: 'audio', signal: 'music', complexity: 10, frameDuration: AUDIO_FRAME_MS * 1000 } as OpusEncoderConfig
-    let config: AudioEncoderConfig = { codec: 'opus', sampleRate, numberOfChannels, bitrate: AUDIO_KBPS * 1000, opus }
-    if (!(await AudioEncoder.isConfigSupported(config)).supported) {
-      config = { codec: 'opus', sampleRate, numberOfChannels, bitrate: AUDIO_KBPS * 1000 }
-      if (!(await AudioEncoder.isConfigSupported(config)).supported) throw new Error('Opus encoding not supported')
+    if (this.stopped) return
+    this.reader = new MediaStreamTrackProcessor<AudioData>({ track: this.track }).readable.getReader()
+    try {
+      while (!this.stopped) {
+        const { value, done } = await this.reader.read()
+        if (done || !value) break
+        try {
+          if (this.stopped) break
+          // Configured from the audio itself: an encoder whose sample rate or channel count differs
+          // from its input fails on every frame, and track settings may not report them (the
+          // mixer's track runs at its AudioContext's rate, often 44.1 kHz).
+          if (!this.config) {
+            this.config = await opusConfig(value.sampleRate, value.numberOfChannels)
+            if (this.stopped) break
+            this.info = { codec: 'opus', sampleRate: this.config.sampleRate, numberOfChannels: this.config.numberOfChannels }
+          }
+          if (!this.encoder && this.rebuilds.tryNow(wallClock())) this.buildEncoder()
+          if (this.encoder?.state === 'configured') this.encoder.encode(value)
+        } catch (err) {
+          if (!this.config) throw err
+          console.error('audio encode failed', err)
+        } finally {
+          value.close()
+        }
+      }
+    } finally {
+      if (this.stopped || !this.config) void this.reader.cancel().catch(() => {})
     }
-    this.info = { codec: 'opus', sampleRate, numberOfChannels }
-    this.encoder = new AudioEncoder({
+  }
+
+  /** (Re)creates the encoder. An error closes it; the next frame then rebuilds it (paced). */
+  private buildEncoder(): void {
+    const encoder = new AudioEncoder({
       output: (chunk) => {
         const data = new Uint8Array(chunk.byteLength)
         chunk.copyTo(data)
@@ -94,15 +130,22 @@ export class AudioPipeline {
           data,
         })
       },
-      error: (e) => console.error('AudioEncoder error', e),
+      error: (e) => {
+        console.error('AudioEncoder error; rebuilding', e)
+        if (this.encoder === encoder) this.encoder = null
+      },
     })
-    this.encoder.configure(config)
-    this.reader = new MediaStreamTrackProcessor<AudioData>({ track: this.track }).readable.getReader()
-    while (!this.stopped) {
-      const { value, done } = await this.reader.read()
-      if (done || !value) break
-      if (this.encoder.state === 'configured') this.encoder.encode(value)
-      value.close()
+    this.encoder = encoder
+    try {
+      encoder.configure(this.config!)
+    } catch (err) {
+      console.error('AudioEncoder configure failed', err)
+      this.encoder = null
+      try {
+        encoder.close()
+      } catch {
+        // A failed configure may already have closed it.
+      }
     }
   }
 
@@ -161,8 +204,22 @@ export class AudioPlayer {
       this.gain = this.ctx.createGain()
       this.gain.connect(this.ctx.destination)
       void this.loadWorklet(this.ctx)
+      this.ctx.addEventListener('statechange', this.onStateChange)
     }
-    void this.ctx.resume()
+    if (this.ctx.state !== 'closed') void this.ctx.resume().catch(() => {})
+  }
+
+  /**
+   * The browser can suspend a running context (an output device change, the OS sleeping) or
+   * interrupt it (Safari: a call, another app taking audio). While suspended, push() drops all
+   * audio, so an unmuted stream would stay silent: resume it. Without a user gesture the resume
+   * may be refused; the next unmute retries.
+   */
+  private onStateChange = (): void => {
+    const ctx = this.ctx
+    const state = ctx?.state as string | undefined
+    if (!ctx || this.muted || (state !== 'suspended' && state !== 'interrupted')) return
+    void ctx.resume().catch(() => {})
   }
 
   private async loadWorklet(ctx: AudioContext): Promise<void> {
@@ -359,6 +416,7 @@ export class AudioPlayer {
     this.node?.disconnect()
     this.node = null
     this.closeDecoder()
+    this.ctx?.removeEventListener('statechange', this.onStateChange)
     void this.ctx?.close().catch(() => {})
   }
 }
