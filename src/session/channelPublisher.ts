@@ -16,12 +16,15 @@ import { plan } from '../topology/planner'
 import {
   ComplaintLog,
   defaultPlannerConfig,
+  edgeKey,
   judgeComplaints,
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
   LateParentTracker,
   PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
+  SILENT_PARENT_AVOID_MS,
+  UPSTREAM_DISRUPTION_MS,
   type Accusation,
   type LatenessSample,
   type StatsSnapshot,
@@ -50,12 +53,6 @@ export interface PublisherContext {
 const REPLAN_INTERVAL_MS = 2000
 const REMOVAL_TIMEOUT_MS = 4000
 const LINK_FAILED_AVOID_MS = 60_000
-const SILENT_PARENT_AVOID_MS = 15_000
-/**
- * After a relay fails, its whole subtree goes silent on that stripe. Descendants' reattach requests
- * within this window blame the upstream failure, not their (healthy) parent.
- */
-const UPSTREAM_DISRUPTION_MS = 6000
 /** A parent that children report as silent must answer a ping within this time. */
 const LIVENESS_TIMEOUT_MS = 1200
 /** A peer that failed a liveness ping stays out of the plan this long (or until it answers again). */
@@ -66,9 +63,6 @@ const STRIPE_SAMPLE_MS = 250
 const STRIPE_SAMPLES = 40
 /** Audience upload counts as short when supply is below 90% of demand for this long. */
 const SHORT_SUPPLY_FOR_MS = 10_000
-
-/** Key of one (peer, stripe) pair in the per-edge maps below. */
-const edgeKey = (peer: string, stripe: number): string => `${peer}:${stripe}`
 
 export interface ChannelSubscriber {
   id: string
@@ -459,7 +453,7 @@ export class ChannelPublisher {
     return this.ctx.mesh.member(id)?.offers[String(this.id)] ?? 0
   }
 
-  /** Excess lateness (ms) per `${parent}:${stripe}`, from children's reports. */
+  /** Excess lateness (ms) per edgeKey(parent, stripe), from children's reports. */
   get lateness(): ReadonlyMap<string, number> {
     return this.late.lateness
   }

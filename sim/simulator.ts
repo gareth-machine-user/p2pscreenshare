@@ -28,12 +28,18 @@ import { plan } from '../src/topology/planner'
 import {
   ComplaintLog,
   defaultPlannerConfig,
+  edgeKey,
+  KEY_REQUEST_INTERVAL_MS,
   KeyframeGate,
   LATE_PARENT_AVOID_MS,
   judgeComplaints,
   LateParentTracker,
   PARENT_GRACE_MS,
   REATTACH_BATCH_MS,
+  REATTACH_COOLDOWN_MS,
+  SILENT_PARENT_AVOID_MS,
+  STATS_INTERVAL_MS,
+  UPSTREAM_DISRUPTION_MS,
   type Accusation,
   type LatenessSample,
   type StatsSnapshot,
@@ -61,15 +67,7 @@ const BUFFER_MS = 60
 /** Extra forwarding delay of a "late" relay (alive, but slow to pass data on). */
 const LATE_EXTRA_MS = 250
 
-// Lossy viewers (simulateLossy). Subscriber-side constants mirror session/subscription.ts,
-// publisher-side ones session/channelPublisher.ts.
-const REATTACH_COOLDOWN_MS = 4000
-const KEY_REQUEST_INTERVAL_MS = 500
-const STATS_INTERVAL_MS = 2000
-const SILENT_PARENT_AVOID_MS = 15_000
-/** A departure's subtree is known to be starved this long; its complaints are not about their parents. */
-const UPSTREAM_DISRUPTION_MS = 6000
-/** The publisher's keyframe throttle before KeyframeGate: one per 300 ms, from anyone. */
+/** Lossy viewers (simulateLossy): the publisher's keyframe throttle before KeyframeGate, one per 300 ms from anyone. */
 const OLD_KEY_MIN_INTERVAL_MS = 300
 
 const HOST = 'host'
@@ -255,7 +253,7 @@ class Simulation {
   private readonly outage = new Map<string, number[]>()
   /** When each of those outages began (lossy runs only, for relays' stats). */
   private readonly outageFrom = new Map<string, number[]>()
-  /** `${peer}:${stripe}` -> until when the publisher knows that feed is starved by a departure. */
+  /** edgeKey(peer, stripe) -> until when the publisher knows that feed is starved by a departure. */
   private readonly disruptedUntil = new Map<string, number>()
 
   // Lossy viewers and the publisher policy they exercise (simulateLossy only).
@@ -456,7 +454,7 @@ class Simulation {
     for (const { child, parent, stripe } of this.reattachQueue.splice(0)) {
       if (this.topo.parents[child]?.[stripe] !== parent || parent === HOST) continue
       // The parent is starved by a departure being repaired: the child stays (as the publisher does).
-      if ((this.disruptedUntil.get(`${parent}:${stripe}`) ?? -Infinity) > now) continue
+      if ((this.disruptedUntil.get(edgeKey(parent, stripe)) ?? -Infinity) > now) continue
       if (this.live.has(parent)) accused.push({ child, parent, stripe, now })
       const m = this.avoidUntil.get(child) ?? new Map<string, number>()
       m.set(parent, now + SILENT_PARENT_AVOID_MS)
@@ -537,7 +535,7 @@ class Simulation {
             const from = this.outageFrom.get(d) ?? new Array(this.S).fill(-Infinity)
             if (o[s] <= now) from[s] = now
             this.outageFrom.set(d, from)
-            this.disruptedUntil.set(`${d}:${s}`, now + UPSTREAM_DISRUPTION_MS)
+            this.disruptedUntil.set(edgeKey(d, s), now + UPSTREAM_DISRUPTION_MS)
           }
           o[s] = Math.max(o[s], now + this.o.repairMs)
           this.outage.set(d, o)

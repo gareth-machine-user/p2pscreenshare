@@ -10,12 +10,11 @@ import type { LossRates, PeerMsg, PublisherMsg, StripeStat, SubscriberMsg, Subsc
 import { RateWindow, round1 } from './rates'
 import { REPLAY_REQUEST_MIN_MS, treeKey, type RelayNode } from '../relay/relayNode'
 import { after, every } from '../net/ticker'
-import { PARENT_GRACE_MS } from '../topology/policy'
+import { KEY_REQUEST_INTERVAL_MS, PARENT_GRACE_MS, REATTACH_COOLDOWN_MS, STATS_INTERVAL_MS } from '../topology/policy'
 import { tuning } from '../tuning'
 import type { Buffering } from '../media/jitterBuffer'
 
 const HEALTH_INTERVAL_MS = 250
-const STATS_INTERVAL_MS = 2000
 /**
  * A stripe silent this long means its parent is gone or stalled (see tuning.ts). Reattaching reuses
  * an existing mesh link, so a false alarm costs little; the publisher re-encodes the last frame
@@ -24,10 +23,7 @@ const STATS_INTERVAL_MS = 2000
 export const STRIPE_SILENCE_MS = tuning.stripeSilenceMs
 /** Extra time allowed for a parent whose mesh link is still connecting. */
 const LINK_SETUP_GRACE_MS = 8000
-const REATTACH_COOLDOWN_MS = 4000
 const RESUBSCRIBE_MS = 10_000
-/** At most one keyframe request per this interval (the decode chain often breaks in bursts). */
-const KEY_REQUEST_INTERVAL_MS = 500
 /**
  * A broken decode chain is first repaired from the stripe parents' GOP caches (`need-gop`); only if
  * the decoder still waits for a keyframe this long after asking does the publisher get `need-key`

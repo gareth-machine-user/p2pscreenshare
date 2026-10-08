@@ -37,6 +37,22 @@ export const REATTACH_BATCH_MS = 400
  */
 export const PARENT_GRACE_MS = 3000
 
+/** A child whose linkOpen parent forwarded nothing avoids that parent this long (ms). */
+export const SILENT_PARENT_AVOID_MS = 15_000
+/**
+ * After a relay fails, its whole subtree goes silent on that stripe. Descendants' reattach requests
+ * within this window blame the upstream failure, not their (healthy) parent (ms).
+ */
+export const UPSTREAM_DISRUPTION_MS = 6000
+
+// Subscriber timing (session/subscription.ts), which the publisher's policy and the simulator assume.
+/** A subscriber asks to reattach a stripe at most once per this long (ms). */
+export const REATTACH_COOLDOWN_MS = 4000
+/** At most one keyframe request per this interval (the decode chain often breaks in bursts, ms). */
+export const KEY_REQUEST_INTERVAL_MS = 500
+/** Subscribers send their stats this often (ms). */
+export const STATS_INTERVAL_MS = 2000
+
 /** A parent whose children's pieces arrive this much later than its own (ms)... */
 export const LATE_PARENT_MS = 150
 /** ...for this long (ms)... */
@@ -54,20 +70,21 @@ export interface LatenessSample {
   parentLateMs: number
 }
 
-const lateKey = (parent: string, stripe: number) => `${parent}:${stripe}`
+/** Key of one (peer, stripe) pair in per-edge maps. */
+export const edgeKey = (peer: string, stripe: number): string => `${peer}:${stripe}`
 
 /**
  * Tracks how much later a parent's children receive a stripe than the parent itself does
  * (averaged over its children), and which parents have been late for too long.
  */
 export class LateParentTracker {
-  /** Excess lateness (ms) per `${parent}:${stripe}`, from the latest round of samples. */
+  /** Excess lateness (ms) per edgeKey(parent, stripe), from the latest round of samples. */
   readonly lateness = new Map<string, number>()
   private lateSince = new Map<string, number>()
 
   /** A parent's excess lateness on a stripe (the planner's penalty). */
   get(parent: string, stripe: number): number {
-    return this.lateness.get(lateKey(parent, stripe)) ?? 0
+    return this.lateness.get(edgeKey(parent, stripe)) ?? 0
   }
 
   /**
@@ -78,7 +95,7 @@ export class LateParentTracker {
   update(samples: Iterable<LatenessSample>, now: number): { parent: string; stripe: number }[] {
     const sums = new Map<string, { total: number; n: number }>()
     for (const { parent, stripe, lateMs, parentLateMs } of samples) {
-      const key = lateKey(parent, stripe)
+      const key = edgeKey(parent, stripe)
       const acc = sums.get(key) ?? { total: 0, n: 0 }
       acc.total += Math.max(0, lateMs - parentLateMs)
       acc.n++
