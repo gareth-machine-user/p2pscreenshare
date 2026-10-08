@@ -275,6 +275,33 @@ describe('ChannelPublisher: planning and commands', () => {
     expect(h.cp.topology.parents.c1).toBeUndefined()
   })
 
+  it('a peer whose pings go unanswered on an open link stays fed, but relays for no one until it answers', async () => {
+    await striped()
+    // Its control channel stalls (an ordered stream waiting on a retransmission) while media flows.
+    h.mesh.suspected.add('p1')
+    await advance(300)
+    expect(h.cp.subscribers.get('p1')!.active).toBe(true)
+    expect(parentOf('p1', 0)).toBe(HOST)
+    expect(hasEdge(HOST, 'p1', 0)).toBe(true)
+    for (const s of [1, 2]) expect(hasEdge(parentOf('p1', s)!, 'p1', s)).toBe(true)
+    for (const c of ['c1', 'c2', 'c3']) {
+      expect(parentOf(c, 0)).not.toBe('p1')
+      expect(toldParent(c, 0)).toBe(parentOf(c, 0))
+    }
+    // It answers again: it may relay again.
+    h.mesh.suspected.delete('p1')
+    await advance(MIN_UPTIME_MS_FOR_RELAY + 2 * 2000 + 100)
+    expect(h.cp.topology.homes.p1?.length).toBeGreaterThan(0)
+  })
+
+  it('a peer whose link closes is taken out of the plan', async () => {
+    await striped()
+    h.mesh.direct.delete('c1')
+    await advance(300)
+    expect(h.cp.subscribers.get('c1')!.active).toBe(false)
+    for (let s = 0; s < 3; s++) expect(hasEdge(['p1', 'p2', 'p3'][s], 'c1', s)).toBe(false)
+  })
+
   it('a departing relay: its edges to the root go, its children are replanned', async () => {
     await striped()
     h.cp.removeSubscriber('p1')

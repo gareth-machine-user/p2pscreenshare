@@ -305,7 +305,7 @@ membership layer handles everything else.
 
 | Event | Detection | Response | Time |
 |---|---|---|---|
-| A relay's link drops | The publisher's link to it closes or misses pings for 1.5 s | Replan at once; its parents get `remove-child`; its subtree is marked "disrupted upstream" for 6 s | ms |
+| A relay's link drops | The publisher's link to it closes or misses pings for 1.5 s | Replan at once; its subtree is marked "disrupted upstream" for 6 s. A closed link: its parents get `remove-child`. Missed pings on an open link: it keeps its own feed (often only the ordered control channel is stalled on a retransmission while media flows) but relays for no one until it answers | ms |
 | A stripe goes silent | A child hears nothing on it for 1.5 s (1 s in the latency profile) and sends `reattach` | Batched for 400 ms and handled shallowest-first; the child avoids the parent, which is blamed (ranked lower, and pinged within 1.2 s) only if the evidence points at it | ~2 s |
 | Resume | The new parent replays its cached GOP over an existing mesh link | | ~1 RTT |
 | A pair can't connect | Mesh ICE fails; both list each other as unreachable | Never a tree edge; retried with backoff | — |

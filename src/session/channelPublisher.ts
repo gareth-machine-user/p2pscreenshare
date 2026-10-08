@@ -74,8 +74,10 @@ export interface ChannelSubscriber {
   failures: number
   /** Peers this subscriber should not be linked to on this channel, with expiry time. */
   avoid: Map<string, number>
-  /** In the current plan (subscribed, linked and answering). */
+  /** In the current plan (subscribed and linked). */
   active: boolean
+  /** Its link is open but its pings go unanswered: still fed, but relays for no one (see checkLiveness). */
+  unanswered: boolean
   /** Out of the plan until then, after failing a liveness ping. */
   suspectUntil: number
 }
@@ -224,6 +226,7 @@ export class ChannelPublisher {
           failures: 0,
           avoid: new Map(),
           active: false,
+          unanswered: false,
           suspectUntil: 0,
         })
         this.lastPositions.delete(from)
@@ -285,18 +288,32 @@ export class ChannelPublisher {
   }
 
   /**
-   * Keeps the plan to subscribers that are linked and answering. The publisher reacts to its own
-   * direct link state immediately, without waiting for gossip; a peer whose link recovers rejoins.
+   * Keeps the plan to subscribers that are linked. The publisher reacts to its own direct link
+   * state immediately, without waiting for gossip; a peer whose link recovers rejoins.
+   *
+   * An open link whose pings go unanswered is often only a stalled control channel: an ordered
+   * stream waiting seconds on a retransmission while media on the same connection still flows (it
+   * happens as new viewers join and the publisher's uplink bursts). Taking such a peer out of the
+   * plan cut its feed on every stripe until the pong came. So it stays fed, and only stops relaying:
+   * its children move at once. If it is really gone, its link closing or the mesh dropping it
+   * (GONE_MS) takes it out.
    */
   private checkLiveness(): void {
     const now = performance.now()
     for (const sub of this.subscribers.values()) {
-      const alive = !!this.ctx.mesh.linkFor(sub.id) && !this.ctx.mesh.isSuspected(sub.id) && now >= sub.suspectUntil
+      const alive = !!this.ctx.mesh.linkFor(sub.id) && now >= sub.suspectUntil
+      const unanswered = alive && this.ctx.mesh.isSuspected(sub.id)
       if (alive && !sub.active) {
         sub.active = true
+        sub.unanswered = unanswered
         this.scheduleReplan()
       } else if (!alive && sub.active) {
         this.deactivate(sub)
+        this.scheduleReplan(0)
+      } else if (sub.active && unanswered !== sub.unanswered) {
+        sub.unanswered = unanswered
+        // Its subtree may go silent before it is moved; that's not their parents' fault.
+        if (unanswered) for (let s = 0; s < this.stripes; s++) this.disruption.markSubtree(this.topology, sub.id, s, now)
         this.scheduleReplan(0)
       }
     }
@@ -496,7 +513,7 @@ export class ChannelPublisher {
       if (mesh.record.unreachable.includes(sub.id)) unreachable.add(this.ctx.selfId)
       peers.push({
         id: sub.id,
-        slots: this.offeredSlots(sub.id),
+        slots: sub.unanswered ? 0 : this.offeredSlots(sub.id),
         joinedAt: sub.joinedAt,
         failures: sub.failures,
         avoid: [...sub.avoid.keys(), ...unreachable],
