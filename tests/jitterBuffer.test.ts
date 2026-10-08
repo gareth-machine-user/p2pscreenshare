@@ -283,3 +283,48 @@ describe('PlayoutClock', () => {
     expect(c.bufferMs).toBe(300)
   })
 })
+
+describe('DecodeScheduler while the playout delay ramps up', () => {
+  /**
+   * 30 fps video whose path turns slow (transit 50 -> `slowTransit` ms from frame 60), so the
+   * delay climbs at its full up-slew; frame `lost` never arrives. Returns when each frame is shown,
+   * as Player does it: decoded up to 300 ms ahead, shown at its render time as of decoding.
+   */
+  function shownAt(lost: number | null, slowTransit: number): Map<number, number> {
+    const clock = new PlayoutClock()
+    const s = new DecodeScheduler(clock)
+    const arrivals: AssembledFrame[] = []
+    for (let seq = 0; seq < 150; seq++) {
+      const captureTime = seq * 33
+      const completedAt = captureTime + (seq >= 60 ? slowTransit : 50)
+      // All keyframes: only the wait for the missing frame is under test, not its dependants.
+      if (seq !== lost) arrivals.push({ ...makeFrame(seq, captureTime), key: true, completedAt })
+    }
+    arrivals.sort((a, b) => a.completedAt - b.completedAt)
+    const shown = new Map<number, number>()
+    let i = 0
+    for (let now = 0; now < 8000; now += 5) {
+      for (; i < arrivals.length && arrivals[i].completedAt <= now; i++) {
+        clock.addSample(arrivals[i].captureTime, arrivals[i].completedAt)
+        s.push(arrivals[i])
+      }
+      for (const f of s.poll(now, 300)) shown.set(f.seq, Math.max(now, clock.renderAt(f.captureTime)!))
+    }
+    return shown
+  }
+
+  it('a lost frame holds nothing back: the frames after it show when they would have anyway', () => {
+    // Re-reading the clock moves the give-up deadline out as the delay rises, but every frame's
+    // decode-ahead window and render time move with it, so the wait costs no extra freeze.
+    for (const slowTransit of [600, 3000]) {
+      const clean = shownAt(null, slowTransit)
+      for (const lost of [61, 70]) {
+        const gap = shownAt(lost, slowTransit)
+        for (const seq of [lost + 1, lost + 5, lost + 20]) {
+          expect(clean.get(seq)).toBeGreaterThan(seq * 33 + 500) // shown well behind: the delay did ramp
+          expect(gap.get(seq), `transit ${slowTransit} lost ${lost} seq ${seq}`).toBe(clean.get(seq))
+        }
+      }
+    }
+  })
+})
