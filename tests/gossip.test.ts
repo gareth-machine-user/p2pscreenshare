@@ -97,6 +97,15 @@ describe('failure detection', () => {
     expect(d.gone(11_001)).toEqual(['a'])
   })
 
+  it('excuses the time this peer was frozen', () => {
+    const d = new FailureDetector(6000)
+    d.heard('a', 0)
+    // Frozen from 1 s to 8 s: the tick at 8 s runs before the queued messages are handled.
+    d.excuse(7000)
+    expect(d.gone(8000)).toEqual([])
+    expect(d.gone(13_001)).toEqual(['a'])
+  })
+
   it('never moves the last-heard time backwards', () => {
     const d = new FailureDetector(6000)
     d.heard('a', 5000)

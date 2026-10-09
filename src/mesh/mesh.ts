@@ -38,6 +38,8 @@ const RTT_SAMPLE_MS = 10_000
 const PING_IDLE_MS = 1000
 /** Period of the main loop: pings, failure detection, connecting, door duty. */
 const TICK_MS = 250
+/** A tick this late means the page was frozen (the worker ticker itself is never throttled). */
+const FROZEN_TICK_MS = 1000
 const CONNECT_BATCH = 8
 /** Time for a relayed offer/answer exchange plus ICE before the attempt counts as failed. */
 const CONNECT_ATTEMPT_MS = 15_000
@@ -180,6 +182,8 @@ export class Mesh<C extends PeerConn = MeshConn> {
   /** Signaling nonces already handled, with the wall-clock time after which a replay is too old anyway. */
   private seenNonces = new Map<string, number>()
   private timers: (() => void)[] = []
+  /** When the main loop last ran (see FROZEN_TICK_MS). */
+  private lastTickAt = performance.now()
   private seekingSince = performance.now()
   /**
    * Since when this peer has been cut off: no open link, though it was linked before (or knows
@@ -642,6 +646,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
 
   private tick(): void {
     const now = performance.now()
+    const gap = now - this.lastTickAt
+    this.lastTickAt = now
+    // The page was frozen (a long task, GC, an overloaded machine): what arrived meanwhile hasn't
+    // been handled yet, so the silence is ours, not the neighbours'.
+    if (gap > FROZEN_TICK_MS) this.detector.excuse(gap - TICK_MS)
     if (this.offline) {
       for (const c of [...this.conns.values()]) c.close()
       for (const id of this.detector.gone(now)) this.dropMember(id)

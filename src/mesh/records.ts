@@ -213,6 +213,16 @@ export class FailureDetector {
     this.lastHeard.delete(id)
   }
 
+  /**
+   * This peer could not listen for `ms` (its page was frozen): nobody's silence over that time
+   * counts. Messages that arrived meanwhile wait in the event queue, and a tick that runs before
+   * them would otherwise drop every neighbour silent for longer than the freeze.
+   */
+  excuse(ms: number): void {
+    if (!(ms > 0)) return
+    for (const [id, t] of this.lastHeard) this.lastHeard.set(id, t + ms)
+  }
+
   /** Peers not heard from within the window. */
   gone(now: number): string[] {
     const out: string[] = []
