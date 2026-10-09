@@ -184,8 +184,8 @@
   {#if !children || panel}
     <div class="player-overlay" data-testid="player-overlay">
       {#if hasAudio && !localStream}
-        <button data-testid="mute" class:primary={muted} aria-pressed={!muted} onclick={toggleMute} title={muted ? 'Unmute' : 'Mute'}>
-          <Icon name={muted ? 'muted' : 'volume'} />{muted ? 'Unmute' : 'Mute'}
+        <button data-testid="mute" class:primary={muted} aria-pressed={!muted} aria-label={muted ? 'Unmute' : 'Mute'} onclick={toggleMute} title={muted ? 'Unmute' : 'Mute'}>
+          <Icon name={muted ? 'muted' : 'volume'} /><span class="label">{muted ? 'Unmute' : 'Mute'}</span>
         </button>
       {/if}
       {#if qualityOptions}
@@ -217,6 +217,10 @@
 
   {#if gearOpen && panel}
     <div class="gear-panel" data-testid="gear-panel">
+      <!-- A phone shows the panel as a sheet, with its own close button (the gear may be under it). -->
+      <button class="gear-close" data-testid="gear-close" aria-label="Close stream details" title="Close" onclick={() => (gearOpen = false)}>
+        <Icon name="close" />
+      </button>
       {@render panel()}
     </div>
   {/if}
@@ -225,7 +229,8 @@
 <svelte:window
   onkeydown={(e) => {
     if (e.key !== 'Escape') return
-    // Real fullscreen handles its own.
-    if (pseudoFs) pseudoFs = false
+    // The innermost first: the details, then the window-filling stage (real fullscreen handles its own).
+    if (gearOpen) gearOpen = false
+    else if (pseudoFs) pseudoFs = false
   }}
 />

@@ -943,6 +943,11 @@ button.scroll-cue:hover {
   background: var(--raised-hover);
   color: var(--text);
 }
+/* Only the phone's sheet (below) has its own close button. */
+.gear-close {
+  display: none;
+}
+
 /* Where there is no Fullscreen API (an iPhone), the stage fills the window instead. */
 .stage.fills-window {
   position: fixed;
@@ -966,6 +971,127 @@ button.scroll-cue:hover {
 html.stage-fills-window,
 html.stage-fills-window body {
   overflow: hidden;
+}
+
+/* A phone (narrow, or short in landscape): smaller controls, and the details as a sheet at the
+   window's edge in smaller type, so the video stays in view. */
+@media (max-width: 600px), (max-height: 500px) {
+  .player-overlay {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    padding: 4px;
+    gap: 2px;
+    border-radius: 12px;
+    flex-wrap: nowrap;
+  }
+  .player-overlay button,
+  .player-overlay select {
+    height: 34px;
+    font-size: 13px;
+  }
+  .player-overlay button {
+    padding: 0 9px;
+  }
+  .player-overlay select {
+    min-width: 0;
+    padding: 0 4px;
+  }
+  /* The mute button is its icon. */
+  .player-overlay .label {
+    display: none;
+  }
+  .stage-chip {
+    top: 8px;
+    left: 8px;
+    max-width: calc(100% - 16px);
+    font-size: 12px;
+  }
+  .gear-panel {
+    position: fixed;
+    z-index: 16;
+    padding: 8px 12px calc(10px + env(safe-area-inset-bottom));
+    font-size: 12px;
+    overscroll-behavior: contain;
+    box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .gear-close {
+    display: flex;
+    float: right;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    justify-content: center;
+    border-color: transparent;
+  }
+  .gear-panel .tabs {
+    margin-bottom: 4px;
+  }
+  .gear-panel .tabs button {
+    height: 32px;
+    padding: 0 10px;
+  }
+  .gear-panel .stats-grid {
+    grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+    gap: 6px 10px;
+    margin: 6px 0;
+  }
+  .gear-panel .stats-grid span {
+    font-size: 11px;
+  }
+  .gear-panel h4 {
+    margin: 10px 0 2px;
+    font-size: 12px;
+  }
+  .gear-panel table {
+    font-size: 12px;
+  }
+  .gear-panel th,
+  .gear-panel td {
+    padding: 4px 6px;
+  }
+}
+/* Portrait: a bottom sheet, under the video. The readout is in the details. */
+@media (max-width: 600px) {
+  /* The controls span the stage, the menus sharing what the buttons leave. */
+  .player-overlay {
+    width: auto;
+  }
+  .player-overlay select {
+    flex: 1 1 0;
+    text-overflow: ellipsis;
+  }
+  .player-overlay .sep,
+  .player-overlay .readout {
+    display: none;
+  }
+  .gear-panel {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    max-height: 40vh;
+    max-height: 40dvh;
+    border-radius: 14px 14px 0 0;
+    border-bottom: none;
+  }
+}
+/* Landscape: a side sheet, over the video's edge. */
+@media (max-height: 500px) and (min-width: 601px) {
+  .gear-panel {
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: auto;
+    width: min(300px, 38vw);
+    padding-right: calc(12px + env(safe-area-inset-right));
+    border-radius: 14px 0 0 14px;
+    border-right: none;
+  }
 }
 
 /* --- invite card (empty stage) -------------------------------------------------------------------- */

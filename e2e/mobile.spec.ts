@@ -28,12 +28,62 @@ async function openPhone(browser: Browser, seed: string, device: Device, o: { la
   return page
 }
 
+/** How much of the picture (the canvas's letterboxed content) the details panel covers, 0..1. */
+function statsCoverage(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const c = document.querySelector<HTMLCanvasElement>('[data-testid=video]')!
+    const b = c.getBoundingClientRect()
+    const scale = Math.min(b.width / c.width, b.height / c.height)
+    const w = c.width * scale
+    const h = c.height * scale
+    const v = { left: b.left + (b.width - w) / 2, top: b.top + (b.height - h) / 2, right: 0, bottom: 0 }
+    v.right = v.left + w
+    v.bottom = v.top + h
+    const p = document.querySelector('[data-testid=gear-panel]')!.getBoundingClientRect()
+    const ow = Math.max(0, Math.min(v.right, p.right) - Math.max(v.left, p.left))
+    const oh = Math.max(0, Math.min(v.bottom, p.bottom) - Math.max(v.top, p.top))
+    return (ow * oh) / (w * h)
+  })
+}
+
 /** Shows the controls (a tap on the picture), if they aren't already. */
 async function showControls(page: Page): Promise<void> {
   const overlay = page.getByTestId('player-overlay')
   if ((await overlay.evaluate((e) => getComputedStyle(e).opacity)) !== '1') await page.getByTestId('stage').tap({ position: { x: 30, y: 30 } })
   await expect.poll(() => overlay.evaluate((e) => getComputedStyle(e).opacity)).toBe('1')
 }
+
+test('phone: the details open on request as a sheet that leaves most of the picture in view', async ({ browser }) => {
+  const seed = `e2e-phone-stats-${Date.now()}`
+  await openHost(browser, seed, { k: 1, m: 0, res: '1280x720' })
+  for (const [device, landscape] of [['Pixel 7', false], ['iPhone 13', true]] as const) {
+    const page = await openPhone(browser, seed, device, { landscape })
+    // Collapsed until asked for.
+    await expect(page.getByTestId('gear-panel')).toHaveCount(0)
+    await showControls(page)
+    // The controls are one compact row, not three over the picture.
+    expect((await page.getByTestId('player-overlay').boundingBox())!.height).toBeLessThan(50)
+    await page.getByTestId('gear').tap()
+    await expect(page.getByTestId('state')).toHaveText('connected')
+    const covered = await statsCoverage(page)
+    console.log(device, landscape ? 'landscape' : 'portrait', 'stats cover', covered.toFixed(2))
+    expect(covered).toBeLessThan(0.5)
+    // Its own close button, as the gear may be under the sheet.
+    await page.getByTestId('gear-close').tap()
+    await expect(page.getByTestId('gear-panel')).toHaveCount(0)
+
+    // Fullscreen: still most of the picture in view.
+    await showControls(page)
+    await page.getByTestId('fullscreen').tap()
+    await expect.poll(() => page.evaluate(() => document.fullscreenElement?.getAttribute('data-testid') ?? null)).toBe('stage')
+    await showControls(page)
+    await page.getByTestId('gear').tap()
+    expect(await statsCoverage(page)).toBeLessThan(0.5)
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('gear-panel')).toHaveCount(0)
+    await page.close()
+  }
+})
 
 test('phone without the Fullscreen API (iPhone): the stage fills the window, and the button, Escape and Back leave', async ({ browser }) => {
   const seed = `e2e-phone-fs-${Date.now()}`
