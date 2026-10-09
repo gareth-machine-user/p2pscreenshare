@@ -3,6 +3,7 @@
   import type { Player } from '../../media/player'
   import type { Buffering, ViewQuality } from '../settings.svelte'
   import Icon from './Icon.svelte'
+  import { enterFullscreen, exitFullscreen, fullscreenElement, FULLSCREEN_EVENTS, lockLandscape } from '../fullscreen'
 
   let {
     player = null,
@@ -52,7 +53,12 @@
   let gearOpen = $state(false)
   /** Touch devices have no hover: a tap toggles the overlay. */
   let touched = $state(false)
-  let fullscreen = $state(false)
+  /** The stage is in real fullscreen. */
+  let nativeFs = $state(false)
+  /** No Fullscreen API (an iPhone): the stage fills the window instead. */
+  let pseudoFs = $state(false)
+  const fullscreen = $derived(nativeFs || pseudoFs)
+  let unlockOrientation = () => {}
   /** Briefly true when a stream comes on stage, so the chip says who it is before fading out. */
   let peek = $state(false)
   let peekTimer: ReturnType<typeof setTimeout> | undefined
@@ -81,9 +87,33 @@
   })
 
   $effect(() => {
-    const onChange = () => (fullscreen = document.fullscreenElement === stage)
-    document.addEventListener('fullscreenchange', onChange)
-    return () => document.removeEventListener('fullscreenchange', onChange)
+    const onChange = () => {
+      nativeFs = !!stage && fullscreenElement() === stage
+      if (!nativeFs) {
+        unlockOrientation()
+        unlockOrientation = () => {}
+      }
+    }
+    for (const e of FULLSCREEN_EVENTS) document.addEventListener(e, onChange)
+    return () => {
+      for (const e of FULLSCREEN_EVENTS) document.removeEventListener(e, onChange)
+    }
+  })
+
+  // Filling the window: the page behind doesn't scroll, and Back leaves (a history entry, same URL).
+  $effect(() => {
+    if (!pseudoFs) return
+    const root = document.documentElement
+    root.classList.add('stage-fills-window')
+    history.pushState({ stageFullscreen: true }, '')
+    const onPop = () => (pseudoFs = false)
+    window.addEventListener('popstate', onPop)
+    return () => {
+      root.classList.remove('stage-fills-window')
+      window.removeEventListener('popstate', onPop)
+      // Left by the button or Escape: drop the entry Back would otherwise have to skip.
+      if (history.state?.stageFullscreen) history.back()
+    }
   })
 
   // Each new player starts muted: carry the user's choice over when the stage switches streams.
@@ -99,10 +129,16 @@
     player?.audio.setMuted(muted)
   }
 
-  function toggleFullscreen() {
+  async function toggleFullscreen() {
+    if (pseudoFs) return void (pseudoFs = false)
+    if (fullscreenElement()) return exitFullscreen()
+    if (!stage) return
     // The stage container (not the canvas) goes fullscreen, so the overlay stays visible.
-    if (document.fullscreenElement) void document.exitFullscreen()
-    else void stage?.requestFullscreen()
+    if (await enterFullscreen(stage)) {
+      unlockOrientation = canvas ? lockLandscape(canvas.width, canvas.height) : () => {}
+    } else {
+      pseudoFs = true
+    }
   }
 
   const QUALITY_LABELS: Record<ViewQuality, string> = { auto: 'Auto quality', full: 'Full quality', preview: 'Preview quality' }
@@ -119,6 +155,7 @@
   class:touched
   class:peek
   class:fullscreen
+  class:fills-window={pseudoFs}
   class:live
   class:has-card={!!children}
   class:playing={!!(player || localStream) && !message && !children}
@@ -184,3 +221,11 @@
     </div>
   {/if}
 </div>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key !== 'Escape') return
+    // Real fullscreen handles its own.
+    if (pseudoFs) pseudoFs = false
+  }}
+/>

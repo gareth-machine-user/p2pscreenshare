@@ -943,6 +943,30 @@ button.scroll-cue:hover {
   background: var(--raised-hover);
   color: var(--text);
 }
+/* Where there is no Fullscreen API (an iPhone), the stage fills the window instead. */
+.stage.fills-window {
+  position: fixed;
+  inset: 0;
+  /* Above the page and its popovers; below request toasts and the (top layer) dialogs. */
+  z-index: 15;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  aspect-ratio: auto;
+  max-height: none;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.stage.fills-window .stage-chip {
+  top: calc(14px + env(safe-area-inset-top));
+  left: calc(14px + env(safe-area-inset-left));
+}
+.stage.fills-window .player-overlay {
+  bottom: calc(14px + env(safe-area-inset-bottom));
+}
+html.stage-fills-window,
+html.stage-fills-window body {
+  overflow: hidden;
+}
 
 /* --- invite card (empty stage) -------------------------------------------------------------------- */
 
