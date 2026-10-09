@@ -230,6 +230,21 @@ describe('capacity model', () => {
     expect(m.peer('a')).toEqual({ kbps: 7000, bound: false })
   })
 
+  it('an uplink overloaded from the start gets a first estimate from stalled windows', () => {
+    const m = new CapacityModel()
+    // Every connection backlogged, one stalling: no measurement, but at least what got through.
+    m.update(0, [w('a', 'a', 3000, { backlogged: true, stalled: true, queueMs: 2000 }), w('b', 'b', 4000, { backlogged: true, queueMs: 1500 })])
+    expect(m.uplinkKbps).toBe(7000)
+    // A probe in which a connection stalled: the same.
+    const p = new CapacityModel()
+    p.update(0, [w('a', 'a', 2000, { backlogged: true, stalled: true }), w('b', 'b', 5000, { backlogged: true })], { probe: true })
+    expect(p.uplinkKbps).toBe(7000)
+    // Not while something wasn't backlogged: the uplink had room.
+    const q = new CapacityModel()
+    q.update(0, [w('a', 'a', 3000, { backlogged: true, stalled: true }), w('b', 'b', 4000)])
+    expect(q.uplinkKbps).toBeNull()
+  })
+
   it('stalled connections and frozen pages are left out', () => {
     const m = new CapacityModel()
     m.update(0, [w('a', 'a', 20_000, { backlogged: true }), w('b', 'b', 20_000, { backlogged: true })], { probe: true })

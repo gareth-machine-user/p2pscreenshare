@@ -231,7 +231,8 @@ export class MaxFilter {
  * - A peer's capacity is the sum over its connections.
  *
  * Windows in which the page froze are ignored, and so are stalled connections (a stall says nothing
- * about the link's rate; any stall in a window keeps it from setting the uplink's capacity).
+ * about the link's rate; any stall in a window keeps it from setting the uplink's capacity, though
+ * while it is unknown such a window, or probe, gives it a first, low value).
  */
 export class CapacityModel {
   readonly uplink = new MaxFilter()
@@ -258,10 +259,16 @@ export class CapacityModel {
       } else c.filter.raise(now, w.kbps, !!o.probe)
     }
     const total = windows.reduce((a, w) => a + w.kbps, 0)
+    // With nothing measured yet, a window that stalled while everything was backlogged (or a probe)
+    // still shows the uplink carries at least what it delivered. Without it, an uplink overloaded
+    // from the start, which stalls in every window, was never measured, and the stream kept
+    // sending at the chosen quality into it.
+    const allActive = windows.filter((w) => w.active)
+    const overloaded = allActive.length > 0 && allActive.every((w) => w.backlogged)
     if (shared && ok.length === windows.length) {
       const queueMs = backlogged.reduce((a, w) => a + w.queueMs, 0) / backlogged.length
       this.uplink.sample(now, total, queueMs)
-    } else this.uplink.raise(now, total)
+    } else this.uplink.raise(now, total, !!o.probe || overloaded)
   }
 
   /** A peer's capacity: the sum over its connections; `bound` if one of them was its own bottleneck. */
