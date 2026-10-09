@@ -9,9 +9,9 @@ type Device = 'iPhone 13' | 'Pixel 7'
 
 /** A viewer on an emulated phone (Chromium with the phone's viewport, touch and user agent). */
 async function openPhone(browser: Browser, seed: string, device: Device, o: { landscape?: boolean; noFullscreenApi?: boolean } = {}): Promise<Page> {
-  const { defaultBrowserType: _, viewport, screen, ...opts } = devices[device]
+  const { defaultBrowserType: _, viewport, ...opts } = devices[device]
   const flip = <T extends { width: number; height: number }>(s: T) => (o.landscape ? { width: s.height, height: s.width } : s)
-  const ctx = await newContext(browser, { ...opts, viewport: flip(viewport), screen: screen && flip(screen) })
+  const ctx = await newContext(browser, { ...opts, viewport: flip(viewport), screen: flip(viewport) })
   // iPhone Safari: no Fullscreen API on anything but a <video>.
   if (o.noFullscreenApi) {
     await ctx.addInitScript(() => {
