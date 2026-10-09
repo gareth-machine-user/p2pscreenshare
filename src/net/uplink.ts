@@ -113,7 +113,7 @@ export interface UplinkStats {
   droppedReplay: number
   /** Items the data channel refused (link closing). */
   sendFailed: number
-  /** Drains that found a link's send buffer full while it had items waiting. */
+  /** Drains that found a media link's send buffer full while live media waited for it (not probes or replays). */
   bufferStalls: number
   /** Sum and count of time spent queued by sent media items (ms), for an average. */
   queueDelaySum: number
@@ -356,9 +356,11 @@ export class Uplink {
           } else q[kept++] = it
         }
         q.length = kept
-        if (kept && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) {
-          this.stats.bufferStalls++
-          if (!bg) this.stalledMs(link, now)
+        // Live media only: a headroom probe keeps its channel's buffer full on purpose, and replays
+        // are meant to wait (live fragments queue ahead of them, so q[0] is live if any is).
+        if (kept && !bg && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) {
+          if (!q[0].replay) this.stats.bufferStalls++
+          this.stalledMs(link, now)
         }
       }
       let progress = true

@@ -245,6 +245,22 @@ describe('Uplink scheduling', () => {
     u.kick()
     expect(u.stats.bufferStalls).toBeGreaterThanOrEqual(1)
   })
+
+  it('a headroom probe or a replay waiting on a full buffer is no buffer stall', () => {
+    const u = new Uplink()
+    const probe = new StubLink('bin')
+    u.setBackground(probe)
+    probe.block()
+    for (let i = 0; i < 5; i++) u.send(probe, msg(i), 0)
+    const m = new StubLink('m')
+    m.block()
+    u.send(m, msg(9), 0, undefined, true)
+    u.kick()
+    expect(u.stats.bufferStalls).toBe(0)
+    // Live media waiting is one.
+    u.send(m, msg(10), 0)
+    expect(u.stats.bufferStalls).toBeGreaterThanOrEqual(1)
+  })
 })
 
 describe('Uplink stall detection', () => {
