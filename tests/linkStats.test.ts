@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { LinkStatsTracker, parseLinkStats, pathInflation, RTT_STALE_MS, rttInflationThreshold, type LinkStats, type StatsRecord } from '../src/net/linkStats'
 
 /** A Chrome (150) report of a data-only connection, trimmed from a real dump (e2e/linkstats.spec.ts). */
-function chrome(o: { rtt?: number; totalRtt?: number; responses?: number; bytesSent?: number; relay?: boolean; sctp?: boolean } = {}): StatsRecord[] {
+function chrome(o: { rtt?: number; totalRtt?: number; responses?: number; bytesSent?: number; bytesReceived?: number; relay?: boolean; sctp?: boolean } = {}): StatsRecord[] {
   const out: StatsRecord[] = [
     { id: 'P', type: 'peer-connection', dataChannelsOpened: 3 },
     {
@@ -20,7 +20,7 @@ function chrome(o: { rtt?: number; totalRtt?: number; responses?: number; bytesS
       id: 'CPsel',
       type: 'candidate-pair',
       bytesDiscardedOnSend: 0,
-      bytesReceived: 47579,
+      bytesReceived: o.bytesReceived ?? 47579,
       bytesSent: o.bytesSent ?? 1882145,
       consentRequestsSent: 2,
       currentRoundTripTime: o.rtt ?? 0.001,
@@ -130,6 +130,16 @@ describe('LinkStatsTracker', () => {
     total += 0.1
     n++
     expect(poll(8000, 100).rttMs).toBeCloseTo(100)
+  })
+
+  it('remembers the last poll that saw bytes received', () => {
+    const t = new LinkStatsTracker()
+    t.update(parseLinkStats(chrome({ bytesReceived: 1000 }))!, 0)
+    expect(t.receivedAt).toBe(-Infinity)
+    t.update(parseLinkStats(chrome({ bytesReceived: 1200 }))!, 2000)
+    expect(t.receivedAt).toBe(2000)
+    t.update(parseLinkStats(chrome({ bytesReceived: 1200 }))!, 4000)
+    expect(t.receivedAt).toBe(2000)
   })
 
   it('goes stale when the RTT stops refreshing', () => {

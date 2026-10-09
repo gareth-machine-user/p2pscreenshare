@@ -108,6 +108,11 @@ export class LinkStatsTracker {
   private history: { at: number; rttMs: number }[] = []
   private lastRttAt = -Infinity
   private latest: LinkStats | null = null
+  /**
+   * The latest poll that saw bytesReceived grow (SCTP data or acks: the remote's stack is alive),
+   * or -Infinity. Mesh liveness for a peer whose ctl channel is stalled (mesh.ts pathHeardAt).
+   */
+  receivedAt = -Infinity
 
   constructor(
     private windowMs = RTT_BASELINE_WINDOW_MS,
@@ -131,6 +136,7 @@ export class LinkStatsTracker {
     while (this.history.length && now - this.history[0].at > this.windowMs) this.history.shift()
     const dtS = prev ? (now - prev.at) / 1000 : 0
     const rate = (a: number | null, b: number | null) => (dtS > 0 && a !== null && b !== null && a >= b ? ((a - b) * 8) / 1000 / dtS : null)
+    if (prev && r.bytesReceived !== null && prev.r.bytesReceived !== null && r.bytesReceived > prev.r.bytesReceived) this.receivedAt = now
     const last = this.history.at(-1)
     this.latest = {
       rttMs: last?.rttMs ?? null,

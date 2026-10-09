@@ -182,6 +182,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     m.onBufferLow = () => this.uplink.kick()
     // Gossiped RTTs: the mesh link's path RTT from the getStats polling below.
     m.pathRttMs = (id) => this.metrics.pathRttMs(id)
+    m.pathHeardAt = (id) => this.metrics.pathHeardAt(id)
     m.onApp = (raw, from) => {
       const msg = parsePeerMsg(raw)
       if (msg) this.handle(msg, from)

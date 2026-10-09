@@ -48,6 +48,9 @@ export class FakeNetwork {
   private cutPairs = new Set<string>()
   /** Peers cut off from everyone. */
   private isolated = new Set<string>()
+  /** Pairs whose ctl channels hold every message until releaseCtl (an SCTP retransmission stall). */
+  private ctlStalled = new Set<string>()
+  private ctlHeld: (() => void)[] = []
   /** Pending offers and answers of mesh links and lanes alike, by token. */
   private offers = new Map<string, object>()
   private answers = new Map<string, object>()
@@ -122,6 +125,25 @@ export class FakeNetwork {
   /** Silently drops all traffic between the pair, open links included. */
   cut(a: string, b: string): void {
     this.cutPairs.add(pairKey(a, b))
+  }
+
+  /**
+   * The pair's ctl channels deliver nothing until releaseCtl, then everything in order, while their
+   * media and bin channels keep flowing: an ordered, reliable stream waiting on a retransmission.
+   */
+  stallCtl(a: string, b: string): void {
+    this.ctlStalled.add(pairKey(a, b))
+  }
+
+  releaseCtl(): void {
+    this.ctlStalled.clear()
+    for (const deliver of this.ctlHeld.splice(0)) this.later(deliver)
+  }
+
+  /** Delivers a ctl message from `from` to `to` after the network delay, unless their ctl is stalled. */
+  deliverCtl(from: string, to: string, deliver: () => void): void {
+    if (this.ctlStalled.has(pairKey(from, to))) this.ctlHeld.push(deliver)
+    else this.later(deliver)
   }
 
   /** Silently drops all traffic to and from `id` (it crashed, or its network went away). */
@@ -407,7 +429,7 @@ export class FakeConn extends FakeDataConn<FakeConn> implements PeerConn {
     this.sent.push(JSON.parse(json) as Ctl)
     const peer = this.peer
     if (!peer || this.net.dropped(this.localId, peer.localId)) return true
-    this.net.later(() => {
+    this.net.deliverCtl(this.localId, peer.localId, () => {
       if (this.state === 'open') peer.receive(json)
     })
     return true

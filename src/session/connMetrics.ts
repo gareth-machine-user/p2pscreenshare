@@ -218,6 +218,13 @@ export class ConnMetrics {
     return null
   }
 
+  /** When any open connection to `peer` last received bytes on the wire (getStats polling), if known. */
+  pathHeardAt(peer: string): number | null {
+    let at = -Infinity
+    for (const r of this.connRecs.values()) if (r.peer === peer) at = Math.max(at, r.tracker.receivedAt)
+    return Number.isFinite(at) ? at : null
+  }
+
   /** Connections that stalled in the last window. */
   stalledLanes(): number {
     return [...this.connRecs.values()].filter((r) => r.rate?.stalled).length

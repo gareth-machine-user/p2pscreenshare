@@ -9,7 +9,8 @@
 // Each peer owns one signed record (mesh/records.ts) and sends it to all neighbours when it
 // changes and as a heartbeat. Every few seconds each peer swaps a digest with one random neighbour
 // and pulls whatever is newer, which repairs gaps where a pair can't talk directly. A peer is gone
-// when nothing fresh has been heard about it, from anyone, for 6 s (or it said goodbye).
+// when nothing fresh has been heard about it, from anyone, for 6 s (or it said goodbye). Anything
+// its open link receives counts, media and SCTP acks too, not only the ctl channel's messages.
 //
 // When a pair's mesh link fails before opening (typically a NAT pair without TURN), both sides list
 // each other as `unreachable` in their records, and retry after 60 s with backoff to 10 min. The
@@ -151,6 +152,11 @@ export class Mesh<C extends PeerConn = MeshConn> {
    * polling), if known. Unlike the ctl pings', it doesn't queue behind the connection's own backlog.
    */
   pathRttMs: (id: string) => number | null = () => null
+  /**
+   * When the pair's connections last received anything on the wire (getStats bytesReceived: SCTP
+   * acks included), if known. Liveness for a peer that sends this one no media (see tick).
+   */
+  pathHeardAt: (id: string) => number | null = () => null
   onBufferLow: () => void = () => {}
   onChat: (m: ChatMessage) => void = () => {}
   /** The owner's decisions changed. */
@@ -251,7 +257,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
       iceServers: opts.iceServers,
       wanted: clampLanes(opts.lanes),
       connect: connectLane,
-      onMedia: (data, from) => this.onMedia(data, from),
+      onMedia: (data, from) => this.mediaFrom(data, from),
       onBufferLow: () => this.onBufferLow(),
       onChange: () => this.onChange(),
     })
@@ -519,7 +525,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
     }
     this.conns.set(id, conn)
     conn.onCtl = (msg) => this.handle(msg as MeshMsg, id, conn)
-    conn.onMedia = (data) => this.onMedia(data, id)
+    conn.onMedia = (data) => this.mediaFrom(data, id)
     conn.onBufferLow = () => this.onBufferLow()
     conn.onStateChange = (state) => {
       if (state === 'open') {
@@ -650,7 +656,14 @@ export class Mesh<C extends PeerConn = MeshConn> {
           .catch(() => {}) // unanswered: the failure detector notices the silence
       }
     }
-    // Members not heard from (directly or through gossip) are gone.
+    // An open link still receiving is alive, ctl or not: the ordered ctl channel can wait seconds
+    // on a retransmission while the connection's media keeps flowing (media is counted as it
+    // arrives, mediaFrom), and dropping the member would close the link and cut its feed.
+    for (const c of this.conns.values()) {
+      const at = c.isOpen ? this.pathHeardAt(c.remoteId) : null
+      if (at !== null) this.detector.heard(c.remoteId, Math.min(at, now))
+    }
+    // Members not heard from (directly, through gossip, or on the wire) are gone.
     for (const id of this.detector.gone(now)) this.dropMember(id)
     const wall = Date.now()
     for (const [n, until] of this.seenNonces) if (wall > until) this.seenNonces.delete(n)
@@ -902,6 +915,12 @@ export class Mesh<C extends PeerConn = MeshConn> {
       if (ms !== null) rtt[c.remoteId] = Math.round(ms)
     }
     this.updateRecord({ rtt })
+  }
+
+  /** Media from a peer, on its mesh link or a lane: evidence it is alive (see tick). */
+  private mediaFrom(data: Uint8Array, from: string): void {
+    if (this.conns.get(from)?.isOpen) this.detector.heard(from, performance.now())
+    this.onMedia(data, from)
   }
 
   // --- chat ----------------------------------------------------------------------------------------

@@ -92,6 +92,42 @@ describe('mesh (in-memory network)', () => {
     expect(meshed(others)).toBe(true)
   })
 
+  it('a stalled ctl channel does not drop a peer whose media still arrives', async () => {
+    const lobby = await makeLobby(2)
+    await startAll(lobby)
+    const [owner, viewer] = lobby.meshes
+    lobby.net.stallCtl(owner.selfId, viewer.selfId)
+    const link = owner.linkFor(viewer.selfId)!
+    for (let t = 0; t < GONE_MS * 2; t += 100) {
+      link.send(new Uint8Array(100))
+      await advance(100)
+    }
+    expect(viewer.member(owner.selfId)).toBeTruthy()
+    expect(viewer.linkFor(owner.selfId)?.isOpen).toBe(true)
+    lobby.net.releaseCtl()
+    await advance(1000)
+    expect(meshed(lobby.meshes)).toBe(true)
+  })
+
+  it('a stalled ctl channel does not drop a peer whose connection still receives (pathHeardAt)', async () => {
+    const lobby = await makeLobby(2)
+    await startAll(lobby)
+    const [owner, viewer] = lobby.meshes
+    // No media either way, but each side's connection sees the other's acks.
+    const wire = (m: Mesh<FakeConn>, other: Mesh<FakeConn>) => (m.pathHeardAt = (id) => (id === other.selfId ? performance.now() - 500 : null))
+    wire(owner, viewer)
+    wire(viewer, owner)
+    lobby.net.stallCtl(owner.selfId, viewer.selfId)
+    await advance(GONE_MS * 2)
+    expect(owner.member(viewer.selfId)).toBeTruthy()
+    expect(viewer.member(owner.selfId)).toBeTruthy()
+    expect(owner.linkFor(viewer.selfId)?.isOpen).toBe(true)
+    // Nothing on the wire either: gone as before.
+    owner.pathHeardAt = () => null
+    const took = await until(() => !owner.member(viewer.selfId), GONE_MS + 2000, 'viewer gone')
+    expect(took).toBeLessThanOrEqual(GONE_MS + 500)
+  })
+
   it('an unsigned digest claiming a newer version does not keep a silent peer alive', async () => {
     const lobby = await makeLobby(4)
     await startAll(lobby)

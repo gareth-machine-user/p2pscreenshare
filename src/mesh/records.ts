@@ -192,8 +192,9 @@ export class RecordStore {
 
 /**
  * Declares a peer gone when nothing fresh has been heard about it, from anyone, for `goneMs`:
- * neither a newer record (direct or forwarded) nor a direct pong. Pongs are answered from message
- * handlers, so a peer whose own timers are throttled (background tab) still counts as alive.
+ * neither a newer record (direct or forwarded), a direct pong, nor anything else its open link
+ * received (mesh.ts tick). Pongs are answered from message handlers, so a peer whose own timers
+ * are throttled (background tab) still counts as alive.
  */
 export class FailureDetector {
   private lastHeard = new Map<string, number>()
