@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AUTO_RECOVER_MS, AUTO_STALL_MS, AutoFallback, liveStreamsOf, planStage, type StageChannel, type ViewQuality } from '../src/session/stage'
-import { discoveryDue, HEADROOM_EVERY_MS, HEADROOM_FIRST_MS, HEADROOM_LIMITED_MS, HeadroomProbe, PROBE_BUFFER, PROBE_CHUNK, PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeStarved } from '../src/session/headroom'
+import { discoveryDue, HEADROOM_EVERY_MS, HEADROOM_FIRST_MS, HEADROOM_FIRST_VIEWER_MS, HEADROOM_LIMITED_MS, HeadroomProbe, PROBE_BUFFER, PROBE_CHUNK, PROBE_DURATION_MS, PROBE_MAX_GAP_MS, probeStarved } from '../src/session/headroom'
 import { deliveredKbps } from '../src/session/capacity'
 import type { LinkState, ProbeLink } from '../src/net/link'
 import { Uplink } from '../src/net/uplink'
@@ -142,12 +142,18 @@ describe('auto quality fallback', () => {
 })
 
 describe('headroom discovery schedule', () => {
-  const base = { now: 0, firstLinkAt: 0, lastAt: 0, limited: false, encoderKbps: 4000, targetKbps: 4000 }
+  const base = { now: 0, firstLinkAt: 0, lastAt: 0, presenting: true, limited: false, encoderKbps: 4000, targetKbps: 4000 }
   it('first shortly after the first link, then every 30 s', () => {
     expect(discoveryDue({ ...base, lastAt: -Infinity, now: HEADROOM_FIRST_MS - 1 })).toBe(false)
     expect(discoveryDue({ ...base, lastAt: -Infinity, now: HEADROOM_FIRST_MS })).toBe(true)
     expect(discoveryDue({ ...base, now: HEADROOM_LIMITED_MS })).toBe(false)
     expect(discoveryDue({ ...base, now: HEADROOM_EVERY_MS })).toBe(true)
+  })
+
+  it("a viewer's first probe waits out its join", () => {
+    const viewer = { ...base, presenting: false, lastAt: -Infinity, encoderKbps: null, targetKbps: null }
+    expect(discoveryDue({ ...viewer, now: HEADROOM_FIRST_MS })).toBe(false)
+    expect(discoveryDue({ ...viewer, now: HEADROOM_FIRST_VIEWER_MS })).toBe(true)
   })
 
   it('every 5 s while a capacity limit holds down a bitrate the encoder uses', () => {

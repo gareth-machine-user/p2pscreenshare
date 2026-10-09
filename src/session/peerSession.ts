@@ -648,6 +648,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       now: performance.now(),
       firstLinkAt: this.firstLinkAt,
       lastAt: this.headroom.lastAt,
+      presenting: !!this.publishing,
       limited: limit === 'uplink' || limit === 'viewers',
       encoderKbps: enc?.kbps ?? null,
       targetKbps: enc?.targetKbps ?? null,

@@ -31,8 +31,14 @@ export const HEADROOM_EVERY_MS = 30_000
 export const HEADROOM_LIMITED_MS = 5000
 /** ...and the encoder uses at least this share of that bitrate (the limit binds)... */
 export const LIMIT_BINDS_SHARE = 0.7
-/** ...and first this long after the first link opens. */
+/** ...and first this long after the first link opens: a presenter's bitrate needs it... */
 export const HEADROOM_FIRST_MS = 1000
+/**
+ * ...while anyone else's capacity only sizes its relay offers, so it waits out the join: a joiner
+ * probing at once saturated its own uplink, and the acks of the stream it was being sent with it,
+ * just as the presenter's uplink burst with its catch-up.
+ */
+export const HEADROOM_FIRST_VIEWER_MS = 10_000
 
 /**
  * Whether headroom discovery is due. The fast cadence is for a presenter whose bitrate a capacity
@@ -45,13 +51,15 @@ export function discoveryDue(o: {
   firstLinkAt: number
   /** When the last probe started, or -Infinity. */
   lastAt: number
+  /** This peer publishes a stream. */
+  presenting: boolean
   /** A capacity estimate holds the bitrate below the chosen quality. */
   limited: boolean
   /** What the encoder put out over the last window, and its bitrate (kbps), if presenting. */
   encoderKbps: number | null
   targetKbps: number | null
 }): boolean {
-  if (o.lastAt === -Infinity) return o.now - o.firstLinkAt >= HEADROOM_FIRST_MS
+  if (o.lastAt === -Infinity) return o.now - o.firstLinkAt >= (o.presenting ? HEADROOM_FIRST_MS : HEADROOM_FIRST_VIEWER_MS)
   const binds = o.limited && o.encoderKbps !== null && o.targetKbps !== null && o.encoderKbps >= LIMIT_BINDS_SHARE * o.targetKbps
   return o.now - o.lastAt >= (binds ? HEADROOM_LIMITED_MS : HEADROOM_EVERY_MS)
 }

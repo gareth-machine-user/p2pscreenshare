@@ -537,7 +537,9 @@ Rate control, in both profiles:
     one's share only says how the uplink was split, so it only raises the estimate. A peer's
     capacity is the sum over its connections.
   - *Headroom discovery*, the only probing (`session/headroom.ts`): once 1 s after the first link
-    opens, then every 30 s (5 s while a capacity estimate holds the bitrate below the chosen quality)
+    opens (10 s for a peer not presenting: it only sizes relay offers, and probing during its join
+    saturated its uplink just as its stream arrived), then every 30 s (5 s while a capacity
+    estimate holds the bitrate below the chosen quality and the encoder uses at least 70% of it)
     while no media connection is backlogged, the uplink's background slot
     pushes bytes onto every open connection's `bin` channel for 1.5 s (64 KB buffered at most per
     channel, refilled from buffer-low events, so it measures in a hidden tab too; a starved probe
