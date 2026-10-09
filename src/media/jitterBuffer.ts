@@ -20,6 +20,13 @@ export interface PlayoutClockOptions {
    * window is only a few seconds) and stall on each one.
    */
   holdMs: number
+  /**
+   * For this long after the first sample (ms), no spike is held and the delay falls at the full
+   * slew rate. A join's first seconds are its worst (the presenter's uplink bursts with the new
+   * child's catch-up, SCTP retransmits what that burst lost): held for holdMs and then glided down
+   * at the quality profile's 8 ms/s, a 3 s spike there took over 6 minutes to go.
+   */
+  warmupMs: number
   /** Added on top of the computed buffer (the viewer's "extra smooth" choice). */
   extraMs: number
 }
@@ -45,6 +52,7 @@ const DEFAULT_CLOCK: PlayoutClockOptions = {
   // follows smoothly instead of skipping ahead, and keep a spike's buffer for a minute.
   slewDownMsPerSec: QUALITY ? 8 : 250,
   holdMs: QUALITY ? 60_000 : 5000,
+  warmupMs: QUALITY ? 30_000 : 0,
   extraMs: 0,
 }
 
@@ -70,6 +78,8 @@ export class PlayoutClock {
   private readonly base: PlayoutClockOptions
   /** The largest buffer needed lately (beyond the fastest path) and when it was last needed. */
   private peak: { extra: number; at: number } | null = null
+  /** When the first sample completed (warmupMs counts from it). */
+  private firstAt: number | null = null
 
   constructor(opts: Partial<PlayoutClockOptions> = {}) {
     this.base = { ...DEFAULT_CLOCK, ...opts }
@@ -92,6 +102,7 @@ export class PlayoutClock {
     const transit = completedAt - captureTime
     // A NaN would corrupt the sorted window for good.
     if (!Number.isFinite(transit)) return
+    this.firstAt ??= completedAt
     this.samples.add(completedAt, transit)
     this.samples.expire(completedAt - this.opts.windowMs)
     this.recompute(completedAt)
@@ -103,16 +114,18 @@ export class PlayoutClock {
     const q = this.samples.quantile(this.opts.quantile)!
     // Express bounds relative to the fastest observed transit (absolute offset is unknown).
     let extra = Math.min(Math.max(q - minT + this.opts.safetyMs, this.opts.minDelayMs), this.opts.maxDelayMs)
-    // Keep the largest recent need for holdMs after it was last needed.
-    if (!this.peak || extra >= this.peak.extra || now - this.peak.at > this.opts.holdMs) this.peak = { extra, at: now }
-    extra = Math.max(extra, this.peak.extra) + this.opts.extraMs
+    const warming = this.firstAt !== null && now - this.firstAt < this.opts.warmupMs
+    // Keep the largest recent need for holdMs after it was last needed (not a join's transient).
+    if (warming) this.peak = null
+    else if (!this.peak || extra >= this.peak.extra || now - this.peak.at > this.opts.holdMs) this.peak = { extra, at: now }
+    extra = Math.max(extra, this.peak?.extra ?? 0) + this.opts.extraMs
     this.target = minT + extra
     if (this.delay === null) {
       this.delay = this.target
     } else {
       const dt = Math.max(0, now - this.lastUpdate) / 1000
       const up = this.opts.slewMsPerSec * 4 * dt
-      const down = (this.opts.slewDownMsPerSec ?? this.opts.slewMsPerSec) * dt
+      const down = (warming ? this.opts.slewMsPerSec : (this.opts.slewDownMsPerSec ?? this.opts.slewMsPerSec)) * dt
       // Increase quickly (avoid stalls), decrease slowly.
       const step = this.target > this.delay ? Math.min(this.target - this.delay, up) : -Math.min(this.delay - this.target, down)
       this.delay += step

@@ -234,7 +234,7 @@ describe('PlayoutClock', () => {
   })
 
   it('keeps the buffer a spike needed for holdMs, then glides down', () => {
-    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000 })
+    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000, warmupMs: 0 })
     // Steady 100 ms transit, then one 600 ms spike at t=1 s.
     for (let t = 0; t <= 1000; t += 20) c.addSample(t, t + 100)
     c.addSample(1000, 1600)
@@ -252,8 +252,19 @@ describe('PlayoutClock', () => {
     expect(c.bufferMs).toBe(0)
   })
 
+  it("a join's first spike is not held: the buffer comes back down within the warm-up", () => {
+    const opts = { quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 8000, slewMsPerSec: 250, slewDownMsPerSec: 8, holdMs: 60_000, warmupMs: 30_000 }
+    const c = new PlayoutClock(opts)
+    // 100 ms transit, with 200 ms of frames 3 s late 2 s in (a join's burst).
+    for (let t = 0; t <= 30_000; t += 50) c.addSample(t, t + 100 + (t >= 2000 && t < 2200 ? 3000 : 0))
+    expect(c.bufferMs).toBe(0)
+    // After the warm-up, a spike is held as before.
+    for (let t = 30_050; t <= 40_000; t += 50) c.addSample(t, t + 100 + (t >= 31_000 && t < 31_200 ? 3000 : 0))
+    expect(c.bufferMs).toBe(3000)
+  })
+
   it('a repeated spike within the hold never lets the buffer shrink', () => {
-    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000 })
+    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000, warmupMs: 0 })
     let min = Infinity
     for (let t = 0; t <= 120_000; t += 20) {
       // A 400 ms hiccup every 25 s.
