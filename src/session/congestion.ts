@@ -11,7 +11,8 @@
 // above the chosen quality or what the audience's relay slots can carry.
 //
 // Pacing: down at once (at most every 4 s), up by at most 25% per 10 s; changes under 5% are noise.
-// With nothing measured yet, it keeps the chosen quality.
+// With viewers but the uplink not measured yet (the first join: the first headroom probe runs 1 s
+// in), it starts at no more than START_KBPS, and goes straight to the target once measured.
 
 /** Settle at this share of what the wire budget carries. */
 export const TARGET_SHARE = 0.85
@@ -23,6 +24,12 @@ export const UP_GAP_MS = 10_000
 export const UP_STEP = 1.25
 /** Changes smaller than this share are ignored. */
 export const DEADBAND = 0.05
+/**
+ * Most a stream sends to its first viewers before the uplink is measured (kbps). Sending the chosen
+ * quality, plus the new child's GOP replay, into an unmeasured 8 Mbit uplink overflowed its queue
+ * and stalled the connection's SCTP association (control channel included) for seconds.
+ */
+export const START_KBPS = 4000
 
 /** The video bitrate at which `wire(video)` reaches `wireKbps` (wire is increasing in video). */
 export function videoKbpsForWire(wireKbps: number, wire: (videoKbps: number) => number): number {
@@ -63,7 +70,7 @@ export interface RateInputs {
   wireAt: (videoKbps: number) => number
 }
 
-export type RateLimit = 'chosen' | 'uplink' | 'viewers' | 'audience'
+export type RateLimit = 'chosen' | 'uplink' | 'viewers' | 'audience' | 'unmeasured'
 
 export interface RateTarget {
   kbps: number
@@ -90,6 +97,10 @@ export function rateTarget(i: RateInputs): RateTarget {
       limit = medianPeerKbps !== null && medianPeerKbps < (perChild ?? Infinity) ? 'viewers' : 'uplink'
     }
   }
+  if (children && i.uplinkKbps === null && START_KBPS < kbps) {
+    kbps = START_KBPS
+    limit = 'unmeasured'
+  }
   if (i.audienceKbps !== null && i.audienceKbps < kbps) {
     kbps = i.audienceKbps
     limit = 'audience'
@@ -101,9 +112,18 @@ export function rateTarget(i: RateInputs): RateTarget {
 export class BitrateController {
   private lastDown = -Infinity
   private lastUp = -Infinity
+  /** The last target was START_KBPS for want of a measurement. */
+  private unmeasured = false
 
   /** The next bitrate, or null to stay. */
   step(now: number, currentKbps: number, t: RateTarget): number | null {
+    const wasUnmeasured = this.unmeasured
+    this.unmeasured = t.limit === 'unmeasured'
+    // The first measurement: straight to its target, which is as safe as any measured one.
+    if (wasUnmeasured && !this.unmeasured && t.kbps > currentKbps) {
+      this.lastUp = now
+      return t.kbps
+    }
     if (t.kbps < currentKbps * (1 - DEADBAND)) {
       if (now - this.lastDown < DOWN_GAP_MS) return null
       this.lastDown = now

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CapacityModel, FROZEN_LAG_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
-import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, rateTarget, TARGET_SHARE, upperMedian, videoKbpsForWire, type RateInputs } from '../src/session/congestion'
+import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, type RateInputs } from '../src/session/congestion'
 import { LINK_BUFFER_HIGH } from '../src/net/link'
 
 // k=4, m=1 with audio: every direct child gets one full copy, all 5 stripes.
@@ -24,11 +24,19 @@ describe('bitrate target', () => {
     expect(sustainable(100)).toBe(0) // less than the per-stripe constants
   })
 
-  it('keeps the chosen quality with nothing measured, or capacity to spare', () => {
-    expect(rateTarget(base)).toMatchObject({ kbps: QUALITY, limit: 'chosen' })
+  it('keeps the chosen quality with capacity to spare', () => {
     expect(rateTarget({ ...base, uplinkKbps: 200_000 })).toMatchObject({ kbps: QUALITY, limit: 'chosen' })
     // Nobody watching: nothing to divide by.
     expect(rateTarget({ ...base, uplinkKbps: 1000, directChildren: 0, peerKbps: [] })).toMatchObject({ kbps: QUALITY, limit: 'chosen' })
+  })
+
+  it('with viewers but nothing measured, starts no higher than START_KBPS', () => {
+    expect(rateTarget(base)).toMatchObject({ kbps: START_KBPS, limit: 'unmeasured' })
+    expect(rateTarget({ ...base, chosenKbps: 2000 })).toMatchObject({ kbps: 2000, limit: 'chosen' })
+    const c = new BitrateController()
+    expect(c.step(0, QUALITY, rateTarget(base))).toBe(START_KBPS)
+    // Measured 2 s later: straight to the target, not +25% per 10 s.
+    expect(c.step(2000, START_KBPS, rateTarget({ ...base, uplinkKbps: 200_000 }))).toBe(QUALITY)
   })
 
   it('a fixed-capacity link: 85% of what it carries', () => {
@@ -203,6 +211,8 @@ function simulate(o: {
 }
 
 const between = (rates: { t: number; kbps: number }[], from: number, to: number) => rates.filter((r) => r.t > from && r.t <= to).map((r) => r.kbps)
+/** After the start: the first window may come before the first probe measured the uplink (START_KBPS). */
+const afterStart = (rates: { t: number; kbps: number }[]) => rates.filter((r) => r.t > 4)
 const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length
 const range = (xs: number[]) => `${Math.round(mean(xs))} [${Math.min(...xs)}..${Math.max(...xs)}]`
 
@@ -233,7 +243,7 @@ describe('estimator and controller, end to end', () => {
   it('one slow viewer does not throttle the others', () => {
     const r = simulate({ seconds: 90, uplink: () => 200_000, link: (_, i) => (i === 2 ? 3000 : 50_000), children: 3 })
     console.log(`3 children, one at 3 Mbps: ${range(r.rates.map((x) => x.kbps))}; slow peer ${JSON.stringify(r.model.peer('p2'))}`)
-    expect(r.rates.every((x) => x.kbps === QUALITY)).toBe(true)
+    expect(afterStart(r.rates).every((x) => x.kbps === QUALITY)).toBe(true)
     expect(r.model.peer('p2').bound).toBe(true)
     expect(r.model.peer('p2').kbps).toBeLessThan(3500)
   })
@@ -276,14 +286,14 @@ describe('estimator and controller, end to end', () => {
 
   it('ignores stalls: a connection that stops for a second every 10 s is not a slow uplink', () => {
     const r = simulate({ seconds: 120, uplink: () => 100_000, link: () => 60_000, children: 2, stalled: (t, i) => i === 0 && t % 10 < 1 })
-    expect(r.rates.every((x) => x.kbps === QUALITY)).toBe(true)
+    expect(afterStart(r.rates).every((x) => x.kbps === QUALITY)).toBe(true)
   })
 
   it('ignores windows in which the page froze', () => {
     // A frozen page sends nothing while it is frozen: the uplink looks slow and backlogged.
     const r = simulate({ seconds: 120, uplink: (t) => (t > 30 && t % 12 < 1.5 ? 0 : 100_000), link: () => 60_000, frozen: (t) => t > 30 && t % 12 < 1.5 })
     expect(FROZEN_LAG_MS).toBeLessThan(1500)
-    expect(r.rates.every((x) => x.kbps === QUALITY)).toBe(true)
+    expect(afterStart(r.rates).every((x) => x.kbps === QUALITY)).toBe(true)
   })
 
   it('never climbs above what the audience can relay', () => {

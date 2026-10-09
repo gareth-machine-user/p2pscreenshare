@@ -649,7 +649,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       firstLinkAt: this.firstLinkAt,
       lastAt: this.headroom.lastAt,
       presenting: !!this.publishing,
-      limited: limit === 'uplink' || limit === 'viewers',
+      limited: limit === 'uplink' || limit === 'viewers' || limit === 'unmeasured',
       encoderKbps: enc?.kbps ?? null,
       targetKbps: enc?.targetKbps ?? null,
     })

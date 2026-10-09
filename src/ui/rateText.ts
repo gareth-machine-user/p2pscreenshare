@@ -14,6 +14,8 @@ export function rateReason(r: RateStatus): string {
       return `limited by viewers' connections: median ~${mbps(r.medianPeerKbps ?? 0)}`
     case 'audience':
       return 'limited by audience relay capacity'
+    case 'unmeasured':
+      return 'starting gently until your upload is measured'
     case 'chosen':
       return r.currentKbps < r.chosenKbps ? 'rising back to the chosen quality' : 'at chosen quality'
   }

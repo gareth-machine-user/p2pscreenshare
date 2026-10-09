@@ -530,7 +530,10 @@ Rate control, in both profiles:
     the last 10 s in windows where most active connections were backlogged at once, with no
     stall. Between such windows it holds; any window raises it to at least what was delivered; a
     backlogged window queueing over 1 s sets it at once (no max filter). Until one comes it is
-    unknown, and the bitrate stays at the chosen quality.
+    unknown, and with viewers the bitrate starts at no more than 4 Mbps (`START_KBPS`), going
+    straight to the target once measured; a window in which everything was backlogged (or a
+    probe) sets a first, low value even if a connection stalled in it, so an uplink overloaded
+    from the start doesn't stay unmeasured.
   - *Connection capacity*: the same max filter over windows in which the connection was
     backlogged while most were not (it alone was the bottleneck: a slow receiver, one SCTP
     congestion window); such a connection is a *limit*. When most are backlogged together, each
@@ -586,7 +589,8 @@ Rate control, in both profiles:
   for e2e.
 - **Why it's clamped.** The presenter bar (while below the chosen quality) and Stats say what
   sets the bitrate in plain words: "limited by your upload: ~X Mbps", "limited by viewers'
-  connections: median ~Y Mbps", "limited by audience relay capacity" or "at chosen quality", and
+  connections: median ~Y Mbps", "limited by audience relay capacity", "starting gently until your
+  upload is measured" or "at chosen quality", and
   how many connections stalled. A lower quality level or fewer parity stripes then usually looks
   sharper than a starved stream.
 
