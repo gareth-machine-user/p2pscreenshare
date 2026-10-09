@@ -166,7 +166,9 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    relay slots offered per channel, subscriptions, open and failed links, RTTs, announced
    channels) and sends it to its neighbours every 2 s and on change, gzipped when large. Every
    2 s it swaps a digest with one random neighbour and pulls whatever is newer. A peer is gone when
-   nothing fresh has been heard about it, from anyone, for 6 s. Pairs whose link fails are listed
+   nothing fresh has been heard about it, from anyone, for 6 s; anything its open link receives
+   counts (media, and SCTP acks seen in getStats), not only control messages, which can wait
+   seconds behind a retransmission on the ordered `ctl` channel. Pairs whose link fails are listed
    as unreachable, never become tree edges, and are retried after 60 s with backoff.
 4. **Channels and subscriptions** (`src/session/peerSession.ts`). A channel is one encoding of one
    stream, with a random 32-bit id drawn each time it starts. The publisher announces it in its
@@ -324,7 +326,7 @@ Measured in the e2e tests on one machine:
 Mechanisms that keep one failure from spreading:
 - **No collateral blame.** When a relay dies, its descendants all go silent together and all complain. Handling complaints shallowest-first, and marking each complainer's subtree as "disrupted upstream" for 6 s, means only the topmost complaint counts against a parent. Healthy relays below it keep their children and their rank.
 - **No forwarding into the void.** When a peer leaves, the publisher tells each of its parents `remove-child`.
-- **Liveness.** The mesh pings every idle link; pongs are answered from a message handler, so background-tab timer throttling doesn't cause false positives.
+- **Liveness.** The mesh pings every idle link; pongs are answered from a message handler, so background-tab timer throttling doesn't cause false positives. Media and wire bytes received on a link count too, so a stalled `ctl` channel alone never drops a neighbour.
 - **Planned moves are glitch-free.** The old parent keeps feeding until the child reports `stripe-ok` from the new one (make-before-break).
 - **No startup backlog.** A new child's live fragments are queued ahead of its GOP replay, so its jitter buffer isn't inflated.
 
