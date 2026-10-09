@@ -25,7 +25,7 @@ import { PublishedStream, type ShareOptions } from './publishedStream'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { AutoFallback, liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
-import { HeadroomProbe } from './headroom'
+import { discoveryDue, HeadroomProbe } from './headroom'
 import { PresenterRate, type RateStatus } from './presenterRate'
 import { ConnMetrics, type LinkRow } from './connMetrics'
 import { PublishRights, type PublishRequest, type PublishRightsContext, type RequestState } from './publishRights'
@@ -60,12 +60,6 @@ export type { LinkRow } from './connMetrics'
 
 /** Budget weights shift towards channels with a deficit this often. */
 const REBALANCE_MS = 10_000
-/** Headroom discovery (session/headroom.ts) runs this often while no media connection is backlogged... */
-const HEADROOM_EVERY_MS = 30_000
-/** ...or this often while the measured capacity holds the bitrate below the chosen quality. */
-const HEADROOM_LIMITED_MS = 5000
-/** ...and first this long after the first link opens. */
-const HEADROOM_FIRST_MS = 1000
 /** How often to consider running it. */
 const HEADROOM_CHECK_MS = 1000
 /** The encoder dropping this many frames per second means it can't keep up (shown, not acted on). */
@@ -643,18 +637,21 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
 
   /**
    * Headroom discovery, the only probing: once shortly after the first link opens, then every 30 s
-   * (5 s while a capacity estimate limits the bitrate) while no media connection is backlogged (a
-   * backlogged one already shows what it carries).
+   * (5 s while a capacity estimate limits a bitrate the stream would use: discoveryDue) while no
+   * media connection is backlogged (a backlogged one already shows what it carries).
    */
   private maybeDiscover(): void {
     if (this.headroom.running || this.firstLinkAt === null) return
-    const now = performance.now()
-    // Held below the chosen quality by a capacity estimate, with nothing backlogged to show it: the
-    // estimate may be stale or low, and only a probe raises it.
     const limit = this.rateControl.target?.limit
-    const limited = limit === 'uplink' || limit === 'viewers'
-    const every = limited ? HEADROOM_LIMITED_MS : HEADROOM_EVERY_MS
-    const due = this.headroom.lastAt === -Infinity ? now - this.firstLinkAt >= HEADROOM_FIRST_MS : now - this.headroom.lastAt >= every
+    const enc = this.encoderStatsNow
+    const due = discoveryDue({
+      now: performance.now(),
+      firstLinkAt: this.firstLinkAt,
+      lastAt: this.headroom.lastAt,
+      limited: limit === 'uplink' || limit === 'viewers',
+      encoderKbps: enc?.kbps ?? null,
+      targetKbps: enc?.targetKbps ?? null,
+    })
     if (due && !this.metrics.backloggedNow) void this.discover()
   }
 

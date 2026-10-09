@@ -25,6 +25,37 @@ const PROBE_TICK_MS = 50
 /** Longest normal gap between refills; longer means the page was starved (ms). */
 export const PROBE_MAX_GAP_MS = 250
 
+/** Headroom discovery runs this often while no media connection is backlogged... */
+export const HEADROOM_EVERY_MS = 30_000
+/** ...or this often while the measured capacity holds the bitrate below the chosen quality... */
+export const HEADROOM_LIMITED_MS = 5000
+/** ...and the encoder uses at least this share of that bitrate (the limit binds)... */
+export const LIMIT_BINDS_SHARE = 0.7
+/** ...and first this long after the first link opens. */
+export const HEADROOM_FIRST_MS = 1000
+
+/**
+ * Whether headroom discovery is due. The fast cadence is for a presenter whose bitrate a capacity
+ * estimate holds down while the stream would use more: only a probe raises a stale or low estimate.
+ * A stream far below its bitrate (a static screen) loses nothing to the limit, and every probe
+ * fills each connection's SCTP association for 1.5 s, the media and ctl channels' too.
+ */
+export function discoveryDue(o: {
+  now: number
+  firstLinkAt: number
+  /** When the last probe started, or -Infinity. */
+  lastAt: number
+  /** A capacity estimate holds the bitrate below the chosen quality. */
+  limited: boolean
+  /** What the encoder put out over the last window, and its bitrate (kbps), if presenting. */
+  encoderKbps: number | null
+  targetKbps: number | null
+}): boolean {
+  if (o.lastAt === -Infinity) return o.now - o.firstLinkAt >= HEADROOM_FIRST_MS
+  const binds = o.limited && o.encoderKbps !== null && o.targetKbps !== null && o.encoderKbps >= LIMIT_BINDS_SHARE * o.targetKbps
+  return o.now - o.lastAt >= (binds ? HEADROOM_LIMITED_MS : HEADROOM_EVERY_MS)
+}
+
 /** Whether a probe's sending was starved (long gaps between refills, or a late end). */
 export function probeStarved(r: { maxGapMs: number; elapsedMs: number }, durationMs = PROBE_DURATION_MS): boolean {
   return r.maxGapMs > PROBE_MAX_GAP_MS || r.elapsedMs > durationMs + PROBE_MAX_GAP_MS
