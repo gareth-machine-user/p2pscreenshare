@@ -2,7 +2,7 @@
 // audience can carry (session/congestion.ts), applied to its stream in steps.
 import type { ChannelPublisher } from './channelPublisher'
 import { stripeKbpsFor, type CapacityModel } from './capacity'
-import { AudienceCap, audienceLimit, BitrateController, rateTarget, type RateTarget } from './congestion'
+import { AudienceCap, audienceLimit, BitrateController, rateTarget, ViewerSettle, type RateTarget } from './congestion'
 import type { PublishedStream } from './publishedStream'
 
 /** The presenter's bitrate and what sets it, in numbers (presenter bar, Stats). */
@@ -25,6 +25,8 @@ export class PresenterRate {
   private ctl = new BitrateController()
   /** Auto quality's cap, apart from the chosen quality. */
   private audienceCap = new AudienceCap()
+  /** Direct children count towards the median only once settled. */
+  private settle = new ViewerSettle()
 
   constructor(
     private selfId: string,
@@ -51,7 +53,8 @@ export class PresenterRate {
   /**
    * The presenter's bitrate (session/congestion.ts): 85% of what the wire budget per direct child
    * carries, the budget being the smaller of the uplink's capacity shared by the direct children
-   * and the median capacity of the peers it feeds directly. Runs on each 2 s window.
+   * and the median capacity of the peers it feeds directly (those fed for VIEWER_SETTLE_MS). Runs
+   * on each 2 s window.
    */
   adapt(s: PublishedStream | null, now: number): void {
     const full = s?.full
@@ -61,7 +64,10 @@ export class PresenterRate {
     }
     const edges = this.directEdges(full)
     const stripes = full.stripes
+    this.settle.update(now, edges.byPeer.keys())
     const peerKbps = [...edges.byPeer].map(([peer, e]) => {
+      // A newly fed child doesn't push back yet: its first windows say little.
+      if (!this.settle.settled(now, peer)) return null
       const c = this.capacity.peer(peer)
       // A peer fed only some stripes needs only that share of a full copy.
       return c.bound && c.kbps !== null ? (c.kbps * stripes) / e : null

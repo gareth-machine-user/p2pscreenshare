@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CapacityModel, FROZEN_LAG_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
-import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, type RateInputs } from '../src/session/congestion'
+import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, VIEWER_SETTLE_MS, ViewerSettle, type RateInputs } from '../src/session/congestion'
 import { LINK_BUFFER_HIGH } from '../src/net/link'
 
 // k=4, m=1 with audio: every direct child gets one full copy, all 5 stripes.
@@ -359,5 +359,22 @@ describe('auto quality (lower automatically)', () => {
     cap.step(10_000, true, null, QUALITY)
     cap.step(20_000, true, { feasibleKbps: 5000 }, QUALITY)
     expect(cap.step(20_000 + AUDIENCE_LIFT_MS - 1, true, null, QUALITY)).toBe(5000)
+  })
+})
+
+describe('viewer settle', () => {
+  it("a direct child's capacity counts only once it has been fed VIEWER_SETTLE_MS", () => {
+    const v = new ViewerSettle()
+    v.update(0, ['a'])
+    v.update(10_000, ['a', 'b'])
+    expect(v.settled(VIEWER_SETTLE_MS - 1, 'a')).toBe(false)
+    expect(v.settled(VIEWER_SETTLE_MS, 'a')).toBe(true)
+    expect(v.settled(VIEWER_SETTLE_MS, 'b')).toBe(false)
+    expect(v.settled(VIEWER_SETTLE_MS, 'c')).toBe(false)
+    // No longer fed: it starts over when it comes back.
+    v.update(VIEWER_SETTLE_MS, ['b'])
+    v.update(VIEWER_SETTLE_MS + 2000, ['a', 'b'])
+    expect(v.settled(VIEWER_SETTLE_MS + 2000, 'a')).toBe(false)
+    expect(v.settled(10_000 + VIEWER_SETTLE_MS, 'b')).toBe(true)
   })
 })

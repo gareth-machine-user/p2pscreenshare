@@ -10,6 +10,9 @@
 // and the target is 85% of the video bitrate that budget carries (stripeKbpsFor's overhead), never
 // above the chosen quality or what the audience's relay slots can carry.
 //
+// A direct child counts towards the median only once it has been fed for VIEWER_SETTLE_MS: a joiner's
+// first windows (GOP replay, its own connections still ramping up) say little about what it can take.
+//
 // Pacing: down at once (at most every 4 s), up by at most 25% per 10 s; changes under 5% are noise.
 // With viewers but the uplink not measured yet (the first join: the first headroom probe runs 1 s
 // in), it starts at no more than START_KBPS, and goes straight to the target once measured.
@@ -30,6 +33,27 @@ export const DEADBAND = 0.05
  * and stalled the connection's SCTP association (control channel included) for seconds.
  */
 export const START_KBPS = 4000
+
+/** A direct child's capacity counts towards the median once it has been fed this long (ms). */
+export const VIEWER_SETTLE_MS = 30_000
+
+/** When each direct child started being fed, to hold off its pushback until VIEWER_SETTLE_MS. */
+export class ViewerSettle {
+  private since = new Map<string, number>()
+
+  /** The current direct children; one no longer fed starts over if it comes back. */
+  update(now: number, children: Iterable<string>): void {
+    const keep = new Set(children)
+    for (const p of this.since.keys()) if (!keep.has(p)) this.since.delete(p)
+    for (const p of keep) if (!this.since.has(p)) this.since.set(p, now)
+  }
+
+  /** `peer` has been fed long enough for its capacity to count. */
+  settled(now: number, peer: string): boolean {
+    const t = this.since.get(peer)
+    return t !== undefined && now - t >= VIEWER_SETTLE_MS
+  }
+}
 
 /** The video bitrate at which `wire(video)` reaches `wireKbps` (wire is increasing in video). */
 export function videoKbpsForWire(wireKbps: number, wire: (videoKbps: number) => number): number {

@@ -550,7 +550,8 @@ Rate control, in both profiles:
     receiver drops the bytes.
   - *Bitrate* (`session/congestion.ts`, pure): the wire budget per direct child is the smaller of
     the uplink's capacity divided by the direct children ((child, stripe) edges / stripes) and the
-    median capacity of the peers fed directly (only those that are a limit; one fed some stripes
+    median capacity of the peers fed directly (only those that are a limit and have been fed for
+    30 s, `VIEWER_SETTLE_MS`, since a joiner's first windows say little; one fed some stripes
     counts its capacity × stripes / those stripes; of two, the larger), so one slow viewer
     doesn't throttle the rest: its own link sheds enhancement layers and its Auto quality can
     fall back to the preview. The target is 85% of the video bitrate that budget carries (the
