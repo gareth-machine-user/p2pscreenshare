@@ -217,6 +217,7 @@ export class PublishedStream {
     const o = this.opts as { bitrateKbps: number; maxSize?: [number, number]; fps?: number }
     const rate = fps ?? o.fps ?? DEFAULT_FPS
     this.ceilingKbps = bitrateKbps
+    this.changedAt = performance.now()
     full.kbps = bitrateKbps
     o.bitrateKbps = bitrateKbps
     o.fps = rate
@@ -237,6 +238,8 @@ export class PublishedStream {
 
   /** The most the bitrate may go up to: the quality the presenter chose. */
   ceilingKbps: number
+  /** When the quality last changed (performance.now()): the encoder was rebuilt and sent a keyframe. */
+  changedAt = -Infinity
 
   /** Adapts the encoder's bitrate (congestion control) without changing the chosen quality. */
   adaptBitrate(kbps: number): void {

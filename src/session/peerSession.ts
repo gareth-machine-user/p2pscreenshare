@@ -67,6 +67,8 @@ const ENCODER_BEHIND_FPS = 3
 /** Each connection's getStats() (path RTT, wire rates) is polled this often. */
 const LINK_STATS_MS = 2000
 
+/** After a quality change, capacity windows this long (two of them) are transient (capacity.ts). */
+const QUALITY_QUIET_MS = 4000
 /** Uplink stats (the capacity windows, and the bitrate that follows them) run this often. */
 const UPLINK_SAMPLE_MS = 2000
 const AUTO_BITRATE_CHECK_MS = 2000
@@ -628,7 +630,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     this.metrics.sampleUplink(now)
     this.encoderStatsNow = this.publishing?.sampleEncoder() ?? null
     const lagMs = Math.round(takeMainThreadLag())
-    this.metrics.sampleLinks(now, lagMs)
+    // Just after a quality change the new encoder's keyframe backs the queues up: no capacity evidence.
+    this.metrics.sampleLinks(now, lagMs, now - (this.publishing?.changedAt ?? -Infinity) < QUALITY_QUIET_MS)
     const encoderDroppedFps = this.encoderStatsNow?.droppedFps ?? 0
     this.localLoad = lagMs >= FROZEN_LAG_MS || encoderDroppedFps >= ENCODER_BEHIND_FPS ? { stallMs: lagMs, encoderDroppedFps } : null
     this.rateControl.adapt(this.publishing, now)

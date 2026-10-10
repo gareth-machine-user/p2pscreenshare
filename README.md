@@ -531,7 +531,9 @@ Rate control, in both profiles:
     raise estimates already made; a joiner's first burst used to read as a full uplink and cut
     the bitrate at once. No probe runs while every connection is settling, so with a first
     viewer the stream holds `START_KBPS` for its first 30 s, then measures; a viewer's pushback
-    waits until it has been fed, and its connections open, for 30 s.
+    waits until it has been fed, and its connections open, for 30 s. Windows in which a connection carried a
+    child's catch-up (a GOP replay), and the two after a quality change (the new encoder's
+    keyframe), are transient the same way.
   - *Uplink capacity* (what a peer gossips as `capacityKbps`): the most delivered in total over
     the last 40 s in windows where most active connections were backlogged at once, with no
     stall: longer than the probes' 30 s cadence, so a backlogged window between probes doesn't

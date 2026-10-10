@@ -188,8 +188,11 @@ export interface ConnWindow {
   backlogged: boolean
   /** It stalled in the window (its send buffer stopped draining). */
   stalled: boolean
-  /** It has been open less than SETTLE_MS: its backlog sets no capacity. */
-  settling?: boolean
+  /**
+   * Its backlog says nothing of capacity, so it sets none: the connection is settling (open less
+   * than SETTLE_MS), it carried a child's catch-up (a GOP replay), or the stream just changed quality.
+   */
+  transient?: boolean
   /** Live media queueing: the average of what was sent, or the oldest item still waiting (ms). */
   queueMs: number
 }
@@ -209,6 +212,7 @@ export function linkWindow(id: unknown, peer: string, a: LinkSnap, b: LinkSnap):
     active: items > 0 || drops > 0 || busy > 0,
     backlogged: ms > 0 && busy >= BACKLOGGED_SHARE * ms && (queueMs >= CONGESTED_QUEUE_MS || drops > 0),
     stalled: b.lastStallAt > a.at,
+    transient: b.replayed > a.replayed,
     queueMs,
     mediaKbps: ms > 0 ? ((b.mediaBytes - a.mediaBytes) * 8) / ms : 0,
     dropsPerS: ms > 0 ? (drops * 1000) / ms : 0,
@@ -264,8 +268,10 @@ export class MaxFilter {
  *   only how the uplink was split, so it merely raises the connection's estimate.
  * - A peer's capacity is the sum over its connections.
  *
- * A connection open less than SETTLE_MS (`settling`) counts as not backlogged, in probes too: its
- * window only raises estimates already made, and gives none a first value. Windows in which the page froze are ignored, and so are stalled connections (a stall says nothing
+ * A `transient` window (a connection open less than SETTLE_MS, a catch-up replay, a quality change)
+ * counts as not backlogged, in probes too: it only raises estimates already made, and gives none a
+ * first value. Windows in which the page froze are ignored, and so are stalled connections (a
+ * stall says nothing
  * about the link's rate; any stall in a window keeps it from setting the uplink's capacity, though
  * while it is unknown such a window, or probe, gives it a first, low value).
  */
@@ -282,7 +288,7 @@ export class CapacityModel {
   update(now: number, windows: ConnWindow[], o: { frozen?: boolean; probe?: boolean } = {}): void {
     if (o.frozen || !windows.length) return
     const ok = windows.filter((w) => !w.stalled)
-    const full = (w: ConnWindow) => w.backlogged && !w.settling
+    const full = (w: ConnWindow) => w.backlogged && !w.transient
     const active = ok.filter((w) => w.active)
     const backlogged = active.filter(full)
     const shared = backlogged.length * 2 > active.length
@@ -292,7 +298,7 @@ export class CapacityModel {
       if (w.active && full(w) && !shared) {
         c.filter.sample(now, w.kbps, w.queueMs)
         c.bound = true
-      } else c.filter.raise(now, w.kbps, !!o.probe && !w.settling)
+      } else c.filter.raise(now, w.kbps, !!o.probe && !w.transient)
     }
     const total = windows.reduce((a, w) => a + w.kbps, 0)
     // With nothing measured yet, a window that stalled while everything was backlogged (or a probe)
@@ -304,7 +310,7 @@ export class CapacityModel {
     if (shared && ok.length === windows.length) {
       const queueMs = backlogged.reduce((a, w) => a + w.queueMs, 0) / backlogged.length
       this.uplink.sample(now, total, queueMs)
-    } else this.uplink.raise(now, total, (!!o.probe && ok.some((w) => !w.settling)) || overloaded)
+    } else this.uplink.raise(now, total, (!!o.probe && ok.some((w) => !w.transient)) || overloaded)
   }
 
   /** A peer's capacity: the sum over its connections; `bound` if one of them was its own bottleneck. */

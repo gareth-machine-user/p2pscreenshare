@@ -108,11 +108,13 @@ describe('delivered rate', () => {
   })
 
   it('a window between two snapshots: backlogged when the queue never emptied with media queueing or dropped, stalled when it stalled', () => {
-    const a: LinkSnap = { at: 0, handed: 0, buffered: 0, busyMs: 0, items: 0, mediaBytes: 0, drops: 0, qSum: 0, qN: 0, lastStallAt: -Infinity, headAgeMs: 0 }
+    const a: LinkSnap = { at: 0, handed: 0, buffered: 0, busyMs: 0, items: 0, mediaBytes: 0, drops: 0, qSum: 0, qN: 0, lastStallAt: -Infinity, headAgeMs: 0, replayed: 0 }
     const b: LinkSnap = { ...a, at: 2000, handed: 2_000_000, buffered: 64_000, busyMs: 1900, items: 1500, mediaBytes: 1_500_000, drops: 10, qSum: 1500 * 300, qN: 1500, headAgeMs: 100 }
     const w = linkWindow('l', 'p', a, b)
     expect(w.kbps).toBeCloseTo(((2_000_000 - 64_000) * 8) / 2000)
-    expect(w).toMatchObject({ id: 'l', peer: 'p', active: true, backlogged: true, stalled: false, queueMs: 300, mediaKbps: 6000, dropsPerS: 5 })
+    expect(w).toMatchObject({ id: 'l', peer: 'p', active: true, backlogged: true, stalled: false, transient: false, queueMs: 300, mediaKbps: 6000, dropsPerS: 5 })
+    // It carried a child's catch-up (a GOP replay): its backlog says nothing of capacity.
+    expect(linkWindow('l', 'p', a, { ...b, replayed: 200_000 }).transient).toBe(true)
     // Busy for less than 90% of the window: not backlogged. The oldest waiting item counts as queueing.
     expect(linkWindow('l', 'p', a, { ...b, busyMs: 1700, headAgeMs: 1200 })).toMatchObject({ backlogged: false, queueMs: 1200 })
     expect(linkWindow('l', 'p', a, { ...b, lastStallAt: 500 }).stalled).toBe(true)
@@ -225,7 +227,7 @@ describe('capacity model', () => {
     m.update(0, [w('a', 'a', 50_000, { backlogged: true }), w('b', 'b', 50_000, { backlogged: true })], { probe: true })
     // A joiner's two lanes, backlogged by its GOP replay, queueing past FAST_DROP_QUEUE_MS.
     const joiner = (kbps: number, o: Partial<ConnWindow> = {}) => [w('c0', 'c', kbps, { backlogged: true, queueMs: 1500, ...o }), w('c1', 'c', kbps, { backlogged: true, queueMs: 1500, ...o })]
-    m.update(2000, [w('a', 'a', 3000), ...joiner(1500, { settling: true })])
+    m.update(2000, [w('a', 'a', 3000), ...joiner(1500, { transient: true })])
     expect(m.uplinkKbps).toBe(100_000)
     expect(m.peer('c')).toEqual({ kbps: null, bound: false })
     // Settled, the same windows count (FAST_DROP_WINDOWS of them in a row).
@@ -233,14 +235,14 @@ describe('capacity model', () => {
     expect(m.uplinkKbps).toBe(6000)
     // The only connection, settling: no first measurement from it either.
     const solo = new CapacityModel()
-    solo.update(0, [w('c0', 'c', 1500, { backlogged: true, queueMs: 1500, settling: true })])
+    solo.update(0, [w('c0', 'c', 1500, { backlogged: true, queueMs: 1500, transient: true })])
     expect(solo.uplinkKbps).toBeNull()
     // Nor from a probe of it: a join's lossy first seconds measured 0.5 Mbps and held there.
-    solo.update(2000, [w('c0', 'c', 600, { backlogged: true, settling: true })], { probe: true })
+    solo.update(2000, [w('c0', 'c', 600, { backlogged: true, transient: true })], { probe: true })
     expect(solo.uplinkKbps).toBeNull()
     expect(solo.peer('c')).toEqual({ kbps: null, bound: false })
     // A probe of settled connections with a settling one: the settled ones set it.
-    m.update(30_000, [w('a', 'a', 40_000, { backlogged: true }), w('b', 'b', 40_000, { backlogged: true }), w('c0', 'c', 500, { backlogged: true, settling: true })], { probe: true })
+    m.update(30_000, [w('a', 'a', 40_000, { backlogged: true }), w('b', 'b', 40_000, { backlogged: true }), w('c0', 'c', 500, { backlogged: true, transient: true })], { probe: true })
     expect(m.uplinkKbps).toBe(80_500)
   })
 

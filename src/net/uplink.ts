@@ -62,6 +62,8 @@ export interface LinkCounters {
   queueDelayN: number
   /** When the link was last seen stalled (STALL_MS without draining), or -Infinity. */
   lastStallAt: number
+  /** GOP-cache replay bytes handed to the channel (a child's catch-up). */
+  replayBytes: number
 }
 
 /**
@@ -86,6 +88,8 @@ export interface LinkSnap {
   lastStallAt: number
   /** How long the oldest item waiting for it has waited (ms). */
   headAgeMs: number
+  /** GOP-cache replay bytes handed to it (LinkCounters.replayBytes). */
+  replayed: number
 }
 
 /** Everything the uplink keeps for one link. */
@@ -164,7 +168,7 @@ export class Uplink {
         queue: [],
         background: false,
         dead: new Map(),
-        counters: { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, lastStallAt: -Infinity },
+        counters: { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, lastStallAt: -Infinity, replayBytes: 0 },
         progress: null,
       }
       this.links.set(link, e)
@@ -238,6 +242,7 @@ export class Uplink {
       qN: c?.queueDelayN ?? 0,
       lastStallAt: c?.lastStallAt ?? -Infinity,
       headAgeMs: this.headAgeMs(media, now),
+      replayed: c?.replayBytes ?? 0,
     }
   }
 
@@ -408,6 +413,7 @@ export class Uplink {
             this.tokens -= it.data.byteLength
             this.stats.sentBytes += it.data.byteLength
             this.stats.sentItems++
+            if (it.replay) c.replayBytes += it.data.byteLength
             // Live media only: replays to a new child are meant to wait behind it.
             if (!e.background && !it.replay) {
               this.stats.queueDelaySum += now - it.enqueuedAt

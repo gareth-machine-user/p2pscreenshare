@@ -426,6 +426,15 @@ describe('Uplink capacity counters', () => {
     expect(b.lastStallAt).toBe(b.at)
   })
 
+  it("counts a connection's catch-up replay bytes apart from live media", () => {
+    const u = new Uplink()
+    const media = new StubLink('m')
+    const probe = new StubLink('p')
+    u.send(media, msg(1, 100), 0)
+    u.send(media, msg(2, 70), 0, undefined, true)
+    expect(u.snapshot(media, probe)).toMatchObject({ handed: 170, mediaBytes: 100, replayed: 70 })
+  })
+
   it('forgets a closed link entirely, counters included, even one that never queued anything', () => {
     const u = new Uplink()
     const a = new StubLink('a')
