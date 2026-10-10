@@ -10,12 +10,14 @@
 // and the target is 85% of the video bitrate that budget carries (stripeKbpsFor's overhead), never
 // above the chosen quality or what the audience's relay slots can carry.
 //
-// A direct child counts towards the median only once it has been fed for VIEWER_SETTLE_MS: a joiner's
-// first windows (GOP replay, its own connections still ramping up) say little about what it can take.
+// A direct child counts towards the median only once it has been fed for SETTLE_MS: a joiner's first
+// windows (GOP replay, its own connections still ramping up) say little about what it can take. Its
+// connections' backlog sets no capacity for as long (session/capacity.ts).
 //
 // Pacing: down at once (at most every 4 s), up by at most 25% per 10 s; changes under 5% are noise.
 // With viewers but the uplink not measured yet (the first join: the first headroom probe runs 1 s
 // in), it starts at no more than START_KBPS, and goes straight to the target once measured.
+import { SETTLE_MS } from './capacity'
 
 /** Settle at this share of what the wire budget carries. */
 export const TARGET_SHARE = 0.85
@@ -34,10 +36,7 @@ export const DEADBAND = 0.05
  */
 export const START_KBPS = 4000
 
-/** A direct child's capacity counts towards the median once it has been fed this long (ms). */
-export const VIEWER_SETTLE_MS = 30_000
-
-/** When each direct child started being fed, to hold off its pushback until VIEWER_SETTLE_MS. */
+/** When each direct child started being fed, to hold off its pushback until SETTLE_MS. */
 export class ViewerSettle {
   private since = new Map<string, number>()
 
@@ -51,7 +50,7 @@ export class ViewerSettle {
   /** `peer` has been fed long enough for its capacity to count. */
   settled(now: number, peer: string): boolean {
     const t = this.since.get(peer)
-    return t !== undefined && now - t >= VIEWER_SETTLE_MS
+    return t !== undefined && now - t >= SETTLE_MS
   }
 }
 

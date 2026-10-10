@@ -6,7 +6,7 @@ import type { Mesh } from '../mesh/mesh'
 import { LinkStatsTracker, parseLinkStats, pathInflation } from '../net/linkStats'
 import type { Uplink } from '../net/uplink'
 import type { UplinkRates } from '../proto/messages'
-import { CapacityModel, FROZEN_LAG_MS, linkWindow, type ConnWindow, type LinkSnap } from './capacity'
+import { CapacityModel, FROZEN_LAG_MS, linkWindow, SETTLE_MS, type ConnWindow, type LinkSnap } from './capacity'
 import type { HeadroomProbe } from './headroom'
 import { RateWindow, round1 } from './rates'
 
@@ -78,6 +78,8 @@ function uplinkCounters(s: Uplink['stats']): UplinkCounters {
 interface ConnRecord {
   peer: string
   lane: number
+  /** When it was first seen open (performance.now()). */
+  openedAt: number
   /** Its getStats() history (net/linkStats.ts): path RTT, wire rates. */
   tracker: LinkStatsTracker
   /** The snapshot the last capacity window ended with, and that window's figures. */
@@ -134,7 +136,7 @@ export class ConnMetrics {
         if (!conn.isOpen) continue
         seen.add(conn)
         let r = this.connRecs.get(conn)
-        if (!r) this.connRecs.set(conn, (r = { peer, lane, tracker: new LinkStatsTracker(), last: null, rate: null }))
+        if (!r) this.connRecs.set(conn, (r = { peer, lane, openedAt: performance.now(), tracker: new LinkStatsTracker(), last: null, rate: null }))
         out.push([conn, r])
       }
     }
@@ -145,7 +147,8 @@ export class ConnMetrics {
 
   /**
    * One capacity window (session/capacity.ts): what each connection delivered since the last one,
-   * whether it was backlogged or stalled meanwhile. A window in which the page froze (the main
+   * whether it was backlogged or stalled meanwhile (a connection open less than SETTLE_MS is
+   * settling: its backlog sets no capacity). A window in which the page froze (the main
    * thread lagged FROZEN_LAG_MS or more) says nothing about the network and is left out.
    */
   sampleLinks(now: number, lagMs: number): void {
@@ -158,7 +161,7 @@ export class ConnMetrics {
       // A connection's counters restart if the uplink forgot it (closed and reopened).
       if (!last || snap.handed < last.handed || snap.items < last.items) continue
       const w = linkWindow(conn, rec.peer, last, snap)
-      windows.push(w)
+      windows.push({ ...w, settling: now - rec.openedAt < SETTLE_MS })
       rec.rate = {
         mediaKbps: Math.round(w.mediaKbps),
         deliveredKbps: Math.round(w.kbps),

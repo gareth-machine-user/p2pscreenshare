@@ -142,6 +142,12 @@ export const BACKLOGGED_SHARE = 0.9
  * delivered, down to the floor.
  */
 export const CONGESTED_QUEUE_MS = 150
+/**
+ * A connection's backlog says what it can carry only once it has been open this long (ms): before
+ * that it is backlogged by its catch-up (the GOP replay) and its own slow start, not by the uplink
+ * or the receiver. It holds a new viewer's pushback off just as long (session/congestion.ts).
+ */
+export const SETTLE_MS = 30_000
 /** The page froze in a window when the main thread lagged this long (ms): the window is ignored. */
 export const FROZEN_LAG_MS = 400
 
@@ -167,6 +173,8 @@ export interface ConnWindow {
   backlogged: boolean
   /** It stalled in the window (its send buffer stopped draining). */
   stalled: boolean
+  /** It has been open less than SETTLE_MS: its backlog sets no capacity. */
+  settling?: boolean
   /** Live media queueing: the average of what was sent, or the oldest item still waiting (ms). */
   queueMs: number
 }
@@ -230,7 +238,8 @@ export class MaxFilter {
  *   only how the uplink was split, so it merely raises the connection's estimate.
  * - A peer's capacity is the sum over its connections.
  *
- * Windows in which the page froze are ignored, and so are stalled connections (a stall says nothing
+ * A connection open less than SETTLE_MS (`settling`) counts as not backlogged: its window only
+ * raises estimates. Windows in which the page froze are ignored, and so are stalled connections (a stall says nothing
  * about the link's rate; any stall in a window keeps it from setting the uplink's capacity, though
  * while it is unknown such a window, or probe, gives it a first, low value).
  */
@@ -247,13 +256,14 @@ export class CapacityModel {
   update(now: number, windows: ConnWindow[], o: { frozen?: boolean; probe?: boolean } = {}): void {
     if (o.frozen || !windows.length) return
     const ok = windows.filter((w) => !w.stalled)
+    const full = (w: ConnWindow) => w.backlogged && !w.settling
     const active = ok.filter((w) => w.active)
-    const backlogged = active.filter((w) => w.backlogged)
+    const backlogged = active.filter(full)
     const shared = backlogged.length * 2 > active.length
     for (const w of ok) {
       let c = this.conns.get(w.id)
       if (!c) this.conns.set(w.id, (c = { peer: w.peer, filter: new MaxFilter(), bound: false }))
-      if (w.active && w.backlogged && !shared) {
+      if (w.active && full(w) && !shared) {
         c.filter.sample(now, w.kbps, w.queueMs)
         c.bound = true
       } else c.filter.raise(now, w.kbps, !!o.probe)
@@ -264,7 +274,7 @@ export class CapacityModel {
     // from the start, which stalls in every window, was never measured, and the stream kept
     // sending at the chosen quality into it.
     const allActive = windows.filter((w) => w.active)
-    const overloaded = allActive.length > 0 && allActive.every((w) => w.backlogged)
+    const overloaded = allActive.length > 0 && allActive.every(full)
     if (shared && ok.length === windows.length) {
       const queueMs = backlogged.reduce((a, w) => a + w.queueMs, 0) / backlogged.length
       this.uplink.sample(now, total, queueMs)

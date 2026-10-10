@@ -207,6 +207,23 @@ describe('capacity model', () => {
     expect(m.uplinkKbps).toBe(3000)
   })
 
+  it("a settling connection's backlog (its catch-up, its slow start) sets no capacity", () => {
+    const m = new CapacityModel()
+    m.update(0, [w('a', 'a', 50_000, { backlogged: true }), w('b', 'b', 50_000, { backlogged: true })], { probe: true })
+    // A joiner's two lanes, backlogged by its GOP replay, queueing past FAST_DROP_QUEUE_MS.
+    const joiner = (kbps: number, o: Partial<ConnWindow> = {}) => [w('c0', 'c', kbps, { backlogged: true, queueMs: 1500, ...o }), w('c1', 'c', kbps, { backlogged: true, queueMs: 1500, ...o })]
+    m.update(2000, [w('a', 'a', 3000), ...joiner(1500, { settling: true })])
+    expect(m.uplinkKbps).toBe(100_000)
+    expect(m.peer('c')).toEqual({ kbps: null, bound: false })
+    // Settled, the same windows count.
+    m.update(4000, [w('a', 'a', 3000), ...joiner(1500)])
+    expect(m.uplinkKbps).toBe(6000)
+    // The only connection, settling: no first measurement from it either.
+    const solo = new CapacityModel()
+    solo.update(0, [w('c0', 'c', 1500, { backlogged: true, queueMs: 1500, settling: true })])
+    expect(solo.uplinkKbps).toBeNull()
+  })
+
   it('one slow connection among several: its own capacity, not the uplink', () => {
     const m = new CapacityModel()
     m.update(0, [w('a', 'a', 50_000, { backlogged: true }), w('b', 'b', 50_000, { backlogged: true })], { probe: true })

@@ -53,7 +53,7 @@ export class PresenterRate {
   /**
    * The presenter's bitrate (session/congestion.ts): 85% of what the wire budget per direct child
    * carries, the budget being the smaller of the uplink's capacity shared by the direct children
-   * and the median capacity of the peers it feeds directly (those fed for VIEWER_SETTLE_MS). Runs
+   * and the median capacity of the peers it feeds directly (those fed for SETTLE_MS). Runs
    * on each 2 s window.
    */
   adapt(s: PublishedStream | null, now: number): void {
