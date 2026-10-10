@@ -126,8 +126,8 @@ async function main(): Promise<void> {
   const hostQ = new URLSearchParams({
     source: 'test',
     k: '4',
-    m: '1',
-    bitrate: String(preset.bitrate),
+    m: process.env.DIAG_M ?? '1',
+    bitrate: String(process.env.DIAG_KBPS ?? preset.bitrate),
     audio: '0',
     mic: '0',
     quality: presetName === 'auto' ? 'auto' : 'fixed',

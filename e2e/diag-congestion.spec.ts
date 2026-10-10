@@ -24,7 +24,8 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
   test.skip(!process.env.E2E_DIAG, 'opt-in diagnostic (E2E_DIAG=1)')
   const seconds = Number(process.env.DIAG_SECONDS ?? 75)
   const presetName = process.env.DIAG_PRESET ?? 'ultra'
-  const preset = DIAG_PRESETS[presetName]
+  // DIAG_KBPS / DIAG_M: override the preset's bitrate, and the parity stripes (1 by default).
+  const preset = { ...DIAG_PRESETS[presetName], ...(process.env.DIAG_KBPS ? { bitrate: Number(process.env.DIAG_KBPS) } : {}) }
   test.setTimeout((seconds + 120) * 1000)
   const seed = `e2e-diag-${Date.now()}`
   // No upload cap (openHost's default cap would be the bottleneck).
@@ -32,7 +33,7 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
   const up = process.env.DIAG_UP ? Number(process.env.DIAG_UP) : null
   const host = await openHost(browser, seed, {
     k: 4,
-    m: 1,
+    m: Number(process.env.DIAG_M ?? 1),
     bitrate: preset.bitrate,
     res: preset.res,
     up,
@@ -56,10 +57,16 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
     const [ms, every] = process.env.DIAG_BLOCK.split(',').map(Number)
     await host.evaluate(blockMainThreadExpr(ms, every))
   }
+  // DIAG_SETQ=seconds,kbps: the presenter changes quality that far into the run (a preset change).
+  const [setqAt, setqKbps] = process.env.DIAG_SETQ ? process.env.DIAG_SETQ.split(',').map(Number) : [Infinity, 0]
   const rows: DiagRow[] = []
   const t0 = Date.now()
   for (let i = 0; i < seconds; i++) {
     const tick = Date.now()
+    if (i === setqAt) {
+      await host.evaluate((kbps) => window.__p2p!.publishing!.setQuality(kbps), setqKbps)
+      console.log(`[${i}s] quality -> ${setqKbps} kbps`)
+    }
     const [h, v]: any[] = await Promise.all([host.evaluate(hostSampleExpr(viewerId)), viewer.evaluate(viewerSampleExpr(hostId))])
     const prev = rows.at(-1)
     rows.push({ t: Math.round((Date.now() - t0) / 100) / 10, h, v })
