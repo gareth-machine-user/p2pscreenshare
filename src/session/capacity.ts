@@ -238,8 +238,8 @@ export class MaxFilter {
  *   only how the uplink was split, so it merely raises the connection's estimate.
  * - A peer's capacity is the sum over its connections.
  *
- * A connection open less than SETTLE_MS (`settling`) counts as not backlogged: its window only
- * raises estimates. Windows in which the page froze are ignored, and so are stalled connections (a stall says nothing
+ * A connection open less than SETTLE_MS (`settling`) counts as not backlogged, in probes too: its
+ * window only raises estimates already made, and gives none a first value. Windows in which the page froze are ignored, and so are stalled connections (a stall says nothing
  * about the link's rate; any stall in a window keeps it from setting the uplink's capacity, though
  * while it is unknown such a window, or probe, gives it a first, low value).
  */
@@ -266,7 +266,7 @@ export class CapacityModel {
       if (w.active && full(w) && !shared) {
         c.filter.sample(now, w.kbps, w.queueMs)
         c.bound = true
-      } else c.filter.raise(now, w.kbps, !!o.probe)
+      } else c.filter.raise(now, w.kbps, !!o.probe && !w.settling)
     }
     const total = windows.reduce((a, w) => a + w.kbps, 0)
     // With nothing measured yet, a window that stalled while everything was backlogged (or a probe)
@@ -278,7 +278,7 @@ export class CapacityModel {
     if (shared && ok.length === windows.length) {
       const queueMs = backlogged.reduce((a, w) => a + w.queueMs, 0) / backlogged.length
       this.uplink.sample(now, total, queueMs)
-    } else this.uplink.raise(now, total, !!o.probe || overloaded)
+    } else this.uplink.raise(now, total, (!!o.probe && ok.some((w) => !w.settling)) || overloaded)
   }
 
   /** A peer's capacity: the sum over its connections; `bound` if one of them was its own bottleneck. */

@@ -527,8 +527,11 @@ Rate control, in both profiles:
     it (`STALL_MS`, below), and the whole window is ignored if the page *froze* (the main thread
     lagged ≥ 400 ms: what queued then is this computer's doing). A connection open less than
     30 s (`SETTLE_MS`) is *settling*: it is backlogged by its catch-up (the GOP replay) and its
-    own slow start, so its windows only raise estimates; a joiner's first burst used to read as a
-    full uplink and cut the bitrate at once. Headroom probes still count it.
+    own slow start (and in Chromium, losses while it starts), so its windows, probes' too, only
+    raise estimates already made; a joiner's first burst used to read as a full uplink and cut
+    the bitrate at once. No probe runs while every connection is settling, so with a first
+    viewer the stream holds `START_KBPS` for its first 30 s, then measures; a viewer's pushback
+    waits until it has been fed, and its connections open, for 30 s.
   - *Uplink capacity* (what a peer gossips as `capacityKbps`): the most delivered in total over
     the last 10 s in windows where most active connections were backlogged at once, with no
     stall. Between such windows it holds; any window raises it to at least what was delivered; a
@@ -553,8 +556,8 @@ Rate control, in both profiles:
     receiver drops the bytes.
   - *Bitrate* (`session/congestion.ts`, pure): the wire budget per direct child is the smaller of
     the uplink's capacity divided by the direct children ((child, stripe) edges / stripes) and the
-    median capacity of the peers fed directly (only those that are a limit and have been fed for
-    30 s, `SETTLE_MS`, since a joiner's first windows say little; one fed some stripes
+    median capacity of the peers fed directly (only those that are a limit and have been fed, and
+    connected, for 30 s, `SETTLE_MS`, since a joiner's first windows say little; one fed some stripes
     counts its capacity × stripes / those stripes; of two, the larger), so one slow viewer
     doesn't throttle the rest: its own link sheds enhancement layers and its Auto quality can
     fall back to the preview. The target is 85% of the video bitrate that budget carries (the

@@ -31,6 +31,8 @@ export class PresenterRate {
   constructor(
     private selfId: string,
     private capacity: CapacityModel,
+    /** Every open connection to `peer` has been open SETTLE_MS. */
+    private connsSettled: (peer: string) => boolean,
   ) {}
 
   /** A new stream starts without the last one's audience cap. */
@@ -53,7 +55,7 @@ export class PresenterRate {
   /**
    * The presenter's bitrate (session/congestion.ts): 85% of what the wire budget per direct child
    * carries, the budget being the smaller of the uplink's capacity shared by the direct children
-   * and the median capacity of the peers it feeds directly (those fed for SETTLE_MS). Runs
+   * and the median capacity of the peers it feeds directly (those fed, and connected, for SETTLE_MS). Runs
    * on each 2 s window.
    */
   adapt(s: PublishedStream | null, now: number): void {
@@ -66,8 +68,8 @@ export class PresenterRate {
     const stripes = full.stripes
     this.settle.update(now, edges.byPeer.keys())
     const peerKbps = [...edges.byPeer].map(([peer, e]) => {
-      // A newly fed child doesn't push back yet: its first windows say little.
-      if (!this.settle.settled(now, peer)) return null
+      // A newly fed or newly connected child doesn't push back yet: its first windows say little.
+      if (!this.settle.settled(now, peer) || !this.connsSettled(peer)) return null
       const c = this.capacity.peer(peer)
       // A peer fed only some stripes needs only that share of a full copy.
       return c.bound && c.kbps !== null ? (c.kbps * stripes) / e : null

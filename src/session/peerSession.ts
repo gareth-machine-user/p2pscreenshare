@@ -159,7 +159,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     })
     this.metrics = new ConnMetrics(this.mesh, this.uplink)
     this.capacity = this.metrics.capacity
-    this.rateControl = new PresenterRate(this.selfId, this.capacity)
+    this.rateControl = new PresenterRate(this.selfId, this.capacity, (peer) => this.metrics.peerSettled(peer, performance.now()))
     // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
     this.relay = new RelayNode(
       this.uplink,
@@ -638,7 +638,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
   /**
    * Headroom discovery, the only probing: once shortly after the first link opens, then every 30 s
    * (5 s while a capacity estimate limits a bitrate the stream would use: discoveryDue) while no
-   * media connection is backlogged (a backlogged one already shows what it carries).
+   * media connection is backlogged (a backlogged one already shows what it carries) and some
+   * connection has been open SETTLE_MS (so a presenter's first probe waits for its first viewer).
    */
   private maybeDiscover(): void {
     if (this.headroom.running || this.firstLinkAt === null) return
@@ -653,7 +654,8 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       encoderKbps: enc?.kbps ?? null,
       targetKbps: enc?.targetKbps ?? null,
     })
-    if (due && !this.metrics.backloggedNow) void this.discover()
+    // Not while every connection is settling: a probe then measures its join (capacity.ts SETTLE_MS).
+    if (due && !this.metrics.backloggedNow && !this.metrics.allSettling(performance.now())) void this.discover()
   }
 
   /**

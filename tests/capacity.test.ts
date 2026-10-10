@@ -222,6 +222,13 @@ describe('capacity model', () => {
     const solo = new CapacityModel()
     solo.update(0, [w('c0', 'c', 1500, { backlogged: true, queueMs: 1500, settling: true })])
     expect(solo.uplinkKbps).toBeNull()
+    // Nor from a probe of it: a join's lossy first seconds measured 0.5 Mbps and held there.
+    solo.update(2000, [w('c0', 'c', 600, { backlogged: true, settling: true })], { probe: true })
+    expect(solo.uplinkKbps).toBeNull()
+    expect(solo.peer('c')).toEqual({ kbps: null, bound: false })
+    // A probe of settled connections with a settling one: the settled ones set it.
+    m.update(30_000, [w('a', 'a', 40_000, { backlogged: true }), w('b', 'b', 40_000, { backlogged: true }), w('c0', 'c', 500, { backlogged: true, settling: true })], { probe: true })
+    expect(m.uplinkKbps).toBe(80_500)
   })
 
   it('one slow connection among several: its own capacity, not the uplink', () => {

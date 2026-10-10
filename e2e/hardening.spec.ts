@@ -93,8 +93,9 @@ test('one slow viewer does not throttle the stream; a capped uplink does, down t
       }
     }, ids)
 
-  // The uplink is measured (headroom probe), at about the 20 Mbps cap.
-  await waitFor(state, (st) => (st.uplinkKbps ?? 0) > 10_000, 30_000, 'uplink measured')
+  // The uplink is measured (headroom probe, once the connections have settled: capacity.ts
+  // SETTLE_MS), at about the 20 Mbps cap.
+  await waitFor(state, (st) => (st.uplinkKbps ?? 0) > 10_000, 60_000, 'uplink measured')
   await slowLink(ids[0])
   await new Promise((r) => setTimeout(r, 15_000))
   const one = await state()

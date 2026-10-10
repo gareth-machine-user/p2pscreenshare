@@ -74,6 +74,11 @@ function uplinkCounters(s: Uplink['stats']): UplinkCounters {
   return { bytes: s.sentBytes, items: s.sentItems, dropped: s.droppedItems, t0: d[0], t1: d[1], t2: d[2] + d[3], stalls: s.bufferStalls, queueSum: s.queueDelaySum, queueN: s.queueDelayN }
 }
 
+/** A connection open less than SETTLE_MS: its backlog says nothing of capacity yet (capacity.ts). */
+function settling(r: ConnRecord, now: number): boolean {
+  return now - r.openedAt < SETTLE_MS
+}
+
 /** What is kept per open connection (a mesh link or a lane), in one place. */
 interface ConnRecord {
   peer: string
@@ -161,7 +166,7 @@ export class ConnMetrics {
       // A connection's counters restart if the uplink forgot it (closed and reopened).
       if (!last || snap.handed < last.handed || snap.items < last.items) continue
       const w = linkWindow(conn, rec.peer, last, snap)
-      windows.push({ ...w, settling: now - rec.openedAt < SETTLE_MS })
+      windows.push({ ...w, settling: settling(rec, now) })
       rec.rate = {
         mediaKbps: Math.round(w.mediaKbps),
         deliveredKbps: Math.round(w.kbps),
@@ -188,14 +193,27 @@ export class ConnMetrics {
     )
     if (!r) return false
     const windows: ConnWindow[] = []
-    for (const [conn, { peer }] of conns) {
+    const now = performance.now()
+    for (const [conn, rec] of conns) {
       const a = r.start.get(conn)
       const b = r.end.get(conn)
       if (!a || !b || !conn.isOpen) continue
-      windows.push({ ...linkWindow(conn, peer, a, b), active: true, backlogged: true })
+      windows.push({ ...linkWindow(conn, rec.peer, a, b), active: true, backlogged: true, settling: settling(rec, now) })
     }
-    this.capacity.update(performance.now(), windows, { probe: true })
+    this.capacity.update(now, windows, { probe: true })
     return true
+  }
+
+  /** Every open connection is still settling (SETTLE_MS): a probe now would measure nothing. */
+  allSettling(now: number): boolean {
+    const conns = this.openConns()
+    return conns.length > 0 && conns.every(([, r]) => settling(r, now))
+  }
+
+  /** Every open connection to `peer` has been open SETTLE_MS (false with none). */
+  peerSettled(peer: string, now: number): boolean {
+    const rs = this.openConns().filter(([, r]) => r.peer === peer)
+    return rs.length > 0 && rs.every(([, r]) => !settling(r, now))
   }
 
   /** Polls getStats() on every open connection (mesh links and lanes) into its tracker. */
