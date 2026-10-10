@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   CAPACITY_WINDOW_MS,
+  FAST_DROP_QUEUE_MS,
+  FAST_DROP_WINDOWS,
   CapacityModel,
   deliveredKbps,
   feasibilityRatio,
@@ -156,13 +158,24 @@ describe('max filter', () => {
     expect(f.kbps).toBe(8000)
   })
 
-  it('drops at once to a backlogged sample queueing over a second', () => {
+  it('drops at once after FAST_DROP_WINDOWS deep-queued samples in a row, to the best of them', () => {
+    const deep = FAST_DROP_QUEUE_MS + 250
     const f = new MaxFilter()
     f.sample(0, 20_000)
     f.sample(2000, 6000, 400)
     expect(f.kbps).toBe(20_000)
-    f.sample(4000, 6000, 1500)
-    expect(f.kbps).toBe(6000)
+    // One or two deep windows are a burst (a keyframe at a new bitrate, a short stall).
+    f.sample(4000, 5000, deep)
+    f.sample(6000, 7000, deep)
+    expect(f.kbps).toBe(20_000)
+    // A window that drained in between: the run starts over.
+    f.raise(8000, 3000)
+    f.sample(10_000, 6000, deep)
+    f.sample(12_000, 6500, deep)
+    expect(f.kbps).toBe(20_000)
+    expect(FAST_DROP_WINDOWS).toBe(3)
+    f.sample(14_000, 5500, deep)
+    expect(f.kbps).toBe(6500)
   })
 })
 
@@ -203,7 +216,7 @@ describe('capacity model', () => {
     // Idle connections don't vote.
     m.update(6000, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 0, { active: false }), w('c', 'c', 0, { active: false })])
     expect(m.uplinkKbps).toBe(11_000)
-    m.update(20_000, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 0, { active: false })])
+    m.update(4000 + CAPACITY_WINDOW_MS + 1, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 0, { active: false })])
     expect(m.uplinkKbps).toBe(3000)
   })
 
@@ -215,8 +228,8 @@ describe('capacity model', () => {
     m.update(2000, [w('a', 'a', 3000), ...joiner(1500, { settling: true })])
     expect(m.uplinkKbps).toBe(100_000)
     expect(m.peer('c')).toEqual({ kbps: null, bound: false })
-    // Settled, the same windows count.
-    m.update(4000, [w('a', 'a', 3000), ...joiner(1500)])
+    // Settled, the same windows count (FAST_DROP_WINDOWS of them in a row).
+    for (const t of [4000, 6000, 8000]) m.update(t, [w('a', 'a', 3000), ...joiner(1500)])
     expect(m.uplinkKbps).toBe(6000)
     // The only connection, settling: no first measurement from it either.
     const solo = new CapacityModel()
@@ -234,12 +247,12 @@ describe('capacity model', () => {
   it('one slow connection among several: its own capacity, not the uplink', () => {
     const m = new CapacityModel()
     m.update(0, [w('a', 'a', 50_000, { backlogged: true }), w('b', 'b', 50_000, { backlogged: true })], { probe: true })
-    m.update(2000, [w('a', 'a', 900, { backlogged: true, queueMs: 1400 }), w('b', 'b', 8000), w('c', 'c', 8000)])
+    for (const t of [2000, 4000, 6000]) m.update(t, [w('a', 'a', 900, { backlogged: true, queueMs: 1400 }), w('b', 'b', 8000), w('c', 'c', 8000)])
     expect(m.peer('a')).toEqual({ kbps: 900, bound: true })
     expect(m.peer('b')).toEqual({ kbps: 50_000, bound: false })
     expect(m.uplinkKbps).toBe(100_000)
     // A headroom probe later shows it carries more now: raised.
-    m.update(30_000, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 40_000, { backlogged: true }), w('c', 'c', 40_000, { backlogged: true })], { probe: true })
+    m.update(50_000, [w('a', 'a', 3000, { backlogged: true }), w('b', 'b', 40_000, { backlogged: true }), w('c', 'c', 40_000, { backlogged: true })], { probe: true })
     expect(m.peer('a')).toEqual({ kbps: 3000, bound: true })
     expect(m.uplinkKbps).toBe(83_000)
   })

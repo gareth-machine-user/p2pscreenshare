@@ -274,14 +274,20 @@ describe('estimator and controller, end to end', () => {
     const at = (t: number) => r.rates.find((x) => x.t >= t)!.kbps
     expect(at(58)).toBe(QUALITY)
     const max = sustainable(3000)
-    // Within one or two windows of the fall.
-    expect(at(64)).toBeLessThanOrEqual(max)
+    // Once FAST_DROP_WINDOWS windows in a row show it (about 6 s), and the next 2 s window.
+    expect(at(68)).toBeLessThanOrEqual(max)
     const settled = between(r.rates, 70, 120)
-    console.log(`40 → 3 Mbps at 60 s (sustainable ${Math.round(max)} kbps): at 64 s ${at(64)}, then ${range(settled)}`)
+    console.log(`40 → 3 Mbps at 60 s (sustainable ${Math.round(max)} kbps): at 68 s ${at(68)}, then ${range(settled)}`)
     for (const x of settled) {
       expect(x).toBeLessThanOrEqual(max)
       expect(x).toBeGreaterThanOrEqual(max * 0.7)
     }
+  })
+
+  it('rides out a burst: a link slow for one window (a keyframe, a retransmission) is not a fall', () => {
+    const r = simulate({ seconds: 120, uplink: () => 100_000, link: (t) => (t >= 60 && t < 62 ? 3000 : 40_000) })
+    console.log(`40 Mbps, 3 Mbps for 2 s at 60 s: ${range(between(r.rates, 50, 120))}`)
+    expect(afterStart(r.rates).every((x) => x.kbps === QUALITY)).toBe(true)
   })
 
   it('ignores stalls: a connection that stops for a second every 10 s is not a slow uplink', () => {

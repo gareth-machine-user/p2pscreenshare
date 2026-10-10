@@ -178,7 +178,7 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    *delivered* (bytes handed to its channels, less what its send buffers grew by) per 2 s window,
    and whether it was *backlogged* (its uplink queue never emptied and live media queued ≥ 150 ms or
    was dropped: it carried all it could). The
-   uplink's capacity is the most delivered over the last 10 s in windows where most connections
+   uplink's capacity is the most delivered over the last 40 s in windows where most connections
    were backlogged at once; a connection's own is the most it delivered while it alone was
    backlogged (see [Rate control](#rate-control)). 75% of the uplink's capacity is split into relay
    slots per watched channel (a publisher first reserves its own roots), weighted towards channels
@@ -315,7 +315,7 @@ membership layer handles everything else.
 | A relay is consistently late | Every viewer measures how far behind the first piece of each frame each stripe arrives; the publisher attributes the excess to the parent | Lateness counts as a parent-choice penalty; a parent late by more than 150 ms for 10 s loses its children there for 30 s | 10 s |
 | Several publishers compete for relays | Channel announcements carry the latest plan's `deficit` | Every 10 s each peer moves 10% of its budget weight from channels without a deficit to those with one | a few rounds |
 | The audience can't upload enough | Offered slots below 90% of the N × S needed for 10 s | The presenter sees "Audience upload is limited: about X Mbps will play smoothly"; with Auto quality the encoder drops to that bitrate (in place, no new capture) | ~10 s |
-| Upload capacity changes | Backlogged windows (any time), or a headroom probe every 30 s (5 s while limited) while nothing is backlogged | Capacity follows (max over 10 s; at once when queueing passes 1 s) | 2–30 s |
+| Upload capacity changes | Backlogged windows (any time), or a headroom probe every 30 s (5 s while limited) while nothing is backlogged | Capacity follows (max over 40 s; at once after ~6 s of queueing past 1.25 s) | 6–30 s |
 
 Measured in the e2e tests on one machine:
 - **With parity (`m ≥ 1`):** a relay leaving is invisible (minimum 31–34 fps during failover).
@@ -533,9 +533,14 @@ Rate control, in both profiles:
     viewer the stream holds `START_KBPS` for its first 30 s, then measures; a viewer's pushback
     waits until it has been fed, and its connections open, for 30 s.
   - *Uplink capacity* (what a peer gossips as `capacityKbps`): the most delivered in total over
-    the last 10 s in windows where most active connections were backlogged at once, with no
-    stall. Between such windows it holds; any window raises it to at least what was delivered; a
-    backlogged window queueing over 1 s sets it at once (no max filter). Until one comes it is
+    the last 40 s in windows where most active connections were backlogged at once, with no
+    stall: longer than the probes' 30 s cadence, so a backlogged window between probes doesn't
+    forget the last one. Between such windows it holds; any window raises it to at least what was
+    delivered; three backlogged windows in a row (about 6 s) queueing over half the base layer's
+    queue limit (`FAST_DROP_QUEUE_MS`: 1.25 s, or 450 ms with `priority=latency`) set it at once
+    to the most any of them delivered (no max filter). A single deep window is mostly a burst (a
+    keyframe at a new bitrate, a short SCTP retransmission stall), and what it delivered is the
+    burst being recovered, not the link's rate. Until one comes it is
     unknown, and with viewers the bitrate starts at no more than 4 Mbps (`START_KBPS`), going
     straight to the target once measured; a window in which everything was backlogged (or a
     probe) sets a first, low value even if a connection stalled in it, so an uplink overloaded
@@ -622,7 +627,7 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
 | `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*`, `mediaMaxPacketLifeTimeMs` | `tuning.ts` | see the table above | Uplink layer deadlines, jitter buffer and retransmits: latency vs complete, smooth frames |
-| `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `BACKLOGGED_SHARE`, `FROZEN_LAG_MS` | `session/capacity.ts` | 10 s, 1 s, 90%, 400 ms | Capacity memory, when a backlog sets it at once, what counts as backlogged, and when a window is the page's fault |
+| `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `FAST_DROP_WINDOWS`, `BACKLOGGED_SHARE`, `FROZEN_LAG_MS` | `session/capacity.ts` | 40 s, half the base layer's queue limit (1.25 s / 450 ms), 3, 90%, 400 ms | Capacity memory, when a backlog sets it at once (and for how many windows in a row), what counts as backlogged, and when a window is the page's fault |
 | `TARGET_SHARE`, `DOWN_GAP_MS`, `UP_GAP_MS`, `UP_STEP`, `DEADBAND` | `session/congestion.ts` | 0.85, 4 s, 10 s, 1.25, 5% | Share of the measured budget used, and how fast the bitrate follows it |
 | `HEADROOM_EVERY_MS`, `PROBE_DURATION_MS` | `session/peerSession.ts`, `session/headroom.ts` | 30 s, 1.5 s | How often (while nothing is backlogged) and how long the headroom probe pushes background bytes |
 

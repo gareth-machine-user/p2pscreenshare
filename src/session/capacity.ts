@@ -5,9 +5,10 @@
 // What is measured is one quantity: the rate each connection delivered (bytes handed to its
 // channels, less what its send buffers grew by), every 2 s, and whether it was backlogged meanwhile
 // (its uplink queue never emptied: it carried all it could). Capacity is the most a connection, or
-// the whole uplink, delivered while backlogged over the last 10 s (a max filter, as in BBR), held
+// the whole uplink, delivered while backlogged over the last 40 s (a max filter, as in BBR), held
 // in between, and raised by whatever is delivered. See CapacityModel.
 import type { LinkSnap } from '../net/uplink'
+import { tuning } from '../tuning'
 
 export type { LinkSnap }
 
@@ -129,10 +130,24 @@ export function feasibleBitrate(currentKbps: number, ratio: number, floorKbps = 
   return Math.max(floorKbps, Math.round((currentKbps * ratio * 0.9) / 50) * 50)
 }
 
-/** Capacity is the most delivered over this long (ms), counting backlogged windows. */
-export const CAPACITY_WINDOW_MS = 10_000
-/** A backlogged window queueing longer than this (ms) sets the capacity at once (no max filter). */
-export const FAST_DROP_QUEUE_MS = 1000
+/**
+ * Capacity is the most delivered over this long (ms), counting backlogged windows: longer than the
+ * headroom probes' 30 s cadence, so one backlogged window between probes doesn't forget the last
+ * probe and set capacity to what the stream happened to carry.
+ */
+export const CAPACITY_WINDOW_MS = 40_000
+/**
+ * FAST_DROP_WINDOWS backlogged windows in a row queueing longer than this (ms) set the capacity at
+ * once (no max filter): half what the base layer may queue before it is dropped (1250 ms for
+ * quality, 450 ms for latency).
+ */
+export const FAST_DROP_QUEUE_MS = tuning.maxAgeByLayer[0] / 2
+/**
+ * ...about 6 s of it. A single deep window is mostly a burst (a keyframe at a new bitrate, a
+ * joiner's catch-up, a short SCTP retransmission stall), and what it delivered is the burst being
+ * recovered, not the link's rate.
+ */
+export const FAST_DROP_WINDOWS = 3
 /** A link is backlogged when its uplink queue held something for this share of a window... */
 export const BACKLOGGED_SHARE = 0.9
 /**
@@ -203,22 +218,33 @@ export function linkWindow(id: unknown, peer: string, a: LinkSnap, b: LinkSnap):
 /**
  * One capacity estimate (kbps): the most delivered over the last CAPACITY_WINDOW_MS, set by
  * windows in which the link (or uplink) carried all it could. Between them it holds; any window
- * raises it to at least what was delivered. A sample queueing past FAST_DROP_QUEUE_MS replaces it
- * at once: the link is clearly carrying less than it used to.
+ * raises it to at least what was delivered. FAST_DROP_WINDOWS samples in a row queueing past
+ * FAST_DROP_QUEUE_MS replace it at once with the most any of them delivered: the link carries less
+ * than it used to.
  */
 export class MaxFilter {
   kbps: number | null = null
   private recent: { at: number; kbps: number }[] = []
+  /** What the deep-queued samples in a row so far delivered. */
+  private deep: number[] = []
 
   /** A window that carried all it could. */
   sample(now: number, kbps: number, queueMs = 0): void {
-    this.recent = queueMs > FAST_DROP_QUEUE_MS ? [] : this.recent.filter((s) => now - s.at < CAPACITY_WINDOW_MS)
-    this.recent.push({ at: now, kbps })
+    this.deep = queueMs > FAST_DROP_QUEUE_MS ? [...this.deep, kbps] : []
+    if (this.deep.length >= FAST_DROP_WINDOWS) {
+      this.recent = [{ at: now, kbps: Math.max(...this.deep) }]
+      this.deep = []
+    } else {
+      this.recent = this.recent.filter((s) => now - s.at < CAPACITY_WINDOW_MS)
+      this.recent.push({ at: now, kbps })
+    }
     this.kbps = Math.max(...this.recent.map((s) => s.kbps))
   }
 
   /** A window that carried less than it could: capacity is at least this (`init`: even if unknown). */
   raise(now: number, kbps: number, init = false): void {
+    // The queue drained (or was only shared): the deep run is over.
+    this.deep = []
     if (this.kbps === null && !init) return
     this.recent = this.recent.filter((s) => now - s.at < CAPACITY_WINDOW_MS)
     this.recent.push({ at: now, kbps })
