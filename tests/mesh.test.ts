@@ -34,7 +34,6 @@ async function makeLobby(n: number, extra: (i: number) => Partial<MeshOptions<Fa
         name: `p${i}`,
         iceServers: [],
         connect: net.factory(identity.id),
-        connectLane: net.laneFactory(identity.id),
         rendezvous: net.rendezvousFor(identity.id),
         storage: memoryStore(),
         ...extra(i),

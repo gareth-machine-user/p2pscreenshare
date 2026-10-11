@@ -5,7 +5,7 @@
 // - Publisher: PublishedStream + one ChannelPublisher per channel (session/publishedStream.ts, session/channelPublisher.ts).
 // - Subscriber: one Subscription per watched channel (session/subscription.ts).
 // - Publish rights: requests to publish and the owner's answers (session/publishRights.ts).
-// - Relay: one RelayNode for every channel, forwarding over the mesh links' media channels.
+// - Relay: one RelayNode for every channel, forwarding over the mesh links' carriers.
 // - Capacity: each connection's delivered rate (session/connMetrics.ts, capacity.ts), split into
 //   relay slots per watched channel; the presenter's bitrate follows it (session/presenterRate.ts).
 import type { PublishPolicy } from '../mesh/auth'
@@ -43,10 +43,8 @@ export interface PeerSessionOptions {
   capKbps: number | null
   /** Debug: refuse mesh links with members of these names. */
   block?: string[]
-  /** Connections per pair (media lanes, mesh/lanes.ts): 1..6; 1 = the mesh link only. Undefined: by round trip. */
-  lanes?: number
-  /** Tests: the mesh's connection, lane, rendezvous and storage factories (tests/fakes/network.ts). */
-  meshDeps?: Pick<MeshOptions<PeerConn>, 'connect' | 'connectLane' | 'rendezvous' | 'storage'>
+  /** Tests: the mesh's connection, rendezvous and storage factories (tests/fakes/network.ts). */
+  meshDeps?: Pick<MeshOptions<PeerConn>, 'connect' | 'rendezvous' | 'storage'>
 }
 
 export interface LiveChannel {
@@ -155,19 +153,13 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       trackers: opts.trackers,
       iceServers: opts.iceServers,
       block: opts.block,
-      lanes: opts.lanes,
       // The fakes implement PeerConn, not MeshConn: all the session relies on.
       ...(opts.meshDeps as Partial<MeshOptions>),
     })
     this.metrics = new ConnMetrics(this.mesh, this.uplink)
     this.capacity = this.metrics.capacity
     this.rateControl = new PresenterRate(this.selfId, this.capacity, (peer) => this.metrics.peerSettled(peer, performance.now()))
-    // Stripes of one pair spread over its media lanes (each lane gets its own uplink queue).
-    this.relay = new RelayNode(
-      this.uplink,
-      (id, index) => this.mesh.connFor(id, index),
-      (id) => this.mesh.connectionsOf(id).map((c) => c.conn),
-    )
+    this.relay = new RelayNode(this.uplink, (id) => this.mesh.linkFor(id))
     this.relay.verifier = (raw, ch) => this.verify(raw, ch)
     this.relay.onFragment = (frag, from) => this.subs.get(frag.header.channel >>> 0)?.onFragment(frag, from)
     this.headroom = new HeadroomProbe(this.uplink)
@@ -544,7 +536,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
 
   /** The presenter's bitrate and what sets it, in numbers (presenter bar, Stats). Null when not presenting. */
   rateStatus(): RateStatus | null {
-    return this.rateControl.status(this.publishing, this.metrics.stalledLanes())
+    return this.rateControl.status(this.publishing, this.metrics.stalledLinks())
   }
 
   // --- control messages --------------------------------------------------------------------------
@@ -683,7 +675,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
    * Per connection to `peer` (Peers panel, e2e): getStats() path stats and the live-media queueing
    * and drops of the last window.
    */
-  linkStatsFor(peer: string): LinkRow[] {
+  linkStatsFor(peer: string): LinkRow | null {
     return this.metrics.linkStatsFor(peer)
   }
 

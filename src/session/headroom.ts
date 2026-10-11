@@ -1,11 +1,13 @@
 // Headroom discovery, the only probing: while no media connection is backlogged, the session
-// pushes low-priority bytes onto every open connection for 1.5 s (each connection's `bin` channel,
-// through the uplink's background slot, so live media always goes first) and measures what each
-// delivered, as for any other window (session/capacity.ts). Those windows count as backlogged.
-// Nobody receives or reports anything: the receiver drops the bytes.
+// pushes low-priority bytes onto every open connection for 1.5 s (padding in each connection's
+// carrier, mesh/carrierLink.ts, through the uplink's background slot, so live media always goes
+// first) and measures what each delivered, as for any other window (session/capacity.ts). Those
+// windows count as backlogged. The padding also lets the browser's bandwidth estimate grow, which
+// it only does for a rate that is used. Nobody receives or reports anything: the receiver drops
+// the bytes.
 //
 // A presenter's tab is usually hidden while it shares another window, and hidden tabs' timers are
-// throttled. So refills are driven by the channels' buffer-low events (with the worker ticker as a
+// throttled. So refills are driven by the probe links' buffer-low events (with the worker ticker as a
 // backstop) and the probe ends on the worker ticker: neither is throttled. A probe whose refills
 // were starved anyway (a frozen page) is discarded rather than taken as a (far too low) measurement.
 import { BACKGROUND_BUFFER_MAX, type ProbeLink } from '../net/link'
@@ -14,10 +16,9 @@ import { every, sleep } from '../net/ticker'
 export const PROBE_DURATION_MS = 1500
 export const PROBE_CHUNK = 16 * 1024
 /**
- * Each channel's send-buffer allowance (the uplink's bound for background data; refills happen
- * when it falls to half, the `bin` channel's low mark). Small on purpose: the `bin` channel shares
- * its SCTP association with the connection's media (and the mesh link's `ctl`), and in Chromium a
- * deep buffer there can stall the whole association for seconds.
+ * Each probe link's send-buffer allowance (the uplink's bound for background data; refills happen
+ * when it falls to half). Small on purpose: padding waiting in the carrier is only packed behind
+ * live media, but a deep backlog of it would keep the carrier busy after the probe ended.
  */
 export const PROBE_BUFFER = BACKGROUND_BUFFER_MAX
 /** Backstop refill period (worker ticker), should a buffer-low event not come. */
@@ -44,7 +45,7 @@ export const HEADROOM_FIRST_VIEWER_MS = 10_000
  * Whether headroom discovery is due. The fast cadence is for a presenter whose bitrate a capacity
  * estimate holds down while the stream would use more: only a probe raises a stale or low estimate.
  * A stream far below its bitrate (a static screen) loses nothing to the limit, and every probe
- * fills each connection's SCTP association for 1.5 s, the media and ctl channels' too.
+ * fills each connection's carrier up to its estimate for 1.5 s.
  */
 export function discoveryDue(o: {
   now: number

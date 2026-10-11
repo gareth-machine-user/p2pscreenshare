@@ -7,7 +7,7 @@
 // (its uplink queue never emptied: it carried all it could). Capacity is the most a connection, or
 // the whole uplink, delivered while backlogged over the last 40 s (a max filter, as in BBR), held
 // in between, and raised by whatever is delivered. See CapacityModel. A connection whose browser
-// publishes its own bandwidth estimate (an RTP lane: getStats availableOutgoingBitrate) is the
+// publishes its own bandwidth estimate (every mesh connection, for its carrier track: getStats availableOutgoingBitrate) is the
 // exception: that estimate is its capacity (CapacityModel.setKnown).
 import type { LinkSnap } from '../net/uplink'
 import { tuning } from '../tuning'
@@ -188,7 +188,7 @@ export function deliveredKbps(handedBytes: number, bufferedBefore: number, buffe
 
 /** One connection over one window. */
 export interface ConnWindow {
-  /** Which connection (a mesh link or a lane). */
+  /** Which connection. */
   id: unknown
   peer: string
   /** Delivered rate (kbps), all channels of the connection. */
@@ -294,7 +294,7 @@ export class MaxFilter {
 
 /**
  * Per-connection, per-peer and uplink capacity from delivered-rate windows, or, for a connection
- * whose browser estimates its bandwidth (an RTP lane), from that estimate.
+ * whose browser estimates its bandwidth (a mesh connection carrying media), from that estimate.
  *
  * - The uplink's capacity is set by windows in which most active connections were backlogged at
  *   once (the shared uplink carried all it could): the total delivered. Headroom probes are such

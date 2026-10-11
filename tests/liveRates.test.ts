@@ -3,8 +3,7 @@ import type { LinkRow } from '../src/session/peerSession'
 import { fmtMbps, livePeers, peerLive, sumKbps, uploadBadge } from '../src/ui/liveRates'
 import { rateReason, rateText, type RateStatus } from '../src/ui/rateText'
 
-const row = (lane: number, o: Partial<LinkRow> = {}): LinkRow => ({
-  lane,
+const row = (o: Partial<LinkRow> = {}): LinkRow => ({
   sendKbps: null,
   recvKbps: null,
   mediaKbps: null,
@@ -19,7 +18,6 @@ const row = (lane: number, o: Partial<LinkRow> = {}): LinkRow => ({
   drops: null,
   stalled: false,
   relayed: false,
-  cwnd: null,
   estimateKbps: null,
   ...o,
 })
@@ -40,16 +38,11 @@ describe('live rates', () => {
     expect(sumKbps([])).toBeNull()
   })
 
-  it("a peer's live figures add up its connections; RTT from the mesh link", () => {
-    const p = peerLive([
-      row(1, { sendKbps: 1200, recvKbps: 30, rttMs: 9, baselineMs: 4 }),
-      row(0, { sendKbps: 800, recvKbps: 20, rttMs: 12, baselineMs: 5 }),
-    ])
-    expect(p).toMatchObject({ sendKbps: 2000, recvKbps: 50, rttMs: 12, baselineMs: 5 })
-    expect(p.breakdown.split('\n')).toEqual(['lane 1: ↑ 1.2 Mbps ↓ 30 kbps, RTT 9 ms', 'mesh link: ↑ 800 kbps ↓ 20 kbps, RTT 12 ms'])
-    // No RTT on the mesh link yet: a lane's.
-    expect(peerLive([row(0), row(1, { rttMs: 7, baselineMs: 6 })]).rttMs).toBe(7)
-    expect(peerLive([])).toMatchObject({ sendKbps: null, recvKbps: null, rttMs: null })
+  it("a peer's live figures are its connection's", () => {
+    const p = peerLive(row({ sendKbps: 800, recvKbps: 20, rttMs: 12, baselineMs: 5 }))
+    expect(p).toMatchObject({ sendKbps: 800, recvKbps: 20, rttMs: 12, baselineMs: 5 })
+    expect(p.breakdown).toBe('↑ 800 kbps ↓ 20 kbps, RTT 12 ms')
+    expect(peerLive(null)).toMatchObject({ sendKbps: null, recvKbps: null, rttMs: null, breakdown: '' })
   })
 
   it('every member in join order: estimates for all, live rates for direct links, totals for you', () => {
@@ -60,7 +53,7 @@ describe('live rates', () => {
         { id: 'me', name: 'Me', joinedAt: 10, capacityKbps: 20_000 },
         { id: 'near', name: 'Near', joinedAt: 20, capacityKbps: null },
       ],
-      linksFor: (id) => (id === 'near' ? [row(0, { sendKbps: 1500, recvKbps: 40, rttMs: 12, baselineMs: 8 })] : []),
+      linkFor: (id) => (id === 'near' ? row({ sendKbps: 1500, recvKbps: 40, rttMs: 12, baselineMs: 8 }) : null),
       totals: { sendKbps: 1600, recvKbps: 900 },
     })
     expect(rows.map((r) => r.id)).toEqual(['me', 'near', 'far'])
@@ -86,11 +79,11 @@ describe('live rates', () => {
     expect(local.title).toContain("Your computer can't keep up (the encoder is dropping 6 frames/s, the page stalled for 0.8 s)")
   })
 
-  it("a peer's capacity adds up its connections; stalled ones are marked", () => {
-    const p = peerLive([row(0, { capKbps: 9000, bound: true }), row(1, { capKbps: 6000, stalled: true })])
-    expect(p).toMatchObject({ capKbps: 15_000, bound: true, stalled: true })
-    expect(p.breakdown).toContain('lane 1: ↑ — ↓ —, RTT —, stalled')
-    expect(peerLive([row(0)])).toMatchObject({ capKbps: null, bound: false, stalled: false })
+  it("a peer's capacity is its connection's; a stall is marked", () => {
+    const p = peerLive(row({ capKbps: 9000, bound: true, stalled: true }))
+    expect(p).toMatchObject({ capKbps: 9000, bound: true, stalled: true })
+    expect(p.breakdown).toBe('↑ — ↓ —, RTT —, stalled')
+    expect(peerLive(row())).toMatchObject({ capKbps: null, bound: false, stalled: false })
   })
 })
 
@@ -103,7 +96,7 @@ describe('bitrate reason', () => {
     uplinkKbps: 40_000,
     medianPeerKbps: null,
     feasibleKbps: null,
-    stalledLanes: 0,
+    stalledLinks: 0,
     ...o,
   })
 

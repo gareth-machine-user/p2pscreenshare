@@ -1,6 +1,6 @@
-// What this peer measures of its connections: the uplink's rates per window, each open connection's
-// capacity windows (session/capacity.ts) and getStats() history (net/linkStats.ts), and the
-// per-peer figures the Peers and Topology panels show.
+// What this peer measures of its connections: the uplink's rates per window, each open mesh
+// connection's capacity windows (session/capacity.ts) and getStats() history (net/linkStats.ts),
+// and the per-peer figures the Peers and Topology panels show.
 import type { PairConn } from '../mesh/dataConn'
 import type { Mesh } from '../mesh/mesh'
 import { LinkStatsTracker, parseLinkStats, pathInflation } from '../net/linkStats'
@@ -13,17 +13,15 @@ import { RateWindow, round1 } from './rates'
 /** Path RTT inflation shown as "+N ms" in the Peers panel, at least (display only). */
 const RTT_QUEUE_SHOWN_MS = 40
 
-/** One connection to a peer, as the Peers panel shows it (PeerSession.linkStatsFor). */
+/** The connection to a peer, as the Peers panel shows it (PeerSession.linkStatsFor). */
 export interface LinkRow {
-  /** 0: the mesh link; 1..: media lanes. */
-  lane: number
-  /** Wire send rate (getStats bytesSent: all channels, with overhead). */
+  /** Wire send rate (getStats bytesSent: carrier and ctl channel, with overhead). */
   sendKbps: number | null
   /** Wire receive rate (getStats bytesReceived). */
   recvKbps: number | null
   /** Live media handed to this connection over the last window. */
   mediaKbps: number | null
-  /** What it delivered over the last window (all its channels), and what it can carry (capacity.ts). */
+  /** What it delivered over the last window (media and probe padding), and what it can carry (capacity.ts). */
   deliveredKbps: number | null
   capKbps: number | null
   /** It was its own bottleneck at some point (a slow receiver, or its congestion window). */
@@ -38,12 +36,10 @@ export interface LinkRow {
   /** Live-media queueing (uplink queue + send buffer) and drops/s over the last window. */
   queueMs: number | null
   drops: number | null
-  /** The connection stalled recently (its send buffer stopped draining; net/uplink.ts STALL_MS). */
+  /** The connection stalled recently (its carrier stopped taking bytes; net/uplink.ts STALL_MS). */
   stalled: boolean
   relayed: boolean | null
-  /** SCTP congestion window (bytes), if the browser exposes sctp-transport stats (Chrome doesn't). */
-  cwnd: number | null
-  /** The browser's bandwidth estimate (getStats availableOutgoingBitrate): RTP lanes only; it is capKbps then. */
+  /** The browser's bandwidth estimate (getStats availableOutgoingBitrate); capKbps is it, capped. */
   estimateKbps: number | null
 }
 
@@ -81,10 +77,9 @@ function settling(r: ConnRecord, now: number): boolean {
   return now - r.openedAt < SETTLE_MS
 }
 
-/** What is kept per open connection (a mesh link or a lane), in one place. */
+/** What is kept per open connection, in one place. */
 interface ConnRecord {
   peer: string
-  lane: number
   /** When it was first seen open (performance.now()). */
   openedAt: number
   /** Its getStats() history (net/linkStats.ts): path RTT, wire rates. */
@@ -105,7 +100,7 @@ export class ConnMetrics {
   backloggedNow = false
   /** The uplink's counters per second; the first window runs from construction (all zero then). */
   private uplinkWindow = new RateWindow<UplinkCounters>()
-  /** Per open connection (mesh link or lane), refreshed by openConns(). */
+  /** Per open connection, refreshed by openConns(). */
   private connRecs = new Map<PairConn, ConnRecord>()
   private pollingStats = false
 
@@ -132,20 +127,19 @@ export class ConnMetrics {
   }
 
   /**
-   * Every open connection (the mesh link and lanes of each peer) with its record. Records of
-   * connections that are no longer open are dropped here, so this is the one place they are pruned.
+   * Every open connection with its record. Records of connections that are no longer open are
+   * dropped here, so this is the one place they are pruned.
    */
   openConns(): [PairConn, ConnRecord][] {
     const out: [PairConn, ConnRecord][] = []
     const seen = new Set<PairConn>()
     for (const peer of [...this.mesh.conns.keys()]) {
-      for (const { lane, conn } of this.mesh.connectionsOf(peer)) {
-        if (!conn.isOpen) continue
-        seen.add(conn)
-        let r = this.connRecs.get(conn)
-        if (!r) this.connRecs.set(conn, (r = { peer, lane, openedAt: performance.now(), tracker: new LinkStatsTracker(), last: null, rate: null }))
-        out.push([conn, r])
-      }
+      const conn = this.mesh.linkFor(peer)
+      if (!conn) continue
+      seen.add(conn)
+      let r = this.connRecs.get(conn)
+      if (!r) this.connRecs.set(conn, (r = { peer, openedAt: performance.now(), tracker: new LinkStatsTracker(), last: null, rate: null }))
+      out.push([conn, r])
     }
     for (const conn of this.connRecs.keys()) if (!seen.has(conn)) this.connRecs.delete(conn)
     this.capacity.retain(seen)
@@ -186,9 +180,10 @@ export class ConnMetrics {
 
   /**
    * Pushes background bytes onto every open connection for 1.5 s (session/headroom.ts) and takes
-   * what each delivered as a backlogged window. False if no probe ran. A connection without an open
-   * probe link (an RTP lane's is a closed stand-in: its capacity is the browser's estimate) is left
-   * out: nothing is pushed onto it, so its window would be no measurement.
+   * what each delivered as a backlogged window. False if no probe ran. A probe link is padding in
+   * the connection's carrier frames, within the browser's estimate: what it delivers counts for the
+   * uplink's capacity, the connection's own stays the estimate (CapacityModel.setKnown), and the
+   * padding is what lets that estimate grow while the stream sends less than it.
    */
   async probe(headroom: HeadroomProbe): Promise<boolean> {
     const conns = this.openConns().filter(([conn]) => conn.probeLink.isOpen)
@@ -223,9 +218,9 @@ export class ConnMetrics {
   }
 
   /**
-   * Polls getStats() on every open connection (mesh links and lanes) into its tracker, and hands
-   * the browser's bandwidth estimate, where a connection has one (RTP lanes), to the capacity model
-   * as that connection's capacity (null clears it).
+   * Polls getStats() on every open connection into its tracker, and hands the browser's bandwidth
+   * estimate (the carrier's: capped at the connection's maxKbps) to the capacity model as that
+   * connection's capacity (null clears it).
    */
   async pollLinkStats(): Promise<void> {
     if (this.pollingStats) return
@@ -238,7 +233,9 @@ export class ConnMetrics {
           if (!r) return
           const stats = rec.tracker.update(r, performance.now())
           // Closed meanwhile (retain() already dropped it): don't bring its estimate back.
-          if (conn.isOpen) this.capacity.setKnown(conn, rec.peer, stats.availableKbps)
+          const est = stats.availableKbps
+          const known = est === null || conn.maxKbps === undefined ? est : Math.min(est, conn.maxKbps)
+          if (conn.isOpen) this.capacity.setKnown(conn, rec.peer, known)
         }),
       )
     } finally {
@@ -248,8 +245,7 @@ export class ConnMetrics {
 
   /** The mesh link's path RTT to `peer`, from the getStats polling (gossiped RTTs). */
   pathRttMs(peer: string): number | null {
-    for (const r of this.connRecs.values()) if (r.peer === peer && r.lane === 0) return r.tracker.current(performance.now())?.rttMs ?? null
-    return null
+    return this.recOf(peer)?.[1].tracker.current(performance.now())?.rttMs ?? null
   }
 
   /** When any open connection to `peer` last received bytes on the wire (getStats polling), if known. */
@@ -260,48 +256,47 @@ export class ConnMetrics {
   }
 
   /** Connections that stalled in the last window. */
-  stalledLanes(): number {
+  stalledLinks(): number {
     return [...this.connRecs.values()].filter((r) => r.rate?.stalled).length
   }
 
-  /** The records of the open connections to `peer`, by lane. */
-  private recsOf(peer: string): [PairConn, ConnRecord][] {
-    return [...this.connRecs].filter(([, r]) => r.peer === peer).sort((a, b) => a[1].lane - b[1].lane)
+  /** The record of the open connection to `peer`. */
+  private recOf(peer: string): [PairConn, ConnRecord] | undefined {
+    for (const e of this.connRecs) if (e[1].peer === peer) return e
+    return undefined
   }
 
   /**
-   * Per connection to `peer` (Peers panel, e2e): getStats() path stats (RTT now and baseline, wire
-   * send rate, relayed, SCTP congestion window where the browser exposes it) and the live-media
-   * queueing and drops of the last window.
+   * The connection to `peer` (Peers panel, e2e): getStats() path stats (RTT now and baseline, wire
+   * rates, relayed, the browser's estimate) and the live-media queueing and drops of the last
+   * window. Null without an open connection.
    */
-  linkStatsFor(peer: string): LinkRow[] {
+  linkStatsFor(peer: string): LinkRow | null {
+    const e = this.recOf(peer)
+    if (!e) return null
+    const [conn, rec] = e
     const kbps = (v: number | null | undefined) => (v === null || v === undefined ? null : Math.round(v))
     const ms = (v: number | null | undefined) => (v === null || v === undefined ? null : Math.round(v * 10) / 10)
-    const now = performance.now()
-    return this.recsOf(peer).map(([conn, rec]) => {
-      const s = rec.tracker.current(now)
-      const r = rec.rate
-      const cap = this.capacity.conn(conn)
-      return {
-        lane: rec.lane,
-        sendKbps: kbps(s?.sendKbps),
-        recvKbps: kbps(s?.recvKbps),
-        mediaKbps: r?.mediaKbps ?? null,
-        deliveredKbps: r?.deliveredKbps ?? null,
-        capKbps: cap?.kbps == null ? null : Math.round(cap.kbps),
-        bound: cap?.bound ?? false,
-        backlogged: r?.backlogged ?? false,
-        rttMs: ms(s?.rttMs),
-        baselineMs: ms(s?.baselineMs),
-        fresh: s?.fresh ?? false,
-        queueMs: r?.queueMs ?? null,
-        drops: r?.drops ?? null,
-        stalled: r?.stalled ?? false,
-        relayed: s?.relayed ?? null,
-        cwnd: s?.cwnd ?? null,
-        estimateKbps: kbps(s?.availableKbps),
-      }
-    })
+    const s = rec.tracker.current(performance.now())
+    const r = rec.rate
+    const cap = this.capacity.conn(conn)
+    return {
+      sendKbps: kbps(s?.sendKbps),
+      recvKbps: kbps(s?.recvKbps),
+      mediaKbps: r?.mediaKbps ?? null,
+      deliveredKbps: r?.deliveredKbps ?? null,
+      capKbps: cap?.kbps == null ? null : Math.round(cap.kbps),
+      bound: cap?.bound ?? false,
+      backlogged: r?.backlogged ?? false,
+      rttMs: ms(s?.rttMs),
+      baselineMs: ms(s?.baselineMs),
+      fresh: s?.fresh ?? false,
+      queueMs: r?.queueMs ?? null,
+      drops: r?.drops ?? null,
+      stalled: r?.stalled ?? false,
+      relayed: s?.relayed ?? null,
+      estimateKbps: kbps(s?.availableKbps),
+    }
   }
 
   /**
@@ -320,25 +315,18 @@ export class ConnMetrics {
     return { sendKbps: send ?? this.uplinkStatsNow?.kbps ?? null, recvKbps: recv }
   }
 
-  /** The link from this peer to `peer` over the last window, all its connections together (Topology). */
+  /** The link from this peer to `peer` over the last window (Topology). */
   linkRate(peer: string): { drops: number; queueMs: number; backlogged: boolean; capKbps: number | null } | null {
-    const rs = this.recsOf(peer).flatMap(([, r]) => (r.rate ? [r.rate] : []))
-    if (!rs.length) return null
+    const r = this.recOf(peer)?.[1].rate
+    if (!r) return null
     const cap = this.capacity.peer(peer).kbps
-    return {
-      drops: Math.round(rs.reduce((a, r) => a + r.drops, 0) * 10) / 10,
-      queueMs: Math.max(...rs.map((r) => r.queueMs)),
-      backlogged: rs.some((r) => r.backlogged),
-      capKbps: cap === null ? null : Math.round(cap),
-    }
+    return { drops: r.drops, queueMs: r.queueMs, backlogged: r.backlogged, capKbps: cap === null ? null : Math.round(cap) }
   }
 
   /** Path RTT inflation to `peer` over its baseline (display only: the Peers panel's "+N ms"). */
   pathQueueFor(peer: string): { inflationMs: number; queued: boolean } | null {
-    const p = pathInflation(
-      this.recsOf(peer).map(([, r]) => r.tracker.current(performance.now())),
-      RTT_QUEUE_SHOWN_MS,
-    )
+    const rec = this.recOf(peer)?.[1]
+    const p = pathInflation([rec ? rec.tracker.current(performance.now()) : null], RTT_QUEUE_SHOWN_MS)
     return p ? { inflationMs: Math.round(p.inflationMs), queued: p.inflated } : null
   }
 }

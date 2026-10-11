@@ -38,7 +38,6 @@ async function makeSessions(n: number): Promise<Lobby> {
         // Typed for PeerConn, which FakeConn implements (the factories' types are invariant in it).
         meshDeps: {
           connect: net.factory(identity.id),
-          connectLane: net.laneFactory(identity.id),
           rendezvous: net.rendezvousFor(identity.id),
           storage: memoryStore(),
         } as unknown as PeerSessionOptions['meshDeps'],
@@ -227,7 +226,7 @@ describe('PeerSession (in-memory network)', () => {
     await until(() => decodes > 0, 3000, 'frames decoded')
     // The bitrate control ran on the uplink windows meanwhile.
     await advance(2000)
-    expect(presenter.rateStatus()).toMatchObject({ chosenKbps: 1000, stalledLanes: 0 })
+    expect(presenter.rateStatus()).toMatchObject({ chosenKbps: 1000, stalledLinks: 0 })
     expect(viewer.rateStatus()).toBeNull()
   })
 })

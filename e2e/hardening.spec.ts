@@ -72,8 +72,8 @@ test('one slow viewer does not throttle the stream; a capped uplink does, down t
 
   /**
    * Makes the presenter's link to a viewer look like a slow receiver: its send buffer stays full,
-   * though it keeps draining (a buffer that never drains is a stalled connection, which the uplink
-   * routes around: net/uplink.ts STALL_MS). Its queue never empties and it delivers next to nothing.
+   * though it keeps draining (a buffer that never drains is a stalled connection: net/uplink.ts
+   * STALL_MS). Its queue never empties and it delivers next to nothing.
    */
   const slowLink = (peer: string) =>
     owner.evaluate((id) => {
@@ -88,8 +88,8 @@ test('one slow viewer does not throttle the stream; a capped uplink does, down t
         rate: s.rateStatus(),
         uplinkKbps: s.capacity.uplinkKbps as number | null,
         peers: peers.map((p: string) => s.peerCapacity(p)) as { kbps: number | null; bound: boolean }[],
-        // The slow viewer's mesh link (k=1: the one stripe goes over it).
-        slowLink: (s.linkStatsFor(peers[0]) as Any[]).find((l) => l.lane === 0) as { capKbps: number | null; bound: boolean; backlogged: boolean },
+        // The slow viewer's mesh link.
+        slowLink: s.linkStatsFor(peers[0]) as { capKbps: number | null; bound: boolean; backlogged: boolean },
       }
     }, ids)
 
@@ -100,10 +100,11 @@ test('one slow viewer does not throttle the stream; a capped uplink does, down t
   await new Promise((r) => setTimeout(r, 15_000))
   const one = await state()
   console.log('one slow link:', JSON.stringify(one))
-  // The slow viewer's connection is its own bottleneck, the bitrate holds for the other one.
+  // The slow viewer's connection is backlogged on its own, and the bitrate holds for the other one.
+  // (Its capacity is the browser's estimate for its carrier, which faking the send buffer can't
+  // lower: a real slow receiver lowers the estimate itself.)
   expect(one.peers[0].bound).toBe(true)
   expect(one.slowLink).toMatchObject({ bound: true, backlogged: true })
-  expect(one.slowLink.capKbps!).toBeLessThan(KBPS)
   expect(one.kbps).toBe(KBPS)
   expect(one.rate.limit).toBe('chosen')
   expect((await viewerSnapshot(b)).fps).toBeGreaterThan(20) // the other viewer is unaffected

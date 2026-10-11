@@ -13,9 +13,10 @@
 // currentRoundTripTime / totalRoundTripTime / responsesReceived / bytesSent / bytesReceived, and
 // the transport's selectedCandidatePairId. No `sctp-transport` report (so no congestion window:
 // parsed in case a browser adds one), and no availableOutgoingBitrate on a data-only connection.
-// A connection that sends RTP media (an RTP lane) does report availableOutgoingBitrate on its
-// selected pair: the send-side bandwidth estimate of the browser's own congestion control (GCC),
-// which session/capacity.ts takes as that connection's capacity (CapacityModel.setKnown).
+// A connection that sends RTP media (every mesh connection: its carrier track, mesh/carrierLink.ts)
+// does report availableOutgoingBitrate on its selected pair: the send-side bandwidth estimate of
+// the browser's own congestion control (GCC), which session/capacity.ts takes as that connection's
+// capacity (CapacityModel.setKnown).
 // Firefox has no selectedCandidatePairId: it flags the pair `selected`.
 
 /** One stats object (RTCStats and its subtypes) as plain data. */

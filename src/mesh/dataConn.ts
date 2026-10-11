@@ -1,25 +1,29 @@
-// What every connection between two peers has, whether it is the pair's mesh connection
-// (meshConn.ts: adds the `ctl` channel) or one of its media lanes (lane.ts): an RTCPeerConnection
-// with an unreliable `media` channel (fragments) and a reliable `bin` channel (headroom probes:
-// session/headroom.ts; received bytes are dropped), and the same offer/answer handshake.
-import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_LOW, type LinkState, type MediaLink, type ProbeLink } from '../net/link'
+// The media side of a mesh connection (meshConn.ts adds the `ctl` channel): an RTCPeerConnection
+// whose fragments and headroom-probe bytes ride in a VP8 carrier track (carrierLink.ts), and the
+// offer/answer handshake that puts the carrier in the first SDP.
+import type { LinkState, MediaLink, ProbeLink } from '../net/link'
 import { parseLinkStats, type StatsLike } from '../net/linkStats'
 import { after } from '../net/ticker'
-import { tuning } from '../tuning'
+import { CARRIER_MAX_KBPS, carrierConfig, CarrierLink } from './carrierLink'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
 export const CONNECT_TIMEOUT_MS = 15_000
 
 /**
- * What the mesh, the lanes and the session use of any connection of a pair, so tests can substitute
- * in-memory ones (tests/fakes/).
+ * What the mesh and the session use of a connection's media side, so tests can substitute in-memory
+ * ones (tests/fakes/).
  */
 export interface PairConn extends MediaLink {
   readonly remoteId: string
   readonly state: LinkState
   readonly wasOpen: boolean
-  /** The `bin` channel as a probe link (see session/headroom.ts). */
+  /** Padding in the carrier, as a probe link (see session/headroom.ts). */
   readonly probeLink: ProbeLink
+  /**
+   * The most it sends (kbps), if it limits itself (the carrier: CARRIER_MAX_KBPS): its capacity is
+   * the browser's estimate, at most this.
+   */
+  readonly maxKbps?: number
   onMedia: (data: Uint8Array) => void
   onStateChange: (state: LinkState) => void
   onBufferLow: () => void
@@ -57,43 +61,12 @@ export async function connStats(pc: RTCPeerConnection): Promise<StatsLike | null
   }
 }
 
-/** A reliable `bin` channel as a ProbeLink: its buffer-low events drive the probe's refills. */
-function binProbeLink(bin: RTCDataChannel, state: () => LinkState): ProbeLink {
-  const link: ProbeLink = {
-    get isOpen() {
-      return bin.readyState === 'open'
-    },
-    get state() {
-      return state()
-    },
-    get bufferedAmount() {
-      return bin.bufferedAmount
-    },
-    onBufferLow: null,
-    send(data: Uint8Array) {
-      if (bin.readyState !== 'open') return false
-      try {
-        bin.send(data as Uint8Array<ArrayBuffer>)
-        return true
-      } catch {
-        // closed between the check and the send
-        return false
-      }
-    },
-  }
-  bin.addEventListener('bufferedamountlow', () => link.onBufferLow?.())
-  return link
-}
-
-/**
- * The real connection, shared by MeshConn and Lane. Subclasses decide which channel opening opens
- * the connection (`setState('open')`).
- */
+/** The real connection's media side; MeshConn decides when it opens (its `ctl` channel). */
 export abstract class DataConn implements PairConn {
   readonly pc: RTCPeerConnection
-  readonly media: RTCDataChannel
-  readonly bin: RTCDataChannel
+  readonly carrier: CarrierLink
   readonly probeLink: ProbeLink
+  readonly maxKbps = CARRIER_MAX_KBPS
   state: LinkState = 'connecting'
   /** Whether this connection was ever open (a failure before that means the pair can't connect). */
   wasOpen = false
@@ -111,41 +84,36 @@ export abstract class DataConn implements PairConn {
     /** Remote peer id (verified by whoever set up the connection). */
     public remoteId: string,
   ) {
-    this.pc = new RTCPeerConnection({ iceServers })
-    // Negotiated ids, the same on every connection (a mesh connection's ctl is id 1).
-    this.media = this.pc.createDataChannel('media', { negotiated: true, id: 0, ordered: false, maxPacketLifeTime: tuning.mediaMaxPacketLifeTimeMs })
-    this.bin = this.pc.createDataChannel('bin', { negotiated: true, id: 2, ordered: true })
-    this.media.binaryType = 'arraybuffer'
-    this.media.bufferedAmountLowThreshold = LINK_BUFFER_LOW
-    this.bin.binaryType = 'arraybuffer'
-    this.bin.bufferedAmountLowThreshold = BACKGROUND_BUFFER_MAX / 2
-    this.probeLink = binProbeLink(this.bin, () => this.state)
-    this.media.onbufferedamountlow = () => this.onBufferLow()
-    this.media.onmessage = (ev) => this.onMedia(new Uint8Array(ev.data as ArrayBuffer))
+    this.pc = new RTCPeerConnection({ iceServers, ...carrierConfig() })
+    this.carrier = new CarrierLink(
+      this.pc,
+      () => this.isOpen,
+      () => this.state,
+      () => this.setState('failed'),
+    )
+    this.carrier.onMedia = (data) => this.onMedia(data)
+    this.carrier.onBufferLow = () => this.onBufferLow()
+    this.probeLink = this.carrier.probeLink
     this.pc.onconnectionstatechange = () => {
-      if (this.pc.connectionState === 'failed') this.setState('failed')
-      if (this.pc.connectionState === 'closed') this.setState('closed')
+      const s = this.pc.connectionState
+      if (s === 'connected') this.carrier.start()
+      else if (s === 'failed') this.setState('failed')
+      else if (s === 'closed') this.setState('closed')
     }
   }
 
   get isOpen(): boolean {
-    return this.state === 'open' && this.media.readyState === 'open'
+    return this.state === 'open'
   }
 
+  /** Bytes handed to the carrier and not yet in a frame. */
   get bufferedAmount(): number {
-    return this.media.bufferedAmount
+    return this.carrier.bufferedAmount
   }
 
-  /** Sends a media fragment (unreliable channel). */
+  /** Sends a media fragment in the carrier. */
   send(data: Uint8Array): boolean {
-    if (!this.isOpen) return false
-    try {
-      this.media.send(data as Uint8Array<ArrayBuffer>)
-      return true
-    } catch {
-      // closed between the check and the send
-      return false
-    }
+    return this.carrier.send(data)
   }
 
   /**
@@ -160,20 +128,23 @@ export abstract class DataConn implements PairConn {
   }
 
   async createOffer(): Promise<string> {
+    this.carrier.addForOffer()
     await this.pc.setLocalDescription(await this.pc.createOffer())
     return gatherComplete(this.pc)
   }
 
   async acceptOffer(sdp: string): Promise<string> {
-    await this.pc.setRemoteDescription({ type: 'offer', sdp })
+    this.carrier.addForAnswer()
+    await this.pc.setRemoteDescription({ type: 'offer', sdp: this.carrier.remoteSdp(sdp) })
     this.haveRemote = true
     this.armTimeout()
+    this.carrier.afterRemoteOffer()
     await this.pc.setLocalDescription(await this.pc.createAnswer())
     return gatherComplete(this.pc)
   }
 
   async acceptAnswer(sdp: string): Promise<void> {
-    await this.pc.setRemoteDescription({ type: 'answer', sdp })
+    await this.pc.setRemoteDescription({ type: 'answer', sdp: this.carrier.remoteSdp(sdp) })
     this.haveRemote = true
     this.armTimeout()
   }
@@ -184,8 +155,11 @@ export abstract class DataConn implements PairConn {
     return (report && parseLinkStats(report)?.relayed) ?? null
   }
 
-  stats(): Promise<StatsLike | null> {
-    return connStats(this.pc)
+  /** The getStats() report; its bandwidth estimate also sets the carrier's send rate. */
+  async stats(): Promise<StatsLike | null> {
+    const report = await connStats(this.pc)
+    if (report) this.carrier.noteStats(report)
+    return report
   }
 
   close(): void {
@@ -198,6 +172,7 @@ export abstract class DataConn implements PairConn {
     if (state === 'open') this.wasOpen = true
     if (state !== 'connecting') this.timeout?.()
     if (state === 'closed' || state === 'failed') {
+      this.carrier.close()
       try {
         this.pc.close()
       } catch {

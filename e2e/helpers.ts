@@ -66,7 +66,6 @@ export async function openHost(browser: Browser, streamId: string, o: HostOpts):
   })
   if (o.up === null) q.delete('up')
   if (o.pattern) q.set('pattern', o.pattern)
-  if (process.env.E2E_LANES) q.set('lanes', process.env.E2E_LANES)
   await page.goto(`/#/host?${q}`)
   await page.waitForFunction(() => {
     return !!window.__p2p?.codec
@@ -81,7 +80,6 @@ export async function openViewer(browser: Browser, streamId: string, name: strin
   if (process.env.E2E_CONSOLE) page.on('console', (m) => console.log(`[${name}]`, m.text()))
   const q = new URLSearchParams({ tracker: TRACKER_URL, name, ice: 'none' })
   if (capKbps) q.set('up', String(capKbps))
-  if (process.env.E2E_LANES) q.set('lanes', process.env.E2E_LANES)
   const { joinCode } = await hostIdentity(streamId)
   await page.goto(`/#/lobby/${joinCode}?${q}`)
   return page

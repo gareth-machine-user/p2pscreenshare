@@ -71,14 +71,15 @@ test('getStats: real fields, RTT refresh cadence, and the per-link stats the app
   console.log('update gaps (ms):', gaps.join(' '))
   expect(cadence.length).toBeGreaterThan(2)
 
-  // The app's per-link stats (polled every 2 s): every connection to the viewer has an RTT and a baseline.
-  const links = await waitFor(
-    () => host.evaluate((id) => (window.__p2p as Any).linkStatsFor(id) as Any[], viewerId),
-    (ls) => ls.length > 0 && ls.every((l: Any) => l.rttMs !== null && l.baselineMs !== null && l.fresh),
+  // The app's link stats (polled every 2 s): the connection to the viewer has an RTT, a baseline,
+  // and the browser's bandwidth estimate for its carrier track.
+  const link = await waitFor(
+    () => host.evaluate((id) => (window.__p2p as Any).linkStatsFor(id) as Any, viewerId),
+    (l) => !!l && l.rttMs !== null && l.baselineMs !== null && l.fresh && l.estimateKbps > 0,
     20_000,
-    'per-link stats',
+    'link stats',
   )
-  console.log('app link stats:', JSON.stringify(links))
+  console.log('app link stats:', JSON.stringify(link))
 
   // The presenter bar shows a live, non-zero upload figure while streaming.
   const upload = host.getByTestId('live-upload')
@@ -102,14 +103,16 @@ test('getStats: real fields, RTT refresh cadence, and the per-link stats the app
   await expect(host.locator(`[data-testid="topo-row"][data-peer="${viewerId}"] [data-testid="topo-num"]`)).toHaveText('#1')
   expect(await host.locator('[data-testid="tree-label"]').allTextContents()).toContain('P')
 
-  // The Peers panel: live sending / receiving per peer, and a row per connection when expanded.
+  // The Peers panel: live sending / receiving per peer, and the connection's details when expanded.
   await host.getByTestId('tab-peers').click()
   const row = host.locator(`[data-testid="peer-row"][data-peer="${viewerId}"]`)
   await expect(row.getByTestId('live-send')).toHaveText(/\d\.\d+ Mbps/)
-  await row.getByTestId('expand-lanes').click()
-  await expect(host.locator(`[data-testid="lane-row"][data-peer="${viewerId}"]`).first()).toBeVisible()
+  await row.getByTestId('expand-link').click()
+  const details = host.locator(`[data-testid="link-row"][data-peer="${viewerId}"]`)
+  await expect(details).toBeVisible()
+  await expect(details).toContainText('estimate')
   console.log('peer row:', (await row.textContent())?.replace(/\s+/g, ' '))
-  console.log('lane rows:', (await host.locator(`[data-testid="lane-row"][data-peer="${viewerId}"]`).allTextContents()).map((t) => t.replace(/\s+/g, ' ')).join(' | '))
+  console.log('link row:', (await details.textContent())?.replace(/\s+/g, ' '))
 
   // The viewer's Stats overlay: what it receives right now.
   await viewer.getByTestId('stage').hover()

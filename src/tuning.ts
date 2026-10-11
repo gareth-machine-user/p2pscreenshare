@@ -15,8 +15,6 @@ export interface Tuning {
   playoutQuantile: number
   playoutSafetyMs: number
   playoutMinDelayMs: number
-  /** How long the media data channel keeps retransmitting a lost packet (ms). */
-  mediaMaxPacketLifeTimeMs: number
   /** A stripe silent this long means its parent is gone or stalled (ms). */
   stripeSilenceMs: number
   keyframeIntervalMs: number
@@ -31,7 +29,6 @@ const PROFILES: Record<Tuning['priority'], Tuning> = {
     playoutQuantile: 0.99,
     playoutSafetyMs: 120,
     playoutMinDelayMs: 150,
-    mediaMaxPacketLifeTimeMs: 3000,
     stripeSilenceMs: 1500,
     // Keyframes are expensive (and in constant-bitrate mode each one briefly blurs the picture to
     // fit the budget), so they come rarely: joiners start from relays' cached GOP, and a viewer
@@ -46,7 +43,6 @@ const PROFILES: Record<Tuning['priority'], Tuning> = {
     playoutQuantile: 0.95,
     playoutSafetyMs: 40,
     playoutMinDelayMs: 30,
-    mediaMaxPacketLifeTimeMs: 1000,
     stripeSilenceMs: 1000,
     keyframeIntervalMs: 2000,
   },

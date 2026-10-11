@@ -4,9 +4,10 @@
   import type { PublishPolicy } from '../mesh/auth'
   import { canCaptureScreen } from '../media/capture'
   import { DEFAULT_ICE } from '../net/bootstrap'
+  import { carrierUnsupported } from '../mesh/carrierLink'
   import { PeerSession } from '../session/peerSession'
   import type { ShareOptions } from '../session/publishedStream'
-  import { iceFrom, lanesFrom, lobbyUrl, randomId, trackersFrom } from './route'
+  import { iceFrom, lobbyUrl, randomId, trackersFrom } from './route'
   import { applyAutoQuality, lobbyPeople, peerBadges, playbackReadout, resolveShareOptions, stageMessage, startErrorText } from './lobbyView'
   import { ownerSeed, saveSettings, settings } from './settings.svelte'
   import { maxSizeFor, targetKbps } from '../media/quality'
@@ -84,6 +85,12 @@
   let destroyed = false
 
   async function init(): Promise<void> {
+    // Media rides in a carrier video track (mesh/carrierLink.ts): no fallback without its APIs.
+    const missing = carrierUnsupported()
+    if (missing) {
+      initError = `This browser isn't supported: it lacks ${missing}. Try a recent Chrome, Edge, Firefox or Safari.`
+      return
+    }
     ownerId = await ownerIdFromCode(joinCode)
     if (!ownerId) {
       invalid = true
@@ -101,7 +108,6 @@
       iceServers,
       capKbps: capParam ? Number(capParam) : null,
       block: params.get('block')?.split(',').filter(Boolean),
-      lanes: lanesFrom(params),
     })
     s.onChange = onChange
     s.quality = settings.view.quality

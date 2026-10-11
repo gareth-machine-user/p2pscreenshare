@@ -6,15 +6,14 @@
 // attempt fails at its deadline, as ICE would). FakeRendezvous stands in for the tracker: every
 // door offers itself to every seeker and door in the lobby, with the mesh's own answer/admit rules.
 //
-// Media lanes (mesh/lanes.ts) are FakeLanes, made by `laneFactory`, with the same handshake. Each
-// connection end (a FakeConn or a FakeLane) has a media and a bin channel that share the
-// connection's send rate, `connRateBytesPerS` (null: unlimited), like one SCTP association's
-// congestion window: sends queue up in `bufferedAmount` and buffer-low events fire as it drains.
+// Each connection end has one media path, as the real carrier (mesh/carrierLink.ts) is: media
+// fragments, and its probe link's padding (which the receiver drops), share the connection's send
+// rate, `connRateBytesPerS` (null: unlimited), like the browser's estimate for the carrier: sends
+// queue up in `bufferedAmount` and buffer-low events fire as it drains.
 //
 // Everything is driven by timers, so tests run it under fake timers (see clock.ts).
 import type { RendezvousOptions, RendezvousPort } from '../../src/net/bootstrap'
 import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../../src/net/link'
-import type { LaneConn } from '../../src/mesh/lane'
 import type { Ctl, PeerConn } from '../../src/mesh/meshConn'
 import type { PairConn } from '../../src/mesh/dataConn'
 import { every } from '../../src/net/ticker'
@@ -27,21 +26,17 @@ export interface FakeNetworkOptions {
   delayMs?: number
   /** Chance that a message between two peers is dropped (0..1; the ctl channel is reliable, so keep 0 unless testing loss). */
   loss?: number
-  /** Send rate of each connection's media + bin channels (bytes/s); null: unlimited. */
+  /** Send rate of each connection's media path, padding included (bytes/s); null: unlimited. */
   connRateBytesPerS?: number | null
 }
 
 export class FakeNetwork {
   readonly delayMs: number
   loss: number
-  /** Send rate of each connection (bytes/s, media and bin together); null: unlimited. */
+  /** Send rate of each connection (bytes/s, media and padding together); null: unlimited. */
   connRateBytesPerS: number | null
-  /** Pairs whose lanes can't connect (their mesh links still can). */
-  private laneBlocked = new Set<string>()
   /** Pairs whose selected path is relayed by TURN (usesRelay() says so). */
   private relayedPairs = new Set<string>()
-  /** Every lane made, for assertions. */
-  readonly lanes: FakeLane[] = []
   /** Pairs that can't connect (as if ICE failed); key from pairKey. */
   private blockedPairs = new Set<string>()
   /** Pairs whose traffic is dropped (a partition: open links stay "open" but go silent). */
@@ -51,7 +46,7 @@ export class FakeNetwork {
   /** Pairs whose ctl channels hold every message until releaseCtl (an SCTP retransmission stall). */
   private ctlStalled = new Set<string>()
   private ctlHeld: (() => void)[] = []
-  /** Pending offers and answers of mesh links and lanes alike, by token. */
+  /** Pending offers and answers, by token. */
   private offers = new Map<string, object>()
   private answers = new Map<string, object>()
   private rendezvous: FakeRendezvous[] = []
@@ -65,20 +60,6 @@ export class FakeNetwork {
     this.connRateBytesPerS = opts.connRateBytesPerS ?? null
   }
 
-  /** The lane factory for the peer `localId` (Mesh's `connectLane` option). */
-  laneFactory(localId: string): (iceServers: RTCIceServer[], remoteId: string, index: number) => FakeLane {
-    return (_ice, remoteId, index) => {
-      const l = new FakeLane(this, localId, remoteId, index, `l${++this.seq}`)
-      this.lanes.push(l)
-      return l
-    }
-  }
-
-  /** Lanes between the pair fail to connect (as if ICE failed); their mesh link is unaffected. */
-  blockLanes(a: string, b: string): void {
-    this.laneBlocked.add(pairKey(a, b))
-  }
-
   /** The pair's mesh link reports a TURN-relayed path. */
   setRelayed(a: string, b: string): void {
     this.relayedPairs.add(pairKey(a, b))
@@ -86,15 +67,6 @@ export class FakeNetwork {
 
   isRelayed(a: string, b: string): boolean {
     return this.relayedPairs.has(pairKey(a, b))
-  }
-
-  canConnectLane(a: string, b: string): boolean {
-    return this.canConnect(a, b) && !this.laneBlocked.has(pairKey(a, b))
-  }
-
-  /** Open lanes `localId` holds towards `remoteId`. */
-  openLanes(localId: string, remoteId: string): FakeLane[] {
-    return this.lanes.filter((l) => l.localId === localId && l.remoteId === remoteId && l.state === 'open')
   }
 
   /** The connection factory for the peer `localId` (Mesh's `connect` option). */
@@ -129,7 +101,7 @@ export class FakeNetwork {
 
   /**
    * The pair's ctl channels deliver nothing until releaseCtl, then everything in order, while their
-   * media and bin channels keep flowing: an ordered, reliable stream waiting on a retransmission.
+   * media keeps flowing (the carrier is another transport): an ordered, reliable stream waiting on a retransmission.
    */
   stallCtl(a: string, b: string): void {
     this.ctlStalled.add(pairKey(a, b))
@@ -152,7 +124,6 @@ export class FakeNetwork {
   }
 
   heal(): void {
-    this.laneBlocked.clear()
     this.blockedPairs.clear()
     this.cutPairs.clear()
     this.isolated.clear()
@@ -228,11 +199,11 @@ interface FakeEnd {
   readonly far: FakeEnd | null
   /** When the connection's send rate frees up (all its channels queue behind each other). */
   wireFreeAt: number
-  receiveData(kind: 'media' | 'bin', data: Uint8Array): void
+  receiveData(kind: 'media' | 'pad', data: Uint8Array): void
 }
 
 /**
- * One channel of a connection end (media or bin), as a ProbeLink: sends leave at the connection's
+ * One send path of a connection end (media, or a probe's padding), as a ProbeLink: sends leave at the connection's
  * rate, meanwhile counting in `bufferedAmount`, and arrive one network delay later.
  */
 export class FakeChannel implements ProbeLink {
@@ -244,7 +215,7 @@ export class FakeChannel implements ProbeLink {
   constructor(
     private net: FakeNetwork,
     private end: FakeEnd,
-    private kind: 'media' | 'bin',
+    private kind: 'media' | 'pad',
   ) {}
 
   get isOpen(): boolean {
@@ -287,8 +258,8 @@ export class FakeChannel implements ProbeLink {
 }
 
 /**
- * What a FakeConn and a FakeLane share, as DataConn (src/mesh/dataConn.ts) does for the real ones:
- * a media and a bin channel and the offer/answer handshake. An "SDP" is a token naming the
+ * What DataConn (src/mesh/dataConn.ts) is for a MeshConn: the media path (with its probe padding)
+ * and the offer/answer handshake. An "SDP" is a token naming the
  * connection; the pair opens a round trip after the offerer accepts the answer, unless the network
  * keeps them apart (then both sides fail at their deadlines, as ICE would).
  */
@@ -300,7 +271,8 @@ abstract class FakeDataConn<P extends FakeDataConn<P>> implements PairConn, Fake
   peer: P | null = null
   wireFreeAt = 0
   readonly media: FakeChannel
-  readonly bin: FakeChannel
+  /** The probe link: padding, sharing the media path's rate. */
+  readonly pad: FakeChannel
   onMedia: (data: Uint8Array) => void = () => {}
   onStateChange: (state: LinkState) => void = () => {}
   onBufferLow: () => void = () => {}
@@ -315,11 +287,11 @@ abstract class FakeDataConn<P extends FakeDataConn<P>> implements PairConn, Fake
     this.media = new FakeChannel(net, this, 'media')
     this.media.bufferLowThreshold = LINK_BUFFER_LOW
     this.media.onBufferLow = () => this.onBufferLow()
-    this.bin = new FakeChannel(net, this, 'bin')
-    this.bin.bufferLowThreshold = BACKGROUND_BUFFER_MAX / 2
+    this.pad = new FakeChannel(net, this, 'pad')
+    this.pad.bufferLowThreshold = BACKGROUND_BUFFER_MAX / 2
   }
 
-  /** Whether the network lets the pair open (lanes can be blocked on their own). */
+  /** Whether the network lets the pair open. */
   protected abstract canOpen(a: string, b: string): boolean
 
   get isOpen(): boolean {
@@ -335,15 +307,15 @@ abstract class FakeDataConn<P extends FakeDataConn<P>> implements PairConn, Fake
   }
 
   get probeLink(): ProbeLink {
-    return this.bin
+    return this.pad
   }
 
   send(data: Uint8Array): boolean {
     return this.media.send(data)
   }
 
-  receiveData(kind: 'media' | 'bin', data: Uint8Array): void {
-    // The bin channel's bytes are dropped, as in the real connections.
+  receiveData(kind: 'media' | 'pad', data: Uint8Array): void {
+    // Padding is dropped, as in the real connections.
     if (kind === 'media') this.onMedia(data)
   }
 
@@ -477,30 +449,6 @@ export class FakeConn extends FakeDataConn<FakeConn> implements PeerConn {
     this.rttMs = this.rttMs === null ? rtt : this.rttMs * 0.8 + rtt * 0.2
     this.pingSentAt = null
     w.resolve(remoteClock)
-  }
-}
-
-/** A media lane in memory. */
-export class FakeLane extends FakeDataConn<FakeLane> implements LaneConn {
-  constructor(
-    net: FakeNetwork,
-    localId: string,
-    remoteId: string,
-    readonly index: number,
-    token: string,
-  ) {
-    super(net, localId, remoteId, token)
-  }
-
-  protected canOpen(a: string, b: string): boolean {
-    return this.net.canConnectLane(a, b)
-  }
-
-  /** Tests: the lane's connection fails (as if its path died), on both ends. */
-  fail(): void {
-    const peer = this.peer
-    this.setState('failed')
-    peer?.setState('failed')
   }
 }
 

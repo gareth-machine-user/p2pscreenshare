@@ -1,7 +1,7 @@
 import { writeFileSync } from 'node:fs'
 import { test } from '@playwright/test'
 import { closeContexts, openHost, openViewer, viewerSnapshot, waitFor } from './helpers'
-import { blockMainThreadExpr, DIAG_PRESETS, formatTimeline, hostSampleExpr, injectStallExpr, INSTALL_LAG, viewerSampleExpr, type DiagRow } from './diag'
+import { blockMainThreadExpr, DIAG_PRESETS, formatTimeline, hostSampleExpr, INSTALL_LAG, viewerSampleExpr, type DiagRow } from './diag'
 
 // Opt-in diagnostic (E2E_DIAG=1): a presenter and one viewer on this machine, no upload cap, at a
 // high quality preset, with a high-entropy test pattern (the encoder runs at its full bitrate).
@@ -14,7 +14,6 @@ import { blockMainThreadExpr, DIAG_PRESETS, formatTimeline, hostSampleExpr, inje
 // Presets (e2e/diag.ts): ultra (1080p 16 Mbps), hi (1080p 8 Mbps), 4k (2160p 20 Mbps), auto (1080p
 // 2.5 Mbps, Auto quality). DIAG_PATTERN=bars: the plain test pattern (~2 Mbps whatever the
 // preset); bursty: still, with a burst of motion every 4 s (a mostly static screen).
-// DIAG_STALL=lane,ms,everyMs emulates SCTP association stalls on one presenter connection;
 // DIAG_BLOCK=ms,everyMs blocks the presenter's main thread. DIAG_UP=kbps caps the presenter's upload.
 // Playwright keeps every page visible; tools/diag-tabs.ts runs the same with real background tabs.
 
@@ -47,12 +46,6 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
   const hostId = await host.evaluate(() => window.__p2p!.selfId)
   await host.evaluate(INSTALL_LAG)
   await viewer.evaluate(INSTALL_LAG)
-  // DIAG_STALL=lane,ms,everyMs: emulate association stalls on one of the presenter's connections.
-  if (process.env.DIAG_STALL) {
-    const [lane, ms, every] = process.env.DIAG_STALL.split(',').map(Number)
-    await waitFor(() => host.evaluate<boolean>(injectStallExpr(viewerId, lane, ms, every)), (ok) => ok, 20_000, `lane ${lane} to stall`)
-  }
-
   // DIAG_BLOCK=ms,everyMs: block the presenter's main thread (an overloaded computer).
   if (process.env.DIAG_BLOCK) {
     const [ms, every] = process.env.DIAG_BLOCK.split(',').map(Number)

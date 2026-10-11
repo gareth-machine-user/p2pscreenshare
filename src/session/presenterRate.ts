@@ -14,7 +14,7 @@ export interface RateStatus {
   uplinkKbps: number | null
   medianPeerKbps: number | null
   feasibleKbps: number | null
-  stalledLanes: number
+  stalledLinks: number
 }
 
 export class PresenterRate {
@@ -80,7 +80,7 @@ export class PresenterRate {
       if (!this.settle.settled(now, peer) || !this.connsSettled(peer)) return null
       const c = this.capacity.peer(peer)
       // Only a limit counts: a connection that was its own bottleneck, or one whose browser
-      // estimates its bandwidth (an RTP lane: CapacityModel.setKnown). A peer fed only some
+      // estimates its bandwidth (the carrier: CapacityModel.setKnown). A peer fed only some
       // stripes needs only that share of a full copy.
       return c.bound && c.kbps !== null ? (c.kbps * stripes) / e : null
     })
@@ -119,7 +119,7 @@ export class PresenterRate {
   }
 
   /** The bitrate and what sets it, in numbers. Null when not presenting. */
-  status(s: PublishedStream | null, stalledLanes: number): RateStatus | null {
+  status(s: PublishedStream | null, stalledLinks: number): RateStatus | null {
     const full = s?.full
     if (!s || !full) return null
     const t = this.target
@@ -131,7 +131,7 @@ export class PresenterRate {
       uplinkKbps: this.capacity.uplinkKbps === null ? null : Math.round(this.capacity.uplinkKbps),
       medianPeerKbps: t?.medianPeerKbps == null ? null : Math.round(t.medianPeerKbps),
       feasibleKbps: full.limited?.feasibleKbps ?? null,
-      stalledLanes,
+      stalledLinks,
     }
   }
 }

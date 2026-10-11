@@ -77,7 +77,7 @@
     <div><span>Your slots / children</span><b>{view.pub.rootSlots} / {view.pub.children}</b></div>
     <div><span>Overcommitted</span><b>{view.pub.overcommitted}</b></div>
   </div>
-  <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.rate ? rateReason(view.rate) : null} stalledLanes={view.rate?.stalledLanes ?? 0} {clamp} />
+  <FrameStats encoder={view.encoderRates} uplink={view.uplinkRates} adapting={view.rate ? rateReason(view.rate) : null} stalledLinks={view.rate?.stalledLinks ?? 0} {clamp} />
   <PeerRates rows={view.peers} />
 {:else}
   <div class="stats-grid" data-testid="viewer-stats">

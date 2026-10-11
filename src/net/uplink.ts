@@ -9,17 +9,14 @@ const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
 
 /**
  * A connection whose send buffer holds more than LINK_BUFFER_LOW and hasn't drained a byte for this
- * long is stalled (ms). A path at any rate drains something every round trip; what stops a whole
- * SCTP association instead is loss recovery by retransmission timeout (Chromium's minimum is
- * ~400 ms, doubling on each repeat), e.g. after a burst overflowed the connection's 64 KB UDP
- * socket buffer. A stall is that connection's alone: its windows say nothing about capacity.
+ * long is stalled (ms). Its carrier packs something every frame at any healthy rate; what stops it
+ * is a frozen worker or page, or an estimate collapsed so far that one fragment takes longer than
+ * this to earn (16 KiB at ~170 kbps). A stall says nothing about the uplink's capacity.
  */
 export const STALL_MS = 750
 /**
- * ...or this many of the path's round trips, if longer: on a long path the retransmission timeout
- * is (Chromium's is the round trip plus four times its variation), and a loss recovered by it held
- * every window of a 300 ms path with 0.5% loss "stalled", which left none to measure capacity with
- * and kept moving trees between connections that were all just recovering losses.
+ * ...or this many of the path's round trips, if longer: on a long path the browser's congestion
+ * control reacts that much more slowly, and a short pause there is no stall.
  */
 export const STALL_RTTS = 4
 
@@ -74,7 +71,7 @@ export interface LinkCounters {
 }
 
 /**
- * One connection's counters at one moment: its media channel and its bin channel (headroom probes)
+ * One connection's counters at one moment: its media link and its probe link (headroom padding)
  * together. Two of them make a capacity window (session/capacity.ts linkWindow).
  */
 export interface LinkSnap {
@@ -102,7 +99,7 @@ export interface LinkSnap {
 /** Everything the uplink keeps for one link. */
 interface LinkEntry {
   queue: Item[]
-  /** Only spare upload (a headroom probe's `bin` channel): see setBackground. */
+  /** Only spare upload (a headroom probe's padding): see setBackground. */
   background: boolean
   /** Frames that already lost a fragment here (until when to remember them). */
   dead: Map<string, number>
@@ -124,7 +121,7 @@ export interface UplinkStats {
   droppedBackground: number
   /** GOP-cache replay items dropped (a new child's catch-up, not live media: not a congestion signal). */
   droppedReplay: number
-  /** Items the data channel refused (link closing). */
+  /** Items the link refused (closing). */
   sendFailed: number
   /** Drains that found a media link's send buffer full while live media waited for it (not probes or replays). */
   bufferStalls: number
@@ -271,7 +268,7 @@ export class Uplink {
   }
 
   /**
-   * Marks a link as background (a headroom probe's `bin` channel): its traffic only uses spare
+   * Marks a link as background (a headroom probe's padding link): its traffic only uses spare
    * upload, served when no media is waiting and only while its send buffer holds at most
    * BACKGROUND_BUFFER_MAX.
    */
@@ -299,25 +296,6 @@ export class Uplink {
     else q.push(item)
     this.stats.queuedBytes += data.byteLength
     this.markBusy(e.counters, true, item.enqueuedAt)
-    this.drain()
-  }
-
-  /**
-   * Moves what waits for `from` (live media and replays, not background) to `to`, merged by queueing
-   * time: `from` stalled, and its stripes now go over `to`.
-   */
-  moveQueued(from: MediaLink, to: MediaLink): void {
-    const src = this.links.get(from)
-    if (!src?.queue.length || from === to || src.background) return
-    const dst = this.entry(to)
-    if (dst.background) return
-    // Live before replays, each in queueing order (as send() keeps them).
-    const merged = [...dst.queue, ...src.queue].sort((a, b) => Number(a.replay) - Number(b.replay) || a.enqueuedAt - b.enqueuedAt)
-    dst.queue = merged
-    src.queue = []
-    const now = performance.now()
-    this.markBusy(src.counters, false, now)
-    this.markBusy(dst.counters, true, now)
     this.drain()
   }
 
@@ -409,9 +387,9 @@ export class Uplink {
           // Background links (probes) are bounded below, by BACKGROUND_BUFFER_MAX.
           if (!q.length || (!e.background && link.bufferedAmount > LINK_BUFFER_HIGH)) continue
           const it = q[0]
-          // Catch-up replays and probes only go out while the channel's send buffer is nearly
-          // empty: a mesh link's channels share one connection, so a deep backlog of either would
-          // hold up live media (audio especially) inside it.
+          // Catch-up replays and probes only go out while the link's send buffer is nearly empty:
+          // the carrier packs in order, so a deep backlog of either would hold up live media
+          // (audio especially) inside it.
           if ((it.replay || e.background) && link.bufferedAmount > BACKGROUND_BUFFER_MAX) continue
           // Tokens may go negative (debt), so messages larger than the burst still get through.
           if (this.capKbps !== null && this.tokens <= 0) {

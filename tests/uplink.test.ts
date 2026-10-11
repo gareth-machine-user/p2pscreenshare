@@ -323,27 +323,6 @@ describe('Uplink stall detection', () => {
     expect(u.isStalled(a)).toBe(true)
   })
 
-  it('moves what waits for a stalled link to another, in queueing order, live before replays', () => {
-    const u = new Uplink()
-    const a = new StubLink('a')
-    const b = new StubLink('b')
-    a.block()
-    b.block()
-    u.send(a, msg(1), 0)
-    u.send(a, msg(2), 0, undefined, true)
-    vi.advanceTimersByTime(5)
-    u.send(b, msg(3), 0)
-    vi.advanceTimersByTime(5)
-    u.send(a, msg(4), 1)
-    u.moveQueued(a, b)
-    expect(u.queued(a)).toBe(0)
-    expect(u.queued(b)).toBe(4)
-    b.unblock()
-    u.kick()
-    expect(sentBy('b')).toEqual([1, 3, 4, 2])
-    expect(sentBy('a')).toEqual([])
-  })
-
   it('never calls a nearly empty or closed link stalled', () => {
     const u = new Uplink()
     const a = new BufferLink('a')

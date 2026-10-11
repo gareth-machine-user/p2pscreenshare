@@ -18,35 +18,32 @@ export function sumKbps(xs: (number | null | undefined)[]): number | null {
   return out
 }
 
-/** One peer's live figures from its connections (Peers panel). */
+/** One peer's live figures from its connection (Peers panel). */
 export interface PeerLive {
   sendKbps: number | null
   recvKbps: number | null
-  /** Path RTT now and its baseline: the mesh link's (lane 0), else the first connection with one. */
+  /** Path RTT now and its baseline. */
   rttMs: number | null
   baselineMs: number | null
-  /** What your connections to it carry together (session/capacity.ts), and whether that was its own limit. */
+  /** What your connection to it carries (session/capacity.ts), and whether that was its own limit. */
   capKbps: number | null
   bound: boolean
-  /** Some connection to it stalled in the last window. */
+  /** The connection stalled in the last window. */
   stalled: boolean
-  /** Per-connection breakdown, for a tooltip. */
+  /** A one-line summary, for a tooltip. */
   breakdown: string
 }
 
-export function peerLive(links: LinkRow[]): PeerLive {
-  const withRtt = links.find((l) => l.lane === 0 && l.rttMs !== null) ?? links.find((l) => l.rttMs !== null)
+export function peerLive(link: LinkRow | null): PeerLive {
   return {
-    sendKbps: sumKbps(links.map((l) => l.sendKbps)),
-    recvKbps: sumKbps(links.map((l) => l.recvKbps)),
-    rttMs: withRtt?.rttMs ?? null,
-    baselineMs: withRtt?.baselineMs ?? null,
-    capKbps: sumKbps(links.map((l) => l.capKbps)),
-    bound: links.some((l) => l.bound),
-    stalled: links.some((l) => l.stalled),
-    breakdown: links
-      .map((l) => `${l.lane === 0 ? 'mesh link' : `lane ${l.lane}`}: ↑ ${fmtKbps(l.sendKbps)} ↓ ${fmtKbps(l.recvKbps)}, RTT ${fmtMs(l.rttMs)}${l.stalled ? ', stalled' : ''}`)
-      .join('\n'),
+    sendKbps: link?.sendKbps ?? null,
+    recvKbps: link?.recvKbps ?? null,
+    rttMs: link?.rttMs ?? null,
+    baselineMs: link?.baselineMs ?? null,
+    capKbps: link?.capKbps ?? null,
+    bound: link?.bound ?? false,
+    stalled: link?.stalled ?? false,
+    breakdown: link ? `↑ ${fmtKbps(link.sendKbps)} ↓ ${fmtKbps(link.recvKbps)}, RTT ${fmtMs(link.rttMs)}${link.stalled ? ', stalled' : ''}` : '',
   }
 }
 
@@ -65,8 +62,8 @@ export interface LivePeerRow extends PeerLive {
   name: string
   self: boolean
   estKbps: number | null
-  /** Connections to it (getStats rows); empty for yourself or members you have no link to. */
-  links: LinkRow[]
+  /** Your connection to it (getStats); null for yourself or members you have no link to. */
+  link: LinkRow | null
   /** You have an open connection with live stats to it. */
   direct: boolean
 }
@@ -79,18 +76,18 @@ export interface LivePeerRow extends PeerLive {
 export function livePeers(o: {
   selfId: string
   members: MemberInfo[]
-  linksFor: (id: string) => LinkRow[]
+  linkFor: (id: string) => LinkRow | null
   totals: { sendKbps: number | null; recvKbps: number | null }
 }): LivePeerRow[] {
   return [...o.members]
     .sort((a, b) => a.joinedAt - b.joinedAt || (a.id < b.id ? -1 : 1))
     .map((m) => {
       const self = m.id === o.selfId
-      const links = self ? [] : o.linksFor(m.id)
+      const link = self ? null : o.linkFor(m.id)
       const live = self
         ? { sendKbps: o.totals.sendKbps, recvKbps: o.totals.recvKbps, rttMs: null, baselineMs: null, capKbps: null, bound: false, stalled: false, breakdown: 'Your totals across all connections' }
-        : peerLive(links)
-      return { id: m.id, name: m.name || m.id.slice(0, 6), self, estKbps: m.capacityKbps, links, direct: links.length > 0, ...live }
+        : peerLive(link)
+      return { id: m.id, name: m.name || m.id.slice(0, 6), self, estKbps: m.capacityKbps, link, direct: link !== null, ...live }
     })
 }
 
@@ -99,7 +96,7 @@ export function sessionPeers(s: PeerSession): LivePeerRow[] {
   return livePeers({
     selfId: s.mesh.selfId,
     members: [s.mesh.record, ...s.mesh.members()],
-    linksFor: (id) => s.linkStatsFor(id),
+    linkFor: (id) => s.linkStatsFor(id),
     totals: s.liveRates(),
   })
 }

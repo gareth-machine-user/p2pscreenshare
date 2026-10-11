@@ -10,8 +10,7 @@
     onkick = null,
   }: { session: PeerSession; badges: (id: string) => string[]; tick: number; onkick?: ((id: string) => void) | null } = $props()
 
-  const fmtBytes = (b: number) => (b >= 1024 ? `${Math.round(b / 1024)} KB` : `${b} B`)
-  /** Peers whose per-connection rows are shown. */
+  /** Peers whose connection details are shown. */
   let expanded = $state(new Set<string>())
   function toggle(id: string): void {
     const next = new Set(expanded)
@@ -19,7 +18,7 @@
     expanded = next
   }
 
-  // Membership comes from gossip records; the live columns from this peer's own per-connection
+  // Membership comes from gossip records; the live columns from this peer's own connection
   // stats (getStats every 2 s, uplink counters), re-read every tick.
   const rows = $derived.by(() => {
     void tick
@@ -37,9 +36,7 @@
         name: p.name,
         self,
         status: self ? 'you' : mesh.linkStatus(r.id),
-        // Media lanes: open connections to this peer (mesh/lanes.ts); TURN-relayed pairs use one.
-        lanes: self ? 0 : mesh.laneCount(r.id),
-        turn: !self && mesh.lanes.relayed(r.id),
+        turn: !self && !!p.link?.relayed,
         // Path RTT from getStats; before the first poll, the gossiped one.
         rtt: self ? null : (p.rttMs ?? mesh.record.rtt[r.id] ?? r.rtt[mesh.selfId] ?? null),
         baseline: p.baselineMs,
@@ -52,7 +49,7 @@
         send: p.sendKbps,
         recv: p.recvKbps,
         breakdown: p.breakdown,
-        links: p.links,
+        link: p.link,
         inflationMs: path?.inflationMs ?? null,
         pathQueued: path?.queued ?? false,
         unreachable: unreachable.size,
@@ -69,11 +66,11 @@
     <thead>
       <tr>
         <th>Peer</th>
-        <th title="Live: what you send to this peer right now (all connections, on the wire, last 2 s)">Sending</th>
+        <th title="Live: what you send to this peer right now (on the wire, last 2 s)">Sending</th>
         <th title="Live: what you receive from this peer right now (on the wire, last 2 s)">Receiving</th>
         <th title="Path round-trip time now / its 2-minute minimum (ICE candidate pair)">RTT now / base</th>
         <th>Link</th>
-        <th title="What your connections to this peer carry (most delivered while they were backlogged, or in the last headroom probe); &quot;limit&quot;: the peer's own connection was the bottleneck">Carries</th>
+        <th title="What your connection to this peer carries (the browser's bandwidth estimate for it, capped); &quot;limit&quot;: it was the bottleneck">Carries</th>
         <th class="secondary" title="The peer's uplink capacity as it measured and gossips it; not current use">Est. upload</th>
         <th>Unreachable</th>
         {#if onkick}<th></th>{/if}
@@ -83,8 +80,8 @@
       {#each rows as r (r.id)}
         <tr data-testid="peer-row" data-peer={r.id}>
           <td title={r.id}>
-            {#if r.links.length}
-              <button class="expand" data-testid="expand-lanes" aria-expanded={expanded.has(r.id)} title="Per-connection stats" onclick={() => toggle(r.id)}>{expanded.has(r.id) ? '▾' : '▸'}</button>
+            {#if r.link}
+              <button class="expand" data-testid="expand-link" aria-expanded={expanded.has(r.id)} title="Connection stats" onclick={() => toggle(r.id)}>{expanded.has(r.id) ? '▾' : '▸'}</button>
             {/if}
             {r.name}
             {#each badges(r.id) as b}<span class="badge">{b}</span>{/each}
@@ -96,8 +93,8 @@
             {#if !r.self}{fmtMs(r.rtt)} / {fmtMs(r.baseline)}{/if}
             {#if r.pathQueued}<span class="badge warn" title="Path RTT {r.inflationMs} ms above its baseline: queueing in the network">+{r.inflationMs} ms</span>{/if}
           </td>
-          <td data-testid="link-status">{r.status}{#if r.lanes > 1}<span class="badge" data-testid="lanes" title="Connections carrying media to this peer">{r.lanes} lanes</span>{:else if r.turn}<span class="badge" title="Relayed through TURN: a single connection">TURN</span>{/if}</td>
-          <td data-testid="link-capacity">{#if !r.self}{fmtKbps(r.linkCap)}{#if r.bound}<span class="badge warn" title="Its connections were backlogged while the rest of your uplink wasn't: this is what they carry">limit</span>{/if}{/if}</td>
+          <td data-testid="link-status">{r.status}{#if r.turn}<span class="badge" title="Relayed through TURN">TURN</span>{/if}</td>
+          <td data-testid="link-capacity">{#if !r.self}{fmtKbps(r.linkCap)}{#if r.bound}<span class="badge warn" title="Its connection was its own bottleneck (or the browser estimates it): this is what it carries">limit</span>{/if}{/if}</td>
           <td class="secondary" data-testid="est-upload" title="The peer's uplink capacity as it measured and gossips it; not current use">{fmtKbps(r.capacity)}</td>
           <td data-testid="unreachable-count">{r.unreachable || ''}</td>
           {#if onkick}
@@ -106,28 +103,25 @@
             </td>
           {/if}
         </tr>
-        {#if expanded.has(r.id)}
-          {#each r.links as l (l.lane)}
-            <tr class="lane-row" data-testid="lane-row" data-peer={r.id} data-lane={l.lane}>
-              <td colspan={cols}>
-                <span class="lane-name">{l.lane === 0 ? 'mesh link' : `lane ${l.lane}`}</span>
-                <span title="Send / receive rate on the wire (getStats)">↑ {fmtMbps(l.sendKbps)} ↓ {fmtMbps(l.recvKbps)}</span>
-                <span title="Path RTT now / its 2-minute minimum (ICE candidate pair)" class:stale={!l.fresh}>RTT {fmtMs(l.rttMs)} / {fmtMs(l.baselineMs)}{l.fresh ? '' : ' (stale)'}</span>
-                {#if l.queueMs !== null}
-                  <span title="Live media: time queued in the uplink and fragments dropped per second; backlogged: its queue never emptied" class:warn={l.backlogged}>queue {fmtMs(l.queueMs)} · {l.drops} drops/s{l.backlogged ? ' · backlogged' : ''}</span>
-                {/if}
-                {#if l.deliveredKbps !== null || l.capKbps !== null}
-                  <span title="Delivered over the last window (all channels) / what this connection carries">delivered {fmtMbps(l.deliveredKbps)} / carries {fmtMbps(l.capKbps)}{l.bound ? ' (limit)' : ''}</span>
-                {/if}
-                {#if l.estimateKbps !== null}
-                  <span title="The browser's bandwidth estimate for this connection (its congestion control, RTP lanes): what it carries">estimate {fmtMbps(l.estimateKbps)}</span>
-                {/if}
-                {#if l.stalled}<span class="badge warn" title="This connection's send buffer stopped draining for a while (an SCTP stall, not congestion): its stripes moved to another connection meanwhile" data-testid="lane-stalled">stalled</span>{/if}
-                {#if l.relayed}<span class="badge">relayed</span>{/if}
-                {#if l.cwnd !== null}<span title="SCTP congestion window">cwnd {fmtBytes(l.cwnd)}</span>{/if}
-              </td>
-            </tr>
-          {/each}
+        {#if expanded.has(r.id) && r.link}
+          {@const l = r.link}
+          <tr class="link-row" data-testid="link-row" data-peer={r.id}>
+            <td colspan={cols}>
+              <span title="Send / receive rate on the wire (getStats)">↑ {fmtMbps(l.sendKbps)} ↓ {fmtMbps(l.recvKbps)}</span>
+              <span title="Path RTT now / its 2-minute minimum (ICE candidate pair)" class:stale={!l.fresh}>RTT {fmtMs(l.rttMs)} / {fmtMs(l.baselineMs)}{l.fresh ? '' : ' (stale)'}</span>
+              {#if l.queueMs !== null}
+                <span title="Live media: time queued in the uplink and fragments dropped per second; backlogged: its queue never emptied" class:warn={l.backlogged}>queue {fmtMs(l.queueMs)} · {l.drops} drops/s{l.backlogged ? ' · backlogged' : ''}</span>
+              {/if}
+              {#if l.deliveredKbps !== null || l.capKbps !== null}
+                <span title="Delivered over the last window (media and probe padding) / what this connection carries">delivered {fmtMbps(l.deliveredKbps)} / carries {fmtMbps(l.capKbps)}{l.bound ? ' (limit)' : ''}</span>
+              {/if}
+              {#if l.estimateKbps !== null}
+                <span title="The browser's bandwidth estimate for this connection (RTP congestion control on the carrier track)">estimate {fmtMbps(l.estimateKbps)}</span>
+              {/if}
+              {#if l.stalled}<span class="badge warn" title="Its carrier stopped taking bytes for a while" data-testid="link-stalled">stalled</span>{/if}
+              {#if l.relayed}<span class="badge">relayed</span>{/if}
+            </td>
+          </tr>
         {/if}
       {/each}
     </tbody>
@@ -149,19 +143,16 @@
     color: var(--muted);
     cursor: pointer;
   }
-  .lane-row td {
+  .link-row td {
     font-size: 12px;
     color: var(--muted);
     padding-top: 0;
     padding-left: 18px;
     white-space: normal;
   }
-  .lane-row span {
+  .link-row span {
     display: inline-block;
     margin-right: 10px;
-  }
-  .lane-name {
-    min-width: 64px;
   }
   .stale {
     opacity: 0.6;

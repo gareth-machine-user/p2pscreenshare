@@ -1,8 +1,7 @@
 // One mesh connection per pair of peers: a reliable, ordered `ctl` channel (gossip, chat, tree
-// commands, stats) on top of what every connection has (dataConn.ts): an unreliable `media`
-// channel (fragments) and a reliable `bin` channel for headroom probes. A tree edge is just
-// "forward channel X stripe s over this pair's media channel", so joining or switching parents
-// never needs new ICE or DTLS setup.
+// commands, stats) and a VP8 carrier track whose frames carry the media fragments (dataConn.ts,
+// carrierLink.ts). A tree edge is just "forward channel X stripe s over this pair's carrier", so
+// joining or switching parents never needs new ICE or DTLS setup.
 import { wallClock } from '../net/clock'
 import { after } from '../net/ticker'
 import { DataConn, type PairConn } from './dataConn'
@@ -39,7 +38,7 @@ export class MeshConn extends DataConn implements PeerConn {
   /** Liveness: last ping sent, last pong (or any message) received. */
   pingSentAt: number | null = null
   lastHeardAt = performance.now()
-  /** Smoothed ping round-trip time (rides inside SCTP, so it queues behind the connection's backlog). */
+  /** Smoothed ping round-trip time (rides inside the ctl channel's SCTP association). */
   rttMs: number | null = null
 
   onCtl: (msg: Ctl) => void = () => {}
