@@ -566,6 +566,12 @@ Rate control, in both profiles:
     congestion window); such a connection is a *limit*. When most are backlogged together, each
     one's share only says how the uplink was split, so it only raises the estimate. A peer's
     capacity is the sum over its connections.
+  - *The browser's estimate.* A connection that reports one (an RTP lane: getStats
+    `availableOutgoingBitrate` on its selected candidate pair, from the browser's own congestion
+    control; Chromium has none on data-only connections) uses it as its capacity, polled every
+    2 s, and is a limit: delivered-rate windows don't set or cut it (no fast drop of its own),
+    though they still count for the uplink. Headroom probes skip connections without an open
+    `bin` channel.
   - *Headroom discovery*, the only probing (`session/headroom.ts`): once 1 s after the first link
     opens (10 s for a peer not presenting: it only sizes relay offers, and probing during its join
     saturated its uplink just as its stream arrived), then every 30 s (5 s while a capacity

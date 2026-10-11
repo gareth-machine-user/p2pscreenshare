@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { CapacityModel, FROZEN_LAG_MS, SETTLE_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
 import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, JumpGate, MAX_CUT, PROBE_FRESH_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, ViewerSettle, type RateInputs } from '../src/session/congestion'
 import { LINK_BUFFER_HIGH } from '../src/net/link'
+import { PresenterRate } from '../src/session/presenterRate'
+import type { PublishedStream } from '../src/session/publishedStream'
 
 // k=4, m=1 with audio: every direct child gets one full copy, all 5 stripes.
 const K = 4
@@ -439,5 +441,36 @@ describe('viewer settle', () => {
     v.update(SETTLE_MS + 2000, ['a', 'b'])
     expect(v.settled(SETTLE_MS + 2000, 'a')).toBe(false)
     expect(v.settled(10_000 + SETTLE_MS, 'b')).toBe(true)
+  })
+})
+
+describe("a viewer whose capacity is the browser's estimate (an RTP lane)", () => {
+  /** A presenter's stream with one direct child `v` fed every stripe (PublishedStream, as presenterRate.ts reads it). */
+  function stream(): PublishedStream {
+    const full = { stripes: STRIPES, k: K, withAudio: true, kbps: QUALITY, limited: null, subscribers: new Set(['v']), topology: { parents: { v: Array(STRIPES).fill('me') } } }
+    return { full, ceilingKbps: QUALITY, adaptBitrate: (kbps: number) => (full.kbps = kbps) } as unknown as PublishedStream
+  }
+
+  it('is a limit: it counts towards the median once settled, like a peer that was its own bottleneck', () => {
+    const capacity = new CapacityModel()
+    // The uplink has room to spare, and the mesh link to v was never its own bottleneck.
+    capacity.update(0, [{ id: 'v0', peer: 'v', kbps: 200_000, active: true, backlogged: true, stalled: false, queueMs: 0 }], { probe: true })
+    const rate = new PresenterRate('me', capacity, () => true)
+    const s = stream()
+    rate.adapt(s, 0)
+    expect(rate.target).toMatchObject({ limit: 'chosen', medianPeerKbps: null })
+    // Its RTP lane reports 8 Mbps: the peer is bound, its capacity the mesh link's plus the estimate.
+    capacity.setKnown('v1', 'v', 8000)
+    expect(capacity.peer('v')).toEqual({ kbps: 208_000, bound: true })
+    // It counts only once fed SETTLE_MS (ViewerSettle), as any viewer.
+    rate.adapt(s, 2000)
+    expect(rate.target!.medianPeerKbps).toBeNull()
+    rate.adapt(s, SETTLE_MS)
+    expect(rate.target!.medianPeerKbps).toBe(208_000)
+    // With the RTP lane alone (the mesh link closed), the estimate sets the bitrate.
+    capacity.retain(new Set(['v1']))
+    rate.adapt(s, SETTLE_MS + 2000)
+    expect(rate.target).toMatchObject({ limit: 'viewers', medianPeerKbps: 8000 })
+    expect(rate.target!.kbps).toBeCloseTo(settleAt(8000))
   })
 })

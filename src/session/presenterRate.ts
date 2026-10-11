@@ -79,7 +79,9 @@ export class PresenterRate {
       // A newly fed or newly connected child doesn't push back yet: its first windows say little.
       if (!this.settle.settled(now, peer) || !this.connsSettled(peer)) return null
       const c = this.capacity.peer(peer)
-      // A peer fed only some stripes needs only that share of a full copy.
+      // Only a limit counts: a connection that was its own bottleneck, or one whose browser
+      // estimates its bandwidth (an RTP lane: CapacityModel.setKnown). A peer fed only some
+      // stripes needs only that share of a full copy.
       return c.bound && c.kbps !== null ? (c.kbps * stripes) / e : null
     })
     const t = rateTarget({

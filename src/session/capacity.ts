@@ -6,7 +6,9 @@
 // channels, less what its send buffers grew by), every 2 s, and whether it was backlogged meanwhile
 // (its uplink queue never emptied: it carried all it could). Capacity is the most a connection, or
 // the whole uplink, delivered while backlogged over the last 40 s (a max filter, as in BBR), held
-// in between, and raised by whatever is delivered. See CapacityModel.
+// in between, and raised by whatever is delivered. See CapacityModel. A connection whose browser
+// publishes its own bandwidth estimate (an RTP lane: getStats availableOutgoingBitrate) is the
+// exception: that estimate is its capacity (CapacityModel.setKnown).
 import type { LinkSnap } from '../net/uplink'
 import { tuning } from '../tuning'
 
@@ -291,7 +293,8 @@ export class MaxFilter {
 }
 
 /**
- * Per-connection, per-peer and uplink capacity from delivered-rate windows.
+ * Per-connection, per-peer and uplink capacity from delivered-rate windows, or, for a connection
+ * whose browser estimates its bandwidth (an RTP lane), from that estimate.
  *
  * - The uplink's capacity is set by windows in which most active connections were backlogged at
  *   once (the shared uplink carried all it could): the total delivered. Headroom probes are such
@@ -308,12 +311,22 @@ export class MaxFilter {
  * stall says nothing
  * about the link's rate; any stall in a window keeps it from setting the uplink's capacity, though
  * while it is unknown such a window, or probe, gives it a first, low value).
+ *
+ * A connection with a *known* capacity (setKnown: the browser's own congestion control estimates
+ * its bandwidth) reports that estimate, and is `bound`: it is that path's limit, decided by the
+ * browser, which probes and backs off on its own. Its windows still count for the uplink (what it
+ * delivered, and whether it was backlogged, as for any connection), but its own max filter isn't
+ * kept meanwhile, so a delivered-rate measurement never competes with the estimate and no fast
+ * drop of its own cuts the bitrate (the estimate already falls as fast as the browser sees loss or
+ * delay). Cleared, it starts again from nothing, as a new connection would.
  */
 export class CapacityModel {
   readonly uplink = new MaxFilter()
   /** When a headroom probe last measured something (not only transient windows), or -Infinity. */
   probedAt = -Infinity
   private conns = new Map<unknown, { peer: string; filter: MaxFilter; bound: boolean }>()
+  /** Connections whose capacity the browser estimates (kbps), by id. */
+  private known = new Map<unknown, { peer: string; kbps: number }>()
 
   /** The uplink's capacity (kbps), null until measured: what a peer gossips as capacityKbps. */
   get uplinkKbps(): number | null {
@@ -339,13 +352,14 @@ export class CapacityModel {
     const allFull = allActive.filter(full)
     const allShared = allFull.length * 2 > allActive.length
     if (!o.probe) {
-      for (const w of allFull) if (!allShared) this.connFor(w).filter.loaded(now, w.kbps)
+      for (const w of allFull) if (!allShared && !this.known.has(w.id)) this.connFor(w).filter.loaded(now, w.kbps)
       if (allShared) this.uplink.loaded(now, windows.reduce((a, w) => a + w.kbps, 0))
     }
     const active = ok.filter((w) => w.active)
     const backlogged = active.filter(full)
     const shared = backlogged.length * 2 > active.length
     for (const w of ok) {
+      if (this.known.has(w.id)) continue // its capacity is the browser's estimate
       const c = this.connFor(w)
       if (w.active && full(w) && !shared) {
         c.filter.sample(now, w.kbps, w.queueMs)
@@ -370,26 +384,51 @@ export class CapacityModel {
     return c
   }
 
-  /** A peer's capacity: the sum over its connections; `bound` if one of them was its own bottleneck. */
+  /**
+   * The browser's bandwidth estimate for connection `id` to `peer` (kbps), polled from getStats;
+   * null (or no usable number) clears it. While set, it is the connection's capacity (see above).
+   */
+  setKnown(id: unknown, peer: string, kbps: number | null): void {
+    if (kbps === null || !Number.isFinite(kbps) || kbps < 0) {
+      this.known.delete(id)
+      return
+    }
+    // What its windows measured before is forgotten: if the estimate goes away, it measures afresh.
+    if (!this.known.has(id)) this.conns.delete(id)
+    this.known.set(id, { peer, kbps })
+  }
+
+  /**
+   * A peer's capacity: the sum over its connections (estimated and measured alike); `bound` if one
+   * of them was its own bottleneck, or has the browser's estimate.
+   */
   peer(peer: string): { kbps: number | null; bound: boolean } {
     let kbps: number | null = null
     let bound = false
-    for (const c of this.conns.values()) {
-      if (c.peer !== peer) continue
+    for (const k of this.known.values()) {
+      if (k.peer !== peer) continue
+      kbps = (kbps ?? 0) + k.kbps
+      bound = true
+    }
+    for (const [id, c] of this.conns) {
+      if (c.peer !== peer || this.known.has(id)) continue
       if (c.filter.kbps !== null) kbps = (kbps ?? 0) + c.filter.kbps
       bound ||= c.bound
     }
     return { kbps, bound }
   }
 
-  /** One connection's capacity, and whether it was its own bottleneck. */
+  /** One connection's capacity, and whether it was its own bottleneck (always, with an estimate). */
   conn(id: unknown): { kbps: number | null; bound: boolean } | null {
+    const k = this.known.get(id)
+    if (k) return { kbps: k.kbps, bound: true }
     const c = this.conns.get(id)
     return c ? { kbps: c.filter.kbps, bound: c.bound } : null
   }
 
-  /** Drops connections not in `keep` (closed). */
+  /** Drops connections not in `keep` (closed), with their estimates. */
   retain(keep: Set<unknown>): void {
     for (const id of this.conns.keys()) if (!keep.has(id)) this.conns.delete(id)
+    for (const id of this.known.keys()) if (!keep.has(id)) this.known.delete(id)
   }
 }

@@ -43,6 +43,8 @@ export interface LinkRow {
   relayed: boolean | null
   /** SCTP congestion window (bytes), if the browser exposes sctp-transport stats (Chrome doesn't). */
   cwnd: number | null
+  /** The browser's bandwidth estimate (getStats availableOutgoingBitrate): RTP lanes only; it is capKbps then. */
+  estimateKbps: number | null
 }
 
 /** One connection's last capacity window (session/capacity.ts linkWindow), rounded for display (Peers panel, Topology). */
@@ -184,10 +186,12 @@ export class ConnMetrics {
 
   /**
    * Pushes background bytes onto every open connection for 1.5 s (session/headroom.ts) and takes
-   * what each delivered as a backlogged window. False if no probe ran.
+   * what each delivered as a backlogged window. False if no probe ran. A connection without an open
+   * probe link (an RTP lane's is a closed stand-in: its capacity is the browser's estimate) is left
+   * out: nothing is pushed onto it, so its window would be no measurement.
    */
   async probe(headroom: HeadroomProbe): Promise<boolean> {
-    const conns = this.openConns()
+    const conns = this.openConns().filter(([conn]) => conn.probeLink.isOpen)
     const snap = () => new Map(conns.map(([conn]) => [conn, this.uplink.snapshot(conn, conn.probeLink)]))
     const r = await headroom.run(
       conns.map(([conn]) => conn.probeLink),
@@ -199,7 +203,7 @@ export class ConnMetrics {
     for (const [conn, rec] of conns) {
       const a = r.start.get(conn)
       const b = r.end.get(conn)
-      if (!a || !b || !conn.isOpen) continue
+      if (!a || !b || !conn.isOpen || !conn.probeLink.isOpen) continue
       windows.push({ ...linkWindow(conn, rec.peer, a, b), active: true, backlogged: true, transient: settling(rec, now) })
     }
     this.capacity.update(now, windows, { probe: true })
@@ -218,16 +222,23 @@ export class ConnMetrics {
     return rs.length > 0 && rs.every(([, r]) => !settling(r, now))
   }
 
-  /** Polls getStats() on every open connection (mesh links and lanes) into its tracker. */
+  /**
+   * Polls getStats() on every open connection (mesh links and lanes) into its tracker, and hands
+   * the browser's bandwidth estimate, where a connection has one (RTP lanes), to the capacity model
+   * as that connection's capacity (null clears it).
+   */
   async pollLinkStats(): Promise<void> {
     if (this.pollingStats) return
     this.pollingStats = true
     try {
       await Promise.all(
-        this.openConns().map(async ([conn, { tracker }]) => {
+        this.openConns().map(async ([conn, rec]) => {
           const report = await conn.stats?.()
           const r = report && parseLinkStats(report)
-          if (r) tracker.update(r, performance.now())
+          if (!r) return
+          const stats = rec.tracker.update(r, performance.now())
+          // Closed meanwhile (retain() already dropped it): don't bring its estimate back.
+          if (conn.isOpen) this.capacity.setKnown(conn, rec.peer, stats.availableKbps)
         }),
       )
     } finally {
@@ -288,6 +299,7 @@ export class ConnMetrics {
         stalled: r?.stalled ?? false,
         relayed: s?.relayed ?? null,
         cwnd: s?.cwnd ?? null,
+        estimateKbps: kbps(s?.availableKbps),
       }
     })
   }

@@ -1,6 +1,7 @@
 // Per-connection stats from RTCPeerConnection.getStats(), and a path RTT history per connection.
-// Pure (no browser APIs), for unit tests with fixture reports. For display only (the Peers panel and
-// Stats): no bitrate or capacity decision uses them.
+// Pure (no browser APIs), for unit tests with fixture reports. Mostly for display (the Peers panel and
+// Stats): the one figure a capacity decision uses is the browser's own bandwidth estimate, where a
+// connection has one (availableOutgoingBitrate, below).
 //
 // The round-trip time is the selected ICE candidate pair's: the STUN checks a connected pair keeps
 // sending (Chrome: one every ~2.6 s). They share the connection's UDP socket, so they wait in any
@@ -12,6 +13,9 @@
 // currentRoundTripTime / totalRoundTripTime / responsesReceived / bytesSent / bytesReceived, and
 // the transport's selectedCandidatePairId. No `sctp-transport` report (so no congestion window:
 // parsed in case a browser adds one), and no availableOutgoingBitrate on a data-only connection.
+// A connection that sends RTP media (an RTP lane) does report availableOutgoingBitrate on its
+// selected pair: the send-side bandwidth estimate of the browser's own congestion control (GCC),
+// which session/capacity.ts takes as that connection's capacity (CapacityModel.setKnown).
 // Firefox has no selectedCandidatePairId: it flags the pair `selected`.
 
 /** One stats object (RTCStats and its subtypes) as plain data. */
@@ -38,6 +42,11 @@ export interface LinkStatsReport {
   relayed: boolean | null
   /** The SCTP congestion window (bytes), from an sctp-transport report (Chrome has none). */
   cwnd: number | null
+  /**
+   * The browser's send-side bandwidth estimate for the pair (bits/s, availableOutgoingBitrate):
+   * reported for connections that send RTP media, absent on data-only ones (Chromium).
+   */
+  availableBps: number | null
 }
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
@@ -73,6 +82,7 @@ export function parseLinkStats(report: StatsLike): LinkStatsReport | null {
     bytesReceived: num(pair.bytesReceived),
     relayed: local === undefined && remote === undefined ? null : local === 'relay' || remote === 'relay',
     cwnd: sctp ? num(sctp.congestionWindow) : null,
+    availableBps: num(pair.availableOutgoingBitrate),
   }
 }
 
@@ -96,6 +106,8 @@ export interface LinkStats {
   recvKbps: number | null
   relayed: boolean | null
   cwnd: number | null
+  /** The browser's bandwidth estimate (kbps) as of this poll: an RTP connection's; null on a data-only one. */
+  availableKbps: number | null
 }
 
 /**
@@ -147,6 +159,7 @@ export class LinkStatsTracker {
       recvKbps: rate(r.bytesReceived, prev?.r.bytesReceived ?? null),
       relayed: r.relayed,
       cwnd: r.cwnd,
+      availableKbps: r.availableBps === null || r.availableBps < 0 ? null : r.availableBps / 1000,
     }
     this.prev = { at: now, r }
     return this.latest
