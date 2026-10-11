@@ -6,9 +6,15 @@
 //
 //   [prefix][len u16 LE][message] ... [len u16 LE][message][prefixLen u16 LE][version u8][magic 2]
 //
-// The prefix is the encoder's own VP8 header bytes, kept so the browser's RTP packetizer and
-// depacketizer see a valid VP8 frame. The carrier header is a trailer, so the receiver finds it
-// without having to parse VP8 to know where the prefix ends.
+// The prefix is the encoder's whole original frame (a 16×16 VP8 frame: ~70 bytes, ~180 at most),
+// kept so the browser's RTP packetizer sees a valid VP8 frame, and so the receiver can give the
+// decoder that very frame back (unpackCarrierFrame): Chromium frees its RTP packet buffer only as
+// frames are decoded, and a frame cut down to its VP8 header doesn't decode. The carrier header is
+// a trailer, so the receiver finds it without having to parse VP8 to know where the prefix ends.
+//
+// Padding (a headroom probe's bytes, mesh/carrierLink.ts) is a message whose first byte is
+// CARRIER_PAD_TAG, which no fragment starts with (its wire version, proto/framing.ts):
+// unpackCarrierFrame leaves it out.
 //
 // A carrier frame is lost whole (RTP has no partial delivery to the transform), and everything in
 // it with it. So a carrier frame never holds pieces of two different stripes of one media frame:
@@ -28,6 +34,10 @@ export const CARRIER_LENGTH_SIZE = 2
 export const MAX_CARRIER_MESSAGE = 0xffff
 /** Largest prefix a trailer can describe. */
 const MAX_PREFIX = 0xffff
+/** First byte of a padding message (proto/framing.ts WIRE_VERSION is never 0). */
+export const CARRIER_PAD_TAG = 0
+/** Padding messages are at least this long (shorter leftovers aren't worth a message). */
+export const CARRIER_MIN_PAD = 64
 /**
  * How many queued messages past the head one pack looks at, to fill a frame past a message that
  * can't go in it (it doesn't fit, or it would break the stripe rule): one stripe can't block the
@@ -69,6 +79,15 @@ export class CarrierPacker {
     return this.queue.length
   }
 
+  /**
+   * Bytes the head message would add to a frame (its length prefix included), or 0 when nothing
+   * waits. pack() always takes the head however long it is, so a caller with a byte budget packs
+   * only once its budget covers this (see CarrierBudget).
+   */
+  get headBytes(): number {
+    return this.queue.length ? CARRIER_LENGTH_SIZE + this.queue[0].data.byteLength : 0
+  }
+
   /** Drops everything waiting. */
   clear(): void {
     this.queue = []
@@ -83,8 +102,20 @@ export class CarrierPacker {
    */
   pack(budgetBytes: number, prefix: Uint8Array = new Uint8Array(0)): { frame: Uint8Array; taken: number } | null {
     if (this.queue.length === 0) return null
+    const { frame, taken } = this.packFrame(budgetBytes, prefix)
+    return { frame, taken }
+  }
+
+  /**
+   * As pack(), but always builds a frame, with no message if none waits. Then, if nothing is left
+   * waiting and the frame has room for one, a padding message of up to `padBytes` (and at least
+   * CARRIER_MIN_PAD) fills it towards `budgetBytes`: `padded` is its length (tag included).
+   * `hold`: a bare frame (prefix and trailer only), leaving the queue as it is.
+   */
+  packFrame(budgetBytes: number, prefix: Uint8Array = new Uint8Array(0), padBytes = 0, hold = false): { frame: Uint8Array; taken: number; padded: number } {
     if (prefix.byteLength > MAX_PREFIX) throw new RangeError(`carrier prefix too long: ${prefix.byteLength} bytes`)
-    const scan = Math.min(this.queue.length, CARRIER_LOOKAHEAD + 1)
+    const scan = hold ? 0 : Math.min(this.queue.length, CARRIER_LOOKAHEAD + 1)
+    const queueLen = this.queue.length
     const take: number[] = []
     // Media frame -> the stripe this carrier frame already holds pieces of.
     const stripes = new Map<string, number>()
@@ -103,6 +134,14 @@ export class CarrierPacker {
       // Nothing more fits, not even an empty message.
       if (size + CARRIER_LENGTH_SIZE > budgetBytes) break
     }
+    // Padding only behind the last waiting message: it must never take a waiting one's room.
+    let padded = 0
+    if (!hold && padBytes > 0 && take.length === queueLen) {
+      const room = Math.min(budgetBytes - size - CARRIER_LENGTH_SIZE, MAX_CARRIER_MESSAGE)
+      const n = Math.floor(Math.min(room, padBytes))
+      if (n >= CARRIER_MIN_PAD) padded = n
+    }
+    if (padded) size += CARRIER_LENGTH_SIZE + padded
 
     const frame = new Uint8Array(size)
     frame.set(prefix, 0)
@@ -115,6 +154,12 @@ export class CarrierPacker {
       frame.set(d, pos + CARRIER_LENGTH_SIZE)
       pos += CARRIER_LENGTH_SIZE + d.byteLength
       taken += d.byteLength
+    }
+    if (padded) {
+      // Zero-filled: the tag (CARRIER_PAD_TAG) and the rest.
+      frame[pos] = padded & 0xff
+      frame[pos + 1] = padded >>> 8
+      pos += CARRIER_LENGTH_SIZE + padded
     }
     frame[pos] = prefix.byteLength & 0xff
     frame[pos + 1] = prefix.byteLength >>> 8
@@ -131,8 +176,67 @@ export class CarrierPacker {
     }
     this.queue.splice(0, scan, ...kept)
     this.bytes -= taken
-    return { frame, taken }
+    return { frame, taken, padded }
   }
+}
+
+/** The carrier's send budget holds this much sending time as burst (ms): a few frames' worth. */
+export const CARRIER_BURST_MS = 40
+
+/**
+ * The send rate of a carrier, as a token bucket: credit accrues at `rateKbps` (the link sets it to
+ * the browser's estimate, capped), up to CARRIER_BURST_MS of it, or as much as the message waiting
+ * at the head of the queue needs (`need`), so a message bigger than the burst still goes once enough
+ * time has passed. Frames are only packed while the credit covers them, and what they hold is
+ * spent; a bare frame (nothing fits yet) is spent too, which may leave the credit below zero.
+ */
+export class CarrierBudget {
+  private credit = 0
+  private at: number | null = null
+
+  constructor(public rateKbps: number) {}
+
+  /** Bytes the budget allows now. */
+  get available(): number {
+    return this.credit
+  }
+
+  /** Adds the credit for the time since the last refill. */
+  refill(now: number, need = 0): number {
+    if (this.at !== null && now > this.at) {
+      const rate = Math.max(0, this.rateKbps) / 8 // bytes per ms
+      const cap = Math.max(rate * CARRIER_BURST_MS, need)
+      // Only up to the cap, but credit already above it (the cap shrank with `need`) is kept.
+      if (this.credit < cap) this.credit = Math.min(cap, this.credit + (now - this.at) * rate)
+    }
+    this.at = now
+    return this.credit
+  }
+
+  spend(bytes: number): void {
+    this.credit -= bytes
+  }
+}
+
+/**
+ * The next carrier frame for the encoder's `prefix` (one per encoded frame): the queued messages
+ * the budget covers, the head first and never past it; then, with nothing left waiting, up to
+ * `padBytes` of padding within what remains. Spends the frame's bytes.
+ */
+export function nextCarrierFrame(
+  packer: CarrierPacker,
+  budget: CarrierBudget,
+  now: number,
+  prefix: Uint8Array,
+  padBytes = 0,
+): { frame: Uint8Array; taken: number; padded: number } {
+  const overhead = prefix.byteLength + CARRIER_TRAILER_SIZE
+  const head = packer.headBytes
+  const avail = budget.refill(now, overhead + head)
+  const hold = head > 0 && avail < overhead + head
+  const r = packer.packFrame(Math.max(overhead, Math.floor(avail)), prefix, padBytes, hold)
+  budget.spend(r.frame.byteLength)
+  return r
 }
 
 /**
@@ -140,12 +244,40 @@ export class CarrierPacker {
  * valid trailer gives none, and a bogus or truncated length ends the list at the last whole message.
  */
 export function unpackCarrier(frame: Uint8Array): Uint8Array[] {
+  const prefixLen = carrierPrefixLength(frame)
+  if (prefixLen === null) return []
+  return walk(frame, prefixLen)
+}
+
+/** The prefix length a carrier frame's trailer gives, or null if it has no valid trailer. */
+function carrierPrefixLength(frame: Uint8Array): number | null {
   const n = frame.byteLength
-  if (n < CARRIER_TRAILER_SIZE) return []
+  if (n < CARRIER_TRAILER_SIZE) return null
   const t = n - CARRIER_TRAILER_SIZE
-  if (frame[t + 4] !== MAGIC_1 || frame[t + 3] !== MAGIC_0 || frame[t + 2] !== CARRIER_VERSION) return []
+  if (frame[t + 4] !== MAGIC_1 || frame[t + 3] !== MAGIC_0 || frame[t + 2] !== CARRIER_VERSION) return null
   const prefixLen = frame[t] | (frame[t + 1] << 8)
-  if (prefixLen > t) return []
+  return prefixLen > t ? null : prefixLen
+}
+
+/**
+ * A received carrier frame, for the receive transform: `prefix` is the encoder's original frame
+ * (to hand back to the decoder), `messages` what was packed in it without padding, `padBytes` the
+ * padding left out. Views into `frame`. Null if it isn't a carrier frame.
+ */
+export function unpackCarrierFrame(frame: Uint8Array): { prefix: Uint8Array; messages: Uint8Array[]; padBytes: number } | null {
+  const prefixLen = carrierPrefixLength(frame)
+  if (prefixLen === null) return null
+  const messages: Uint8Array[] = []
+  let padBytes = 0
+  for (const m of walk(frame, prefixLen)) {
+    if (m.byteLength === 0 || m[0] === CARRIER_PAD_TAG) padBytes += m.byteLength
+    else messages.push(m)
+  }
+  return { prefix: frame.subarray(0, prefixLen), messages, padBytes }
+}
+
+function walk(frame: Uint8Array, prefixLen: number): Uint8Array[] {
+  const t = frame.byteLength - CARRIER_TRAILER_SIZE
   const out: Uint8Array[] = []
   let pos = prefixLen
   while (pos + CARRIER_LENGTH_SIZE <= t) {

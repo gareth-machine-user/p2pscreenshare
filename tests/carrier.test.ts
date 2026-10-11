@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CARRIER_BURST_MS,
   CARRIER_LENGTH_SIZE,
   CARRIER_LOOKAHEAD,
+  CARRIER_MIN_PAD,
+  CARRIER_PAD_TAG,
   CARRIER_TRAILER_SIZE,
+  CarrierBudget,
   CarrierPacker,
+  nextCarrierFrame,
   unpackCarrier,
+  unpackCarrierFrame,
 } from '../src/net/carrier'
 import { packetize, type EncodedFrame } from '../src/media/packetizer'
 import { Reassembler, type AssembledFrame } from '../src/media/reassembler'
-import { decodeFragment, NO_REF, peekStripe } from '../src/proto/framing'
+import { decodeFragment, encodeFragment, NO_REF, peekStripe } from '../src/proto/framing'
 
 const K = 4
 const M = 2
@@ -347,5 +353,146 @@ describe('carrier frame loss', () => {
     expect(s.hit).toBeGreaterThan(20)
     // One lost carrier frame takes at most one stripe: frames beyond parity need 3 losses.
     expect(s.recoverable).toBeGreaterThan(390)
+  })
+})
+
+describe('padding and the receive side', () => {
+  it('reports the head message’s cost', () => {
+    const p = new CarrierPacker()
+    expect(p.headBytes).toBe(0)
+    p.push(bytes(300, 1))
+    p.push(bytes(10, 2))
+    expect(p.headBytes).toBe(300 + CARRIER_LENGTH_SIZE)
+    p.pack(1000)
+    expect(p.headBytes).toBe(0)
+  })
+
+  it('gives back the original frame and the messages, leaving padding out', () => {
+    const p = new CarrierPacker()
+    p.push(bytes(100, 1))
+    p.push(bytes(50, 2))
+    const r = p.packFrame(2000, PREFIX, 10_000)
+    expect(r.taken).toBe(150)
+    // Padding fills the frame up to the budget.
+    expect(r.padded).toBe(2000 - (PREFIX.byteLength + CARRIER_TRAILER_SIZE + 3 * CARRIER_LENGTH_SIZE + 150))
+    expect(r.frame.byteLength).toBe(2000)
+    const u = unpackCarrierFrame(r.frame)!
+    expect(u.prefix).toEqual(PREFIX)
+    expect(u.messages).toEqual([bytes(100, 1), bytes(50, 2)])
+    expect(u.padBytes).toBe(r.padded)
+    // The plain unpack sees the padding as a message starting with the tag.
+    expect(unpackCarrier(r.frame).at(-1)![0]).toBe(CARRIER_PAD_TAG)
+    expect(unpackCarrierFrame(PREFIX)).toBeNull()
+  })
+
+  it('pads only behind the last waiting message, at most what was asked, never less than the minimum', () => {
+    const p = new CarrierPacker()
+    p.push(bytes(100, 1))
+    p.push(bytes(5000, 2))
+    // The second message doesn't fit: no padding takes its room.
+    expect(p.packFrame(1000, PREFIX, 10_000).padded).toBe(0)
+    p.clear()
+    expect(p.packFrame(1000, PREFIX, 300).padded).toBe(300)
+    expect(p.packFrame(1000, PREFIX, CARRIER_MIN_PAD - 1).padded).toBe(0)
+    // Too little room left.
+    expect(p.packFrame(PREFIX.byteLength + CARRIER_TRAILER_SIZE + CARRIER_LENGTH_SIZE + CARRIER_MIN_PAD - 1, PREFIX, 1000).padded).toBe(0)
+    // A bare frame still carries the prefix and the trailer.
+    const bare = p.packFrame(0, PREFIX)
+    expect(bare.frame.byteLength).toBe(PREFIX.byteLength + CARRIER_TRAILER_SIZE)
+    expect(unpackCarrierFrame(bare.frame)).toEqual({ prefix: PREFIX, messages: [], padBytes: 0 })
+  })
+
+  it('holds the queue for a bare frame', () => {
+    const p = new CarrierPacker()
+    p.push(bytes(10, 1))
+    const r = p.packFrame(1 << 20, PREFIX, 1000, true)
+    expect(r.taken).toBe(0)
+    expect(r.padded).toBe(0)
+    expect(p.length).toBe(1)
+  })
+
+  it('never takes a fragment for padding', () => {
+    const frag = encodeFragment(
+      { channel: 1, key: true, audio: false, replay: false, layer: 0, epoch: 1, frameSeq: 0, gopId: 0, refSeq: NO_REF, captureTime: 0, k: 1, m: 0, pieceIdx: 0, stripe: 0, frameLen: 10, fragIdx: 0, fragCount: 1 },
+      new Uint8Array(10),
+    )
+    expect(frag[0]).not.toBe(CARRIER_PAD_TAG)
+    const p = new CarrierPacker()
+    p.push(frag)
+    expect(unpackCarrierFrame(p.packFrame(1000, PREFIX, 500).frame)!.messages).toEqual([frag])
+  })
+})
+
+describe('CarrierBudget', () => {
+  const FRAME_MS = 10
+  const overhead = PREFIX.byteLength + CARRIER_TRAILER_SIZE
+
+  /** Sends `ms` of 100 fps carrier frames at `kbps` from a backlog of `size`-byte messages. */
+  function run(kbps: number, size: number, ms: number, pad = 0) {
+    const p = new CarrierPacker()
+    // A backlog that outlasts the run.
+    const n = Math.ceil(((kbps / 8) * ms * 1.2) / size) + 10
+    for (let i = 0; i < n; i++) p.push(bytes(size, i))
+    const b = new CarrierBudget(kbps)
+    let bytes_ = 0
+    let taken = 0
+    let padded = 0
+    let biggest = 0
+    for (let t = 0; t <= ms; t += FRAME_MS) {
+      const r = nextCarrierFrame(p, b, t, PREFIX, pad)
+      bytes_ += r.frame.byteLength
+      taken += r.taken
+      padded += r.padded
+      biggest = Math.max(biggest, r.frame.byteLength)
+    }
+    return { kbps: (bytes_ * 8) / ms, taken, padded, biggest }
+  }
+
+  it('sends at its rate, whatever the message size', () => {
+    // (At most CARRIER_LOOKAHEAD + 1 messages go in a frame: 100 fps of them carry 8 Mbps from ~150 B up.)
+    for (const size of [200, 1200, 16 * 1024]) {
+      const r = run(8000, size, 10_000)
+      expect(r.kbps).toBeGreaterThan(8000 * 0.95)
+      expect(r.kbps).toBeLessThan(8000 * 1.05)
+    }
+    // 16 KiB fragments at 300 kbps: one every ~440 ms, not one a frame.
+    const slow = run(300, 16 * 1024, 10_000)
+    expect(slow.kbps).toBeLessThan(300 * 1.1)
+    expect(slow.taken / (16 * 1024)).toBeGreaterThanOrEqual(21)
+  })
+
+  it('bursts at most CARRIER_BURST_MS worth, or one head message', () => {
+    const b = new CarrierBudget(8000)
+    b.refill(0)
+    // A long pause: the credit is capped.
+    expect(b.refill(10_000)).toBe((8000 / 8) * CARRIER_BURST_MS)
+    expect(b.refill(20_000, 50_000)).toBe(50_000)
+    const r = run(8000, 1200, 2000)
+    expect(r.biggest).toBeLessThanOrEqual((8000 / 8) * CARRIER_BURST_MS + overhead + 1200)
+  })
+
+  it('pads up to its rate when no media waits, and nothing beyond', () => {
+    const p = new CarrierPacker()
+    const b = new CarrierBudget(4000)
+    let sent = 0
+    let pad = 0
+    for (let t = 0; t <= 5000; t += FRAME_MS) {
+      const r = nextCarrierFrame(p, b, t, PREFIX, 1 << 30)
+      sent += r.frame.byteLength
+      pad += r.padded
+    }
+    expect((sent * 8) / 5000).toBeGreaterThan(4000 * 0.95)
+    expect((sent * 8) / 5000).toBeLessThan(4000 * 1.05)
+    expect(pad).toBeGreaterThan(0)
+    // Media first: with a backlog, no padding at all.
+    expect(run(4000, 1200, 5000, 1 << 30).padded).toBe(0)
+  })
+
+  it('sends bare frames (prefix and trailer) when there is nothing to send, or no credit', () => {
+    const p = new CarrierPacker()
+    const b = new CarrierBudget(0)
+    p.push(bytes(100, 1))
+    for (let t = 0; t < 100; t += FRAME_MS) expect(nextCarrierFrame(p, b, t, PREFIX).frame.byteLength).toBe(overhead)
+    expect(p.length).toBe(1)
   })
 })
