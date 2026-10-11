@@ -327,4 +327,69 @@ describe('capacity model', () => {
     expect(m.uplinkKbps).toBe(40_000)
     expect(m.conn('a')?.kbps).toBe(20_000)
   })
+
+  describe("the browser's estimate (an RTP lane)", () => {
+    it('is the connection\'s capacity, and its limit; a peer sums it with measured connections', () => {
+      const m = new CapacityModel()
+      m.setKnown('a1', 'a', 6000)
+      // Known before any window: the estimate alone.
+      expect(m.conn('a1')).toEqual({ kbps: 6000, bound: true })
+      expect(m.peer('a')).toEqual({ kbps: 6000, bound: true })
+      // The mesh link to the same peer, measured by a probe (not its own bottleneck): summed.
+      m.update(0, [w('a0', 'a', 9000, { backlogged: true }), w('a1', 'a', 1000, { backlogged: true })], { probe: true })
+      expect(m.conn('a0')).toEqual({ kbps: 9000, bound: false })
+      expect(m.peer('a')).toEqual({ kbps: 15_000, bound: true })
+      // Its windows still count for the uplink: everything was backlogged in the probe.
+      expect(m.uplinkKbps).toBe(10_000)
+      // Each poll replaces it, down as well as up.
+      m.setKnown('a1', 'a', 2500)
+      expect(m.peer('a')).toEqual({ kbps: 11_500, bound: true })
+      // Another peer is unaffected.
+      expect(m.peer('b')).toEqual({ kbps: null, bound: false })
+    })
+
+    it('wins over what its windows deliver: no measurement or fast drop of its own', () => {
+      const m = new CapacityModel()
+      m.update(0, [w('a', 'a', 50_000, { backlogged: true }), w('b', 'b', 50_000, { backlogged: true })], { probe: true })
+      m.setKnown('a', 'a', 8000)
+      // Alone backlogged and deep-queued for FAST_DROP_WINDOWS windows: a bound connection's
+      // fast drop, were it measured. The estimate stands, and no fast drop is signalled.
+      for (const t of [2000, 4000, 6000]) m.update(t, [w('a', 'a', 900, { backlogged: true, queueMs: FAST_DROP_QUEUE_MS + 100 }), w('b', 'b', 8000), w('c', 'c', 8000)])
+      expect(m.conn('a')).toEqual({ kbps: 8000, bound: true })
+      expect(m.fastDropAt).toBe(-Infinity)
+      // Nor does an unbacklogged window above it raise it.
+      m.update(8000, [w('a', 'a', 20_000), w('b', 'b', 8000)])
+      expect(m.conn('a')?.kbps).toBe(8000)
+    })
+
+    it('null (or no usable number) clears it: the connection measures afresh', () => {
+      const m = new CapacityModel()
+      m.update(0, [w('a', 'a', 30_000, { backlogged: true }), w('b', 'b', 30_000, { backlogged: true })], { probe: true })
+      expect(m.conn('a')).toEqual({ kbps: 30_000, bound: false })
+      m.setKnown('a', 'a', 4000)
+      m.setKnown('a', 'a', null)
+      // What it measured before the estimate is forgotten: unknown until a window says otherwise.
+      expect(m.conn('a')).toBeNull()
+      expect(m.peer('a')).toEqual({ kbps: null, bound: false })
+      m.update(2000, [w('a', 'a', 5000), w('b', 'b', 5000)])
+      expect(m.conn('a')).toEqual({ kbps: null, bound: false })
+      m.update(4000, [w('a', 'a', 7000, { backlogged: true }), w('b', 'b', 7000, { backlogged: true })], { probe: true })
+      expect(m.conn('a')).toEqual({ kbps: 7000, bound: false })
+      m.setKnown('b', 'b', NaN)
+      m.setKnown('b', 'b', -1)
+      expect(m.conn('b')?.bound).toBe(false)
+    })
+
+    it('retain drops the estimates of closed connections', () => {
+      const m = new CapacityModel()
+      m.setKnown('a1', 'a', 6000)
+      m.setKnown('a2', 'a', 4000)
+      expect(m.peer('a').kbps).toBe(10_000)
+      m.retain(new Set(['a2']))
+      expect(m.conn('a1')).toBeNull()
+      expect(m.peer('a')).toEqual({ kbps: 4000, bound: true })
+      m.retain(new Set())
+      expect(m.peer('a')).toEqual({ kbps: null, bound: false })
+    })
+  })
 })

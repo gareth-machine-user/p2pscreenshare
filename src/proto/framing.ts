@@ -190,3 +190,21 @@ export function peekLayer(raw: Uint8Array): number {
 export function peekIsKey(raw: Uint8Array): boolean {
   return (raw[1] & FLAG_KEY) !== 0
 }
+
+/** The media frame and stripe a fragment belongs to, as peekStripe reads them. */
+export interface StripeRef {
+  /** `channel:a|v:epoch:frameSeq`, the same frame identity the Reassembler uses. */
+  frame: string
+  stripe: number
+}
+
+/**
+ * Which frame and stripe `raw` carries, or null if it isn't a fragment (e.g. probe or padding
+ * bytes). A header peek only: decodeFragment still checks the shape on receipt.
+ */
+export function peekStripe(raw: Uint8Array): StripeRef | null {
+  if (raw.byteLength < HEADER_SIZE + SIG_SIZE || raw[0] !== WIRE_VERSION) return null
+  const v = new DataView(raw.buffer, raw.byteOffset, HEADER_SIZE)
+  const kind = (raw[1] & FLAG_AUDIO) !== 0 ? 'a' : 'v'
+  return { frame: `${v.getUint32(36, true)}:${kind}:${v.getUint16(2, true)}:${v.getUint32(4, true)}`, stripe: raw[27] }
+}

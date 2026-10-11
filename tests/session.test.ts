@@ -5,6 +5,9 @@ import { deliveredKbps } from '../src/session/capacity'
 import type { LinkState, ProbeLink } from '../src/net/link'
 import { Uplink } from '../src/net/uplink'
 import { resetTicker } from '../src/net/ticker'
+import { ConnMetrics } from '../src/session/connMetrics'
+import type { PairConn } from '../src/mesh/dataConn'
+import type { Mesh } from '../src/mesh/mesh'
 
 const SELF = 'self'
 let nextId = 1
@@ -211,9 +214,10 @@ describe('headroom probe', () => {
   })
 
   /** Runs a probe over links each draining `bytesPerMs[i]`; returns each link's delivered kbps. */
-  async function run(bytesPerMs: number[], during?: (t: number, links: StubProbeLink[]) => void) {
+  async function run(bytesPerMs: number[], during?: (t: number, links: StubProbeLink[]) => void, setup?: (links: StubProbeLink[]) => void) {
     const uplink = new Uplink()
     const links = bytesPerMs.map(() => new StubProbeLink())
+    setup?.(links)
     const probe = new HeadroomProbe(uplink)
     const snap = () => ({ at: performance.now(), links: links.map((l) => ({ handed: uplink.countersOf(l)?.handedBytes ?? 0, buffered: l.bufferedAmount })) })
     const result = probe.run(links, snap)
@@ -256,5 +260,76 @@ describe('headroom probe', () => {
     const probe = new HeadroomProbe(new Uplink())
     expect(await probe.run([], () => 0)).toBeNull()
     expect(probe.lastAt).toBe(-Infinity)
+  })
+
+  it('sends nothing on a closed probe link (an RTP lane has a closed stand-in)', async () => {
+    const closed = (links: StubProbeLink[]) => {
+      links[1].isOpen = false
+      links[1].state = 'closed'
+    }
+    const { kbps, links } = await run([12_500, 12_500], undefined, closed)
+    expect(kbps![0]).toBeGreaterThan(100_000 * 0.9)
+    expect(links[1].sent).toBe(0)
+    expect(kbps![1]).toBe(0)
+  })
+
+  describe('over the open connections (ConnMetrics.probe)', () => {
+    /** A connection as ConnMetrics reads it: open, with a probe link open or not. */
+    const conn = (probeOpen: boolean) => {
+      const probeLink = new StubProbeLink()
+      probeLink.isOpen = probeOpen
+      return { isOpen: true, state: 'open', bufferedAmount: 0, probeLink } as unknown as PairConn
+    }
+    function metrics(conns: PairConn[]) {
+      const mesh = { conns: new Map([['v', {}]]), connectionsOf: () => conns.map((c, lane) => ({ lane, conn: c })) } as unknown as Mesh
+      const m = new ConnMetrics(mesh, new Uplink())
+      const probed: ProbeLink[][] = []
+      const headroom = {
+        run: async <S>(links: ProbeLink[], snap: () => S) => {
+          probed.push(links)
+          return links.length ? { start: snap(), end: snap() } : null
+        },
+      } as unknown as HeadroomProbe
+      return { m, probed, headroom }
+    }
+
+    it('leaves out a connection whose probe link is closed: no bytes for it, no window from it', async () => {
+      const mesh = conn(true)
+      const rtp = conn(false)
+      const { m, probed, headroom } = metrics([mesh, rtp])
+      expect(await m.probe(headroom)).toBe(true)
+      expect(probed).toEqual([[mesh.probeLink]])
+      expect(m.capacity.conn(mesh)).not.toBeNull()
+      expect(m.capacity.conn(rtp)).toBeNull()
+    })
+
+    it("takes a connection's bandwidth estimate from getStats as its capacity, and shows it", async () => {
+      const mesh = conn(true)
+      const rtp = conn(false)
+      let bps: number | undefined = 5_000_000
+      // Only the RTP connection's selected pair has availableOutgoingBitrate.
+      const pair = (o: object) => [{ id: 'p', type: 'candidate-pair', selected: true, ...o }]
+      Object.assign(mesh, { stats: async () => pair({}) })
+      Object.assign(rtp, { stats: async () => pair(bps === undefined ? {} : { availableOutgoingBitrate: bps }) })
+      const { m } = metrics([mesh, rtp])
+      await m.pollLinkStats()
+      expect(m.capacity.conn(rtp)).toEqual({ kbps: 5000, bound: true })
+      expect(m.capacity.conn(mesh)).toBeNull()
+      expect(m.linkStatsFor('v').map((l) => [l.estimateKbps, l.capKbps])).toEqual([
+        [null, null],
+        [5000, 5000],
+      ])
+      // Gone from the report: cleared.
+      bps = undefined
+      await m.pollLinkStats()
+      expect(m.capacity.conn(rtp)).toBeNull()
+    })
+
+    it('with only such connections, no probe runs', async () => {
+      const { m, probed, headroom } = metrics([conn(false)])
+      expect(await m.probe(headroom)).toBe(false)
+      expect(probed).toEqual([[]])
+      expect(m.capacity.probedAt).toBe(-Infinity)
+    })
   })
 })

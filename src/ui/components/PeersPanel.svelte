@@ -119,6 +119,9 @@
                 {#if l.deliveredKbps !== null || l.capKbps !== null}
                   <span title="Delivered over the last window (all channels) / what this connection carries">delivered {fmtMbps(l.deliveredKbps)} / carries {fmtMbps(l.capKbps)}{l.bound ? ' (limit)' : ''}</span>
                 {/if}
+                {#if l.estimateKbps !== null}
+                  <span title="The browser's bandwidth estimate for this connection (its congestion control, RTP lanes): what it carries">estimate {fmtMbps(l.estimateKbps)}</span>
+                {/if}
                 {#if l.stalled}<span class="badge warn" title="This connection's send buffer stopped draining for a while (an SCTP stall, not congestion): its stripes moved to another connection meanwhile" data-testid="lane-stalled">stalled</span>{/if}
                 {#if l.relayed}<span class="badge">relayed</span>{/if}
                 {#if l.cwnd !== null}<span title="SCTP congestion window">cwnd {fmtBytes(l.cwnd)}</span>{/if}

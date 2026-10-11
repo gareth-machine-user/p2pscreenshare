@@ -20,6 +20,7 @@ const row = (lane: number, o: Partial<LinkRow> = {}): LinkRow => ({
   stalled: false,
   relayed: false,
   cwnd: null,
+  estimateKbps: null,
   ...o,
 })
 

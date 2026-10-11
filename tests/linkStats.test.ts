@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { LinkStatsTracker, parseLinkStats, pathInflation, RTT_STALE_MS, rttInflationThreshold, type LinkStats, type StatsRecord } from '../src/net/linkStats'
 
 /** A Chrome (150) report of a data-only connection, trimmed from a real dump (e2e/linkstats.spec.ts). */
-function chrome(o: { rtt?: number; totalRtt?: number; responses?: number; bytesSent?: number; bytesReceived?: number; relay?: boolean; sctp?: boolean } = {}): StatsRecord[] {
+function chrome(
+  o: { rtt?: number; totalRtt?: number; responses?: number; bytesSent?: number; bytesReceived?: number; relay?: boolean; sctp?: boolean; availableBps?: unknown } = {},
+): StatsRecord[] {
   const out: StatsRecord[] = [
     { id: 'P', type: 'peer-connection', dataChannelsOpened: 3 },
     {
@@ -33,6 +35,8 @@ function chrome(o: { rtt?: number; totalRtt?: number; responses?: number; bytesS
       totalRoundTripTime: o.totalRtt ?? 0.002,
       transportId: 'T01',
       writable: true,
+      // Only a connection that sends RTP media has the browser's bandwidth estimate.
+      ...(o.availableBps === undefined ? {} : { availableOutgoingBitrate: o.availableBps }),
     },
     { id: 'La', type: 'local-candidate', candidateType: o.relay ? 'relay' : 'host' },
     { id: 'Ra', type: 'remote-candidate', candidateType: 'srflx' },
@@ -82,6 +86,15 @@ describe('parseLinkStats', () => {
     expect(r.bytesSent).toBe(1882145)
     expect(r.relayed).toBe(false)
     expect(r.cwnd).toBeNull() // Chrome has no sctp-transport report
+    expect(r.availableBps).toBeNull() // nor a bandwidth estimate on a data-only connection
+  })
+  it("an RTP connection: the browser's bandwidth estimate on the selected pair", () => {
+    expect(parseLinkStats(chrome({ availableBps: 2_500_000 }))!.availableBps).toBe(2_500_000)
+    // The losing pair's (or a malformed) value is not taken.
+    const other = chrome().map((r) => (r.id === 'CPother' ? { ...r, availableOutgoingBitrate: 9e6 } : r))
+    expect(parseLinkStats(other)!.availableBps).toBeNull()
+    expect(parseLinkStats(chrome({ availableBps: 'fast' }))!.availableBps).toBeNull()
+    expect(parseLinkStats(chrome({ availableBps: NaN }))!.availableBps).toBeNull()
   })
   it('Chrome: relay candidate, and the congestion window when an SCTP report is present', () => {
     const r = parseLinkStats(chrome({ relay: true, sctp: true }))!
@@ -130,6 +143,15 @@ describe('LinkStatsTracker', () => {
     total += 0.1
     n++
     expect(poll(8000, 100).rttMs).toBeCloseTo(100)
+  })
+
+  it('carries the bandwidth estimate in kbps, as of the latest poll', () => {
+    const t = new LinkStatsTracker()
+    expect(t.update(parseLinkStats(chrome())!, 0).availableKbps).toBeNull()
+    expect(t.update(parseLinkStats(chrome({ availableBps: 3_200_000 }))!, 2000).availableKbps).toBe(3200)
+    expect(t.current(3000)!.availableKbps).toBe(3200)
+    // Gone from the report: gone (not held).
+    expect(t.update(parseLinkStats(chrome())!, 4000).availableKbps).toBeNull()
   })
 
   it('remembers the last poll that saw bytes received', () => {
@@ -181,6 +203,7 @@ describe('pathInflation', () => {
     recvKbps: null,
     relayed: false,
     cwnd: null,
+    availableKbps: null,
     ...o,
   })
   it('threshold: max(floor, half the baseline)', () => {
