@@ -2,7 +2,7 @@
 // audience can carry (session/congestion.ts), applied to its stream in steps.
 import type { ChannelPublisher } from './channelPublisher'
 import { stripeKbpsFor, type CapacityModel } from './capacity'
-import { AudienceCap, audienceLimit, BitrateController, rateTarget, ViewerSettle, type RateTarget } from './congestion'
+import { AudienceCap, audienceLimit, BitrateController, JumpGate, rateTarget, ViewerSettle, type RateTarget } from './congestion'
 import type { PublishedStream } from './publishedStream'
 
 /** The presenter's bitrate and what sets it, in numbers (presenter bar, Stats). */
@@ -27,6 +27,8 @@ export class PresenterRate {
   private audienceCap = new AudienceCap()
   /** Direct children count towards the median only once settled. */
   private settle = new ViewerSettle()
+  /** When to go straight to the target (a raised quality, a cut a probe no longer bears out). */
+  private gate = new JumpGate()
 
   constructor(
     private selfId: string,
@@ -38,6 +40,12 @@ export class PresenterRate {
   /** A new stream starts without the last one's audience cap. */
   newStream(): void {
     this.audienceCap = new AudienceCap()
+    this.gate = new JumpGate()
+  }
+
+  /** A headroom probe would let the bitrate go straight to a raised quality (JumpGate). */
+  get probeWanted(): boolean {
+    return this.gate.probeWanted
   }
 
   /**
@@ -84,8 +92,11 @@ export class PresenterRate {
       wireAt: (v) => stripes * stripeKbpsFor(v, full.k, full.withAudio),
     })
     this.target = t
-    const next = this.ctl.step(now, full.kbps, t)
-    if (next !== null) s.adaptBitrate(next)
+    const jump = this.gate.step(now, { ceilingKbps: s.ceilingKbps, currentKbps: full.kbps, targetKbps: t.kbps, probedAt: this.capacity.probedAt, children: edges.children > 0 })
+    const next = jump ? this.ctl.jump(now, t) : this.ctl.step(now, full.kbps, t, { fastDropAt: this.capacity.fastDropAt })
+    if (next === null) return
+    if (next < full.kbps) this.gate.cut(now)
+    s.adaptBitrate(next)
   }
 
   /**

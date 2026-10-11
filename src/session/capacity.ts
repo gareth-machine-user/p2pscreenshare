@@ -163,6 +163,15 @@ export const CONGESTED_QUEUE_MS = 150
  * or the receiver. It holds a new viewer's pushback off just as long (session/congestion.ts).
  */
 export const SETTLE_MS = 30_000
+/**
+ * Backlogged this many windows over CAPACITY_WINDOW_MS (stalled ones included), a link carries what
+ * they delivered on average, if that is less than the most. On a long, lossy path each SCTP
+ * association alternates bursts with retransmission timeouts of a second or more: the most it
+ * delivered, in windows without a stall, was 1.3-2 times what it carried, and the stream sized to
+ * it never played (300 ms round trip, 0.5% loss). On a clean link the backlogged windows deliver
+ * about the same, so the average is the most.
+ */
+export const SUSTAINED_WINDOWS = 5
 /** The page froze in a window when the main thread lagged this long (ms): the window is ignored. */
 export const FROZEN_LAG_MS = 400
 
@@ -224,13 +233,32 @@ export function linkWindow(id: unknown, peer: string, a: LinkSnap, b: LinkSnap):
  * windows in which the link (or uplink) carried all it could. Between them it holds; any window
  * raises it to at least what was delivered. FAST_DROP_WINDOWS samples in a row queueing past
  * FAST_DROP_QUEUE_MS replace it at once with the most any of them delivered: the link carries less
- * than it used to.
+ * than it used to. Backlogged often enough, it is at most what those windows delivered on average
+ * (SUSTAINED_WINDOWS).
  */
 export class MaxFilter {
-  kbps: number | null = null
+  /** The most delivered (kbps), null until measured. */
+  peak: number | null = null
+  /** When the last fast drop set it, or -Infinity. */
+  droppedAt = -Infinity
   private recent: { at: number; kbps: number }[] = []
   /** What the deep-queued samples in a row so far delivered. */
   private deep: number[] = []
+  /** Windows in which the link was backlogged, stalled ones included (see loaded). */
+  private loadedWins: { at: number; kbps: number }[] = []
+
+  /** The estimate: the most delivered, or what backlogged windows delivered on average, if less. */
+  get kbps(): number | null {
+    if (this.peak === null || this.loadedWins.length < SUSTAINED_WINDOWS) return this.peak
+    const mean = this.loadedWins.reduce((a, w) => a + w.kbps, 0) / this.loadedWins.length
+    return Math.min(this.peak, mean)
+  }
+
+  /** A window in which the link was backlogged, even if it stalled: what it sustained. */
+  loaded(now: number, kbps: number): void {
+    this.loadedWins = this.loadedWins.filter((w) => now - w.at < CAPACITY_WINDOW_MS)
+    this.loadedWins.push({ at: now, kbps })
+  }
 
   /** A window that carried all it could. */
   sample(now: number, kbps: number, queueMs = 0): void {
@@ -238,21 +266,27 @@ export class MaxFilter {
     if (this.deep.length >= FAST_DROP_WINDOWS) {
       this.recent = [{ at: now, kbps: Math.max(...this.deep) }]
       this.deep = []
+      this.droppedAt = now
     } else {
       this.recent = this.recent.filter((s) => now - s.at < CAPACITY_WINDOW_MS)
       this.recent.push({ at: now, kbps })
     }
-    this.kbps = Math.max(...this.recent.map((s) => s.kbps))
+    this.peak = Math.max(...this.recent.map((s) => s.kbps))
   }
 
-  /** A window that carried less than it could: capacity is at least this (`init`: even if unknown). */
+  /**
+   * A window that carried less than it could: capacity is at least this (`init`: even if unknown).
+   * While unknown it is still remembered, so the first measurement can't fall below what was just
+   * delivered: on a long path a connection's first backlogged window often comes right after a
+   * loss, at a fraction of what it carried before (its congestion window halved).
+   */
   raise(now: number, kbps: number, init = false): void {
     // The queue drained (or was only shared): the deep run is over.
     this.deep = []
-    if (this.kbps === null && !init) return
     this.recent = this.recent.filter((s) => now - s.at < CAPACITY_WINDOW_MS)
     this.recent.push({ at: now, kbps })
-    if (this.kbps === null || kbps > this.kbps) this.kbps = kbps
+    if (this.peak === null && !init) return
+    if (this.peak === null || kbps > this.peak) this.peak = kbps
   }
 }
 
@@ -277,6 +311,8 @@ export class MaxFilter {
  */
 export class CapacityModel {
   readonly uplink = new MaxFilter()
+  /** When a headroom probe last measured something (not only transient windows), or -Infinity. */
+  probedAt = -Infinity
   private conns = new Map<unknown, { peer: string; filter: MaxFilter; bound: boolean }>()
 
   /** The uplink's capacity (kbps), null until measured: what a peer gossips as capacityKbps. */
@@ -284,17 +320,33 @@ export class CapacityModel {
     return this.uplink.kbps
   }
 
+  /** When the uplink's or any connection's capacity last fell at once (a fast drop), or -Infinity. */
+  get fastDropAt(): number {
+    let at = this.uplink.droppedAt
+    for (const c of this.conns.values()) at = Math.max(at, c.filter.droppedAt)
+    return at
+  }
+
   /** One window over every connection. `probe`: a headroom probe kept them all backlogged. */
   update(now: number, windows: ConnWindow[], o: { frozen?: boolean; probe?: boolean } = {}): void {
     if (o.frozen || !windows.length) return
     const ok = windows.filter((w) => !w.stalled)
+    if (o.probe && ok.some((w) => !w.transient)) this.probedAt = now
     const full = (w: ConnWindow) => w.backlogged && !w.transient
+    // What backlogged links sustained, stalls included (SUSTAINED_WINDOWS): each connection that was
+    // its own bottleneck, and the uplink when most were backlogged. Not a probe's: a burst on purpose.
+    const allActive = windows.filter((w) => w.active)
+    const allFull = allActive.filter(full)
+    const allShared = allFull.length * 2 > allActive.length
+    if (!o.probe) {
+      for (const w of allFull) if (!allShared) this.connFor(w).filter.loaded(now, w.kbps)
+      if (allShared) this.uplink.loaded(now, windows.reduce((a, w) => a + w.kbps, 0))
+    }
     const active = ok.filter((w) => w.active)
     const backlogged = active.filter(full)
     const shared = backlogged.length * 2 > active.length
     for (const w of ok) {
-      let c = this.conns.get(w.id)
-      if (!c) this.conns.set(w.id, (c = { peer: w.peer, filter: new MaxFilter(), bound: false }))
+      const c = this.connFor(w)
       if (w.active && full(w) && !shared) {
         c.filter.sample(now, w.kbps, w.queueMs)
         c.bound = true
@@ -305,12 +357,17 @@ export class CapacityModel {
     // still shows the uplink carries at least what it delivered. Without it, an uplink overloaded
     // from the start, which stalls in every window, was never measured, and the stream kept
     // sending at the chosen quality into it.
-    const allActive = windows.filter((w) => w.active)
     const overloaded = allActive.length > 0 && allActive.every(full)
     if (shared && ok.length === windows.length) {
       const queueMs = backlogged.reduce((a, w) => a + w.queueMs, 0) / backlogged.length
       this.uplink.sample(now, total, queueMs)
     } else this.uplink.raise(now, total, (!!o.probe && ok.some((w) => !w.transient)) || overloaded)
+  }
+
+  private connFor(w: ConnWindow): { peer: string; filter: MaxFilter; bound: boolean } {
+    let c = this.conns.get(w.id)
+    if (!c) this.conns.set(w.id, (c = { peer: w.peer, filter: new MaxFilter(), bound: false }))
+    return c
   }
 
   /** A peer's capacity: the sum over its connections; `bound` if one of them was its own bottleneck. */

@@ -27,7 +27,7 @@ import type { PeerIdentity } from './identity'
 import { MeshConn, type ConnFactory, type PeerConn } from './meshConn'
 import { Lane, type LaneFactory } from './lane'
 import type { PairConn } from './dataConn'
-import { clampLanes, isLaneMsg, Lanes, type LaneMsg } from './lanes'
+import { isLaneMsg, Lanes, type LaneMsg } from './lanes'
 import { doorPeers, FailureDetector, GONE_MS, isMemberRecord, linkSuspected, RecordStore, retryDelayMs, SUSPECT_MS, type Digest, type MemberRecord } from './records'
 import { after, every } from '../net/ticker'
 import { storageGet, storageSet } from '../util/storage'
@@ -114,7 +114,10 @@ export interface MeshOptions<C extends PeerConn = MeshConn> {
   block?: string[]
   /** Tests: makes connections (default: a real MeshConn). */
   connect?: ConnFactory<C>
-  /** Connections per pair (media lanes, see lanes.ts): 1..4, default 2. 1 = the mesh link only. */
+  /**
+   * Connections per pair (media lanes, see lanes.ts): 1..6, 1 = the mesh link only. Undefined: 2,
+   * or 6 for a pair with a long round trip.
+   */
   lanes?: number
   /** Tests: makes lanes (default: a real Lane). */
   connectLane?: LaneFactory
@@ -259,7 +262,7 @@ export class Mesh<C extends PeerConn = MeshConn> {
     this.lanes = new Lanes({
       selfId: this.selfId,
       iceServers: opts.iceServers,
-      wanted: clampLanes(opts.lanes),
+      setting: opts.lanes,
       connect: connectLane,
       onMedia: (data, from) => this.mediaFrom(data, from),
       onBufferLow: () => this.onBufferLow(),

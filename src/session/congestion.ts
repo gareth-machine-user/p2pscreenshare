@@ -14,7 +14,10 @@
 // windows (GOP replay, its own connections still ramping up) say little about what it can take. Its
 // connections' backlog sets no capacity for as long (session/capacity.ts).
 //
-// Pacing: down at once (at most every 4 s), up by at most 25% per 10 s; changes under 5% are noise.
+// Pacing: down at once (at most every 4 s), by at most half unless capacity just fell at once (a
+// fast drop: ~6 s of evidence), up by at most 25% per 10 s; changes under 5% are noise. Straight up
+// to the target, though, once a probe confirms it (JumpGate): after the chosen quality went up, and
+// after a cut that capacity no longer bears out.
 // With viewers but the uplink not measured yet (the first join: the first headroom probe runs 1 s
 // in), it starts at no more than START_KBPS, and goes straight to the target once measured.
 import { SETTLE_MS } from './capacity'
@@ -29,6 +32,10 @@ export const UP_GAP_MS = 10_000
 export const UP_STEP = 1.25
 /** Changes smaller than this share are ignored. */
 export const DEADBAND = 0.05
+/** A cut is at most to this share of the bitrate, unless capacity just fell at once or is unmeasured. */
+export const MAX_CUT = 0.5
+/** A probe this recent (ms) confirms a raised quality: the bitrate goes straight to it. */
+export const PROBE_FRESH_MS = 30_000
 /**
  * Most a stream sends to its first viewers before the uplink is measured (kbps). Sending the chosen
  * quality, plus the new child's GOP replay, into an unmeasured 8 Mbit uplink overflowed its queue
@@ -138,8 +145,11 @@ export class BitrateController {
   /** The last target was START_KBPS for want of a measurement. */
   private unmeasured = false
 
-  /** The next bitrate, or null to stay. */
-  step(now: number, currentKbps: number, t: RateTarget): number | null {
+  /**
+   * The next bitrate, or null to stay. `fastDropAt`: when capacity last fell at once (CapacityModel):
+   * one since the last cut lets this cut go all the way to the target.
+   */
+  step(now: number, currentKbps: number, t: RateTarget, o: { fastDropAt?: number } = {}): number | null {
     const wasUnmeasured = this.unmeasured
     this.unmeasured = t.limit === 'unmeasured'
     // The first measurement: straight to its target, which is as safe as any measured one.
@@ -149,14 +159,66 @@ export class BitrateController {
     }
     if (t.kbps < currentKbps * (1 - DEADBAND)) {
       if (now - this.lastDown < DOWN_GAP_MS) return null
+      const steep = (o.fastDropAt ?? -Infinity) > this.lastDown || this.unmeasured
       this.lastDown = now
-      return t.kbps
+      return steep ? t.kbps : Math.max(t.kbps, currentKbps * MAX_CUT)
     }
     // Back to the chosen quality even from just below it; elsewhere small moves are noise.
     const up = t.kbps > currentKbps * (1 + DEADBAND) || (t.limit === 'chosen' && t.kbps > currentKbps)
     if (!up || now - this.lastUp < UP_GAP_MS || now - this.lastDown < UP_GAP_MS) return null
     this.lastUp = now
     return Math.min(t.kbps, currentKbps * UP_STEP)
+  }
+
+  /** Straight to the target (JumpGate said so). */
+  jump(now: number, t: RateTarget): number {
+    this.unmeasured = t.limit === 'unmeasured'
+    this.lastUp = now
+    return t.kbps
+  }
+}
+
+/**
+ * When the bitrate may go straight up to its target instead of 25% per 10 s:
+ *   - after the chosen quality went up, once a probe no older than PROBE_FRESH_MS confirms the
+ *     uplink carries it (asking for one if there is none: `probeWanted`). Until then the stream
+ *     stays where it was rather than sending the new quality, and its keyframe, into an
+ *     unverified link;
+ *   - after a cut, once a probe since shows capacity is back (one that shows it isn't ends it too).
+ * With no direct children there is nothing to overload: at once.
+ */
+export class JumpGate {
+  private ceiling = 0
+  /** A probe at or after this confirms the pending jump; null with none pending. */
+  private after: number | null = null
+  /** The pending jump is a raised quality, which asks for a probe. */
+  private raised = false
+  /** A probe now would confirm a pending jump (PeerSession runs one). */
+  probeWanted = false
+
+  /** One window: whether to jump to the target now. `probedAt`: CapacityModel.probedAt. */
+  step(now: number, o: { ceilingKbps: number; currentKbps: number; targetKbps: number; probedAt: number; children: boolean }): boolean {
+    if (o.ceilingKbps > this.ceiling) {
+      this.after = now - PROBE_FRESH_MS
+      this.raised = true
+    }
+    this.ceiling = o.ceilingKbps
+    const up = o.targetKbps > o.currentKbps
+    if (this.after !== null && (!o.children || o.probedAt >= this.after)) {
+      this.after = null
+      this.raised = false
+      this.probeWanted = false
+      return up
+    }
+    this.probeWanted = this.after !== null && this.raised && up
+    return false
+  }
+
+  /** The bitrate was cut: a probe after now may lift it straight back. */
+  cut(now: number): void {
+    this.after = now
+    this.raised = false
+    this.probeWanted = false
   }
 }
 

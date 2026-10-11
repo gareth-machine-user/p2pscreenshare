@@ -207,9 +207,10 @@ export class PublishedStream {
   }
 
   /**
-   * Changes bitrate, capture size cap and frame rate in place: the encoder is rebuilt (choosing
-   * the codec again for the new bits per pixel) and sends a keyframe, with no new capture (which
-   * would need the user to pick a screen again) and no new channel.
+   * Changes the chosen quality, capture size cap and frame rate in place: the encoder is rebuilt
+   * (choosing the codec again for the new bits per pixel) and sends a keyframe, with no new capture
+   * (which would need the user to pick a screen again) and no new channel. A higher bitrate is
+   * reached by the rate control, not here.
    */
   async setQuality(bitrateKbps: number, maxSize?: [number, number], fps?: number): Promise<void> {
     const full = this.full
@@ -218,10 +219,12 @@ export class PublishedStream {
     const rate = fps ?? o.fps ?? DEFAULT_FPS
     this.ceilingKbps = bitrateKbps
     this.changedAt = performance.now()
-    full.kbps = bitrateKbps
+    // Down at once; up only as far as the bitrate already was: the rate control goes on to the new
+    // quality once a probe confirms the uplink carries it (session/congestion.ts JumpGate).
+    full.kbps = Math.min(full.kbps, bitrateKbps)
     o.bitrateKbps = bitrateKbps
     o.fps = rate
-    this.video.setTarget(bitrateKbps, rate)
+    this.video.setTarget(full.kbps, rate)
     const track = this.localStream?.getVideoTracks()[0]
     if (track && this.opts.source !== 'test') {
       const size = maxSize ?? o.maxSize

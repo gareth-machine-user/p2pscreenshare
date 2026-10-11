@@ -6,7 +6,10 @@
 // (lane-offer / lane-answer / lane-close), never through the tracker or other peers, and the lower
 // peer id offers (the mesh's rule). The offerer opens its lanes shortly after the mesh link opens,
 // unless that link goes through TURN; the answerer declines lanes beyond its own setting, so a pair
-// uses the smaller of the two settings. Lanes close with the mesh link (and so on leave, kick and
+// uses the smaller of the two settings. Without a setting (`lanes=N`), a pair whose round trip is
+// FAR_RTT_MS or more opens FAR_LANES: over a long path each SCTP association recovers from a loss
+// at one packet per round trip, so it carries far less than the path, and N of them carry N times
+// that (see the README's Lanes section). Lanes close with the mesh link (and so on leave, kick and
 // ban). A failed lane is retried with backoff, at most a few times per pair, and a page creates at
 // most LANE_BUDGET of them: Chromium allows 500 RTCPeerConnections per page, closed ones included.
 //
@@ -20,9 +23,13 @@ import type { LaneConn, LaneFactory } from './lane'
 import type { PeerConn } from './meshConn'
 import type { PairConn } from './dataConn'
 
-export const MAX_LANES = 4
-/** Connections per pair unless the page says otherwise (`lanes=N`). */
+export const MAX_LANES = 6
+/** Connections per pair unless the page says otherwise (`lanes=N`)... */
 export const DEFAULT_LANES = 2
+/** ...or the pair's round trip is at least this long (ms)... */
+export const FAR_RTT_MS = 100
+/** ...when it opens this many: one per stripe of the default 4+2 layout. */
+export const FAR_LANES = 6
 /** The offerer opens lanes this long after the mesh link opened (it carries the snapshot first). */
 export const LANE_START_MS = 1000
 /** Backoff before re-opening a failed lane, by failure count (1st, 2nd, ...). */
@@ -30,8 +37,10 @@ export const LANE_RETRY_MS = [5000, 30_000]
 /** After this many lane failures with one peer, no more lanes to it (for this page's lifetime). */
 export const LANE_MAX_FAILURES = 3
 /** Most lanes one page creates in its lifetime (the Chromium per-page connection limit is 500). */
-export const LANE_BUDGET = 200
+export const LANE_BUDGET = 300
 const SDP_MAX = 64 * 1024
+/** How long the offerer waits for the ping that measures the pair's round trip (ms). */
+const RTT_PING_TIMEOUT_MS = 2000
 
 /** Lane signaling on a mesh link's `ctl` channel. */
 export type LaneMsg =
@@ -55,6 +64,12 @@ export function clampLanes(n: number | undefined): number {
   return Math.max(1, Math.min(MAX_LANES, Math.floor(n)))
 }
 
+/** Connections a pair opens: the page's setting if it has one, else by the pair's round trip. */
+export function lanesForRtt(rttMs: number | null, setting: number | undefined): number {
+  if (setting !== undefined) return clampLanes(setting)
+  return rttMs !== null && rttMs >= FAR_RTT_MS ? FAR_LANES : DEFAULT_LANES
+}
+
 interface Slot {
   lane: LaneConn | null
   /** Waiting to re-open after a failure (cancel function). */
@@ -74,8 +89,8 @@ interface Pair {
 export interface LaneHost {
   readonly selfId: string
   readonly iceServers: RTCIceServer[]
-  /** Connections wanted per pair (1 = lanes off). */
-  readonly wanted: number
+  /** Connections per pair the page set (`lanes=N`, 1 = lanes off), or undefined: by round trip. */
+  readonly setting: number | undefined
   connect: LaneFactory
   onMedia(data: Uint8Array, from: string): void
   onBufferLow(): void
@@ -99,7 +114,7 @@ export class Lanes {
     if (this.pairs.get(id)?.primary === conn) return
     const pair: Pair = { primary: conn, offerer: this.host.selfId < id, slots: new Map(), relayed: false, start: null, closed: false }
     this.pairs.set(id, pair)
-    if (pair.offerer && this.host.wanted > 1) pair.start = after(LANE_START_MS, () => void this.start(pair))
+    if (pair.offerer && this.host.setting !== 1) pair.start = after(LANE_START_MS, () => void this.start(pair))
   }
 
   /** The mesh link closed (or was replaced): its lanes go with it. */
@@ -186,7 +201,21 @@ export class Lanes {
       this.host.onChange()
       return
     }
-    for (let i = 1; i < this.host.wanted; i++) void this.offer(pair, i)
+    const n = lanesForRtt(this.host.setting === undefined ? await this.rttOf(pair) : null, this.host.setting)
+    if (pair.closed || !pair.primary.isOpen) return
+    for (let i = 1; i < n; i++) void this.offer(pair, i)
+  }
+
+  /** The pair's round trip (ms): the lower of the mesh link's average and a fresh ping, or null. */
+  private async rttOf(pair: Pair): Promise<number | null> {
+    const known = pair.primary.rttMs
+    const t0 = performance.now()
+    const fresh = await pair.primary.ping(RTT_PING_TIMEOUT_MS).then(
+      () => performance.now() - t0,
+      () => null,
+    )
+    if (known === null) return fresh
+    return fresh === null ? known : Math.min(known, fresh)
   }
 
   private canCreate(id: string): boolean {
@@ -233,7 +262,8 @@ export class Lanes {
     // Only the lower id offers: an offer from the other side is ignored (not declined, which would
     // close the lane of that index we opened).
     if (pair.offerer) return
-    if (i >= this.host.wanted || this.created >= LANE_BUDGET) {
+    // Without a setting, whatever the offerer chose for the pair's round trip.
+    if (i >= (this.host.setting === undefined ? MAX_LANES : clampLanes(this.host.setting)) || this.created >= LANE_BUDGET) {
       pair.primary.sendCtl({ t: 'lane-close', i, d: true })
       return
     }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   CAPACITY_WINDOW_MS,
+  SUSTAINED_WINDOWS,
   FAST_DROP_QUEUE_MS,
   FAST_DROP_WINDOWS,
   CapacityModel,
@@ -158,6 +159,37 @@ describe('max filter', () => {
     expect(f.kbps).toBe(12_000)
     f.sample(4000 + CAPACITY_WINDOW_MS + 1, 8000)
     expect(f.kbps).toBe(8000)
+  })
+
+  it('backlogged in SUSTAINED_WINDOWS windows, it is at most what they delivered on average (a lossy, long path)', () => {
+    const f = new MaxFilter()
+    // Bursts between retransmission timeouts: the best window says 3 Mbps, the link carries ~1.5.
+    const wins = [3000, 600, 1200, 2800, 0]
+    wins.forEach((kbps, i) => {
+      if (kbps >= 2800) f.sample(i * 2000, kbps)
+      f.loaded(i * 2000, kbps)
+      if (i < SUSTAINED_WINDOWS - 1) expect(f.kbps).toBe(3000)
+    })
+    expect(f.peak).toBe(3000)
+    expect(f.kbps).toBe(1520)
+    // A clean link's backlogged windows deliver about the same: the average is about the most.
+    const g = new MaxFilter()
+    for (let i = 0; i < 10; i++) {
+      g.sample(i * 2000, 5000 - (i % 2) * 100)
+      g.loaded(i * 2000, 5000 - (i % 2) * 100)
+    }
+    expect(g.kbps).toBe(4950)
+  })
+
+  it('remembers what was delivered before the first measurement (a dip right after a loss sets no low first value)', () => {
+    const f = new MaxFilter()
+    for (let t = 0; t < 30_000; t += 2000) f.raise(t, 4000)
+    expect(f.kbps).toBeNull()
+    f.sample(30_000, 1400)
+    expect(f.kbps).toBe(4000)
+    // ...but only for CAPACITY_WINDOW_MS, like any other sample.
+    f.sample(28_000 + CAPACITY_WINDOW_MS + 1, 1400)
+    expect(f.kbps).toBe(1400)
   })
 
   it('drops at once after FAST_DROP_WINDOWS deep-queued samples in a row, to the best of them', () => {

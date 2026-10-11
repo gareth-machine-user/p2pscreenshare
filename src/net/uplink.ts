@@ -15,6 +15,13 @@ const MAX_AGE_MS_BY_LAYER = tuning.maxAgeByLayer
  * socket buffer. A stall is that connection's alone: its windows say nothing about capacity.
  */
 export const STALL_MS = 750
+/**
+ * ...or this many of the path's round trips, if longer: on a long path the retransmission timeout
+ * is (Chromium's is the round trip plus four times its variation), and a loss recovered by it held
+ * every window of a 300 ms path with 0.5% loss "stalled", which left none to measure capacity with
+ * and kept moving trees between connections that were all just recovering losses.
+ */
+export const STALL_RTTS = 4
 
 /** How long a frame that lost a fragment on a link is remembered, so its other fragments are dropped too (ms). */
 const DEAD_FRAME_RETAIN_MS = 2000
@@ -102,6 +109,8 @@ interface LinkEntry {
   counters: LinkCounters
   /** Its send buffer as last seen (plus what was sent into it since), and when it last drained. */
   progress: { buffered: number; at: number } | null
+  /** Not draining this long (ms) is a stall: STALL_MS, or STALL_RTTS of its path's round trips. */
+  stallMs: number
 }
 
 export interface UplinkStats {
@@ -170,6 +179,7 @@ export class Uplink {
         dead: new Map(),
         counters: { handedBytes: 0, busyMs: 0, busySince: null, sentItems: 0, sentBytes: 0, drops: 0, queueDelaySum: 0, queueDelayN: 0, lastStallAt: -Infinity, replayBytes: 0 },
         progress: null,
+        stallMs: STALL_MS,
       }
       this.links.set(link, e)
     }
@@ -197,13 +207,18 @@ export class Uplink {
     if (b <= LINK_BUFFER_LOW || b < p.buffered) p.at = now
     p.buffered = b
     const ms = now - p.at
-    if (ms >= STALL_MS) e.counters.lastStallAt = now
+    if (ms >= e.stallMs) e.counters.lastStallAt = now
     return ms
   }
 
   /** Whether `link` is stalled (see stalledMs). */
   isStalled(link: MediaLink, now = performance.now()): boolean {
-    return this.stalledMs(link, now) >= STALL_MS
+    return this.stalledMs(link, now) >= this.entry(link).stallMs
+  }
+
+  /** The round trip of `link`'s path without queueing (ms), if known: a long one stalls later. */
+  setPathRtt(link: MediaLink, rttMs: number | null): void {
+    this.entry(link).stallMs = Math.max(STALL_MS, STALL_RTTS * (rttMs ?? 0))
   }
 
   /** How long `link`'s queue has held something in total (ms), up to `now`. */

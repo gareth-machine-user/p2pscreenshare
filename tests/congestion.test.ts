@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CapacityModel, FROZEN_LAG_MS, SETTLE_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
-import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, ViewerSettle, type RateInputs } from '../src/session/congestion'
+import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, JumpGate, MAX_CUT, PROBE_FRESH_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, ViewerSettle, type RateInputs } from '../src/session/congestion'
 import { LINK_BUFFER_HIGH } from '../src/net/link'
 
 // k=4, m=1 with audio: every direct child gets one full copy, all 5 stripes.
@@ -88,6 +88,63 @@ describe('bitrate pacing', () => {
     expect(c.step(40_000, 6250, t(6000))).toBeNull()
     // But back to the chosen quality from just below it.
     expect(c.step(40_000, 15_800, t(16_000, 'chosen'))).toBe(16_000)
+  })
+
+  it('a cut is at most by half, unless capacity just fell at once', () => {
+    const c = new BitrateController()
+    expect(MAX_CUT).toBe(0.5)
+    expect(c.step(0, 16_000, t(2000))).toBe(8000)
+    expect(c.step(DOWN_GAP_MS, 8000, t(2000))).toBe(4000)
+    // A fast drop since the last cut (~6 s of evidence already): all the way.
+    expect(c.step(2 * DOWN_GAP_MS, 4000, t(1000), { fastDropAt: DOWN_GAP_MS + 1 })).toBe(1000)
+    // The same fast drop doesn't steepen the next cut.
+    expect(c.step(3 * DOWN_GAP_MS, 1000, t(300), { fastDropAt: DOWN_GAP_MS + 1 })).toBe(500)
+  })
+
+  it('a jump: straight to the target, then the usual pacing', () => {
+    const c = new BitrateController()
+    expect(c.jump(0, t(20_000, 'chosen'))).toBe(20_000)
+    expect(c.step(2000, 20_000, t(21_000, 'uplink'))).toBeNull()
+  })
+})
+
+describe('jump gate', () => {
+  const at = (g: JumpGate, now: number, o: Partial<Parameters<JumpGate['step']>[1]> = {}) =>
+    g.step(now, { ceilingKbps: 20_000, currentKbps: 7000, targetKbps: 20_000, probedAt: -Infinity, children: true, ...o })
+
+  it('a raised quality: at once with a recent probe, else once a probe confirms it', () => {
+    const g = new JumpGate()
+    at(g, 0, { ceilingKbps: 7000, targetKbps: 7000 }) // streaming at 7 Mbps
+    // Raised, with a probe 20 s ago: straight there.
+    expect(at(g, 100_000, { probedAt: 80_000 })).toBe(true)
+    // Raised again, the last probe too old: wait, and ask for one.
+    expect(at(g, 200_000, { ceilingKbps: 28_000, currentKbps: 20_000, targetKbps: 28_000, probedAt: 200_000 - PROBE_FRESH_MS - 1 })).toBe(false)
+    expect(g.probeWanted).toBe(true)
+    expect(at(g, 202_000, { ceilingKbps: 28_000, currentKbps: 20_000, targetKbps: 28_000, probedAt: 201_000 })).toBe(true)
+    expect(g.probeWanted).toBe(false)
+  })
+
+  it("a probe that shows the uplink can't carry the raise ends it without a jump", () => {
+    const g = new JumpGate()
+    at(g, 0, { ceilingKbps: 7000, targetKbps: 7000 })
+    expect(at(g, 100_000)).toBe(false)
+    expect(at(g, 102_000, { targetKbps: 9000, currentKbps: 9000, probedAt: 101_000 })).toBe(false)
+    expect(at(g, 104_000, { targetKbps: 12_000, currentKbps: 9000, probedAt: 101_000 })).toBe(false)
+  })
+
+  it('no children: at once', () => {
+    const g = new JumpGate()
+    at(g, 0, { ceilingKbps: 7000, targetKbps: 7000, children: false })
+    expect(at(g, 1000, { children: false })).toBe(true)
+  })
+
+  it('after a cut, a later probe that shows capacity back lifts it at once', () => {
+    const g = new JumpGate()
+    at(g, 0, { currentKbps: 20_000, probedAt: 0 })
+    g.cut(10_000)
+    expect(at(g, 12_000, { currentKbps: 10_000, probedAt: 0 })).toBe(false)
+    expect(g.probeWanted).toBe(false) // the usual cadence probes, no extra one
+    expect(at(g, 16_000, { currentKbps: 10_000, probedAt: 15_000 })).toBe(true)
   })
 })
 
@@ -198,7 +255,7 @@ function simulate(o: {
         return p.bound ? p.kbps : null
       })
       const target = rateTarget({ chosenKbps: QUALITY, audienceKbps: o.audienceKbps ?? null, uplinkKbps: model.uplinkKbps, directChildren: n, peerKbps, wireAt })
-      const next = ctl.step(t * 1000, v, target)
+      const next = ctl.step(t * 1000, v, target, { fastDropAt: model.fastDropAt })
       if (next !== null) {
         const r = applyRate(next, QUALITY)
         if (r !== v) changes++

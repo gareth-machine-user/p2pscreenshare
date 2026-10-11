@@ -25,7 +25,7 @@ import { PublishedStream, type ShareOptions } from './publishedStream'
 import { Subscription, type SubscriptionContext } from './subscription'
 import { ChannelOwners } from './channelOwners'
 import { AutoFallback, liveStreamsOf, planStage, type StageSource, type ViewQuality } from './stage'
-import { discoveryDue, HeadroomProbe } from './headroom'
+import { discoveryDue, HEADROOM_LIMITED_MS, HeadroomProbe } from './headroom'
 import { PresenterRate, type RateStatus } from './presenterRate'
 import { ConnMetrics, type LinkRow } from './connMetrics'
 import { PublishRights, type PublishRequest, type PublishRightsContext, type RequestState } from './publishRights'
@@ -43,7 +43,7 @@ export interface PeerSessionOptions {
   capKbps: number | null
   /** Debug: refuse mesh links with members of these names. */
   block?: string[]
-  /** Connections per pair (media lanes, mesh/lanes.ts): 1..4, default 2; 1 = the mesh link only. */
+  /** Connections per pair (media lanes, mesh/lanes.ts): 1..6; 1 = the mesh link only. Undefined: by round trip. */
   lanes?: number
   /** Tests: the mesh's connection, lane, rendezvous and storage factories (tests/fakes/network.ts). */
   meshDeps?: Pick<MeshOptions<PeerConn>, 'connect' | 'connectLane' | 'rendezvous' | 'storage'>
@@ -643,22 +643,28 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
    * (5 s while a capacity estimate limits a bitrate the stream would use: discoveryDue) while no
    * media connection is backlogged (a backlogged one already shows what it carries) and some
    * connection has been open SETTLE_MS (so a presenter's first probe waits for its first viewer).
+   * Also when a raised quality waits for one (PresenterRate.probeWanted).
    */
   private maybeDiscover(): void {
     if (this.headroom.running || this.firstLinkAt === null) return
     const limit = this.rateControl.target?.limit
     const enc = this.encoderStatsNow
-    const due = discoveryDue({
-      now: performance.now(),
-      firstLinkAt: this.firstLinkAt,
-      lastAt: this.headroom.lastAt,
-      presenting: !!this.publishing,
-      limited: limit === 'uplink' || limit === 'viewers' || limit === 'unmeasured',
-      encoderKbps: enc?.kbps ?? null,
-      targetKbps: enc?.targetKbps ?? null,
-    })
+    const now = performance.now()
+    // A raised quality waits for a probe to confirm it (congestion.ts JumpGate): one per 5 s at most.
+    const wanted = this.rateControl.probeWanted && now - this.headroom.lastAt >= HEADROOM_LIMITED_MS
+    const due =
+      wanted ||
+      discoveryDue({
+        now,
+        firstLinkAt: this.firstLinkAt,
+        lastAt: this.headroom.lastAt,
+        presenting: !!this.publishing,
+        limited: limit === 'uplink' || limit === 'viewers' || limit === 'unmeasured',
+        encoderKbps: enc?.kbps ?? null,
+        targetKbps: enc?.targetKbps ?? null,
+      })
     // Not while every connection is settling: a probe then measures its join (capacity.ts SETTLE_MS).
-    if (due && !this.metrics.backloggedNow && !this.metrics.allSettling(performance.now())) void this.discover()
+    if (due && !this.metrics.backloggedNow && !this.metrics.allSettling(now)) void this.discover()
   }
 
   /**

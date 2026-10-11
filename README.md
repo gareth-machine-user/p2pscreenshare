@@ -129,7 +129,7 @@ Useful URL parameters (put them in the page query or the hash query):
 | `source=test&res=640x360&audio=1&mic=1` | With `share=1`: animated test pattern (prints the clock), a test tone, the microphone |
 | `source=camera&facing=environment` | With `share=1`: share a camera (`user`, the default, is the front one) |
 | `block=name1,name2` | Debug: refuse mesh links with these members, as if ICE failed |
-| `lanes=2` | Connections per peer pair, 1–4 (default 2; `1` = a single connection). See [Lanes](#lanes-experimental) |
+| `lanes=2` | Connections per peer pair, 1–6 (default 2, or 6 for a pair ≥ 100 ms apart; `1` = a single connection). See [Lanes](#lanes-experimental) |
 
 `#/host?stream=<seed>` (an owner link from older versions) still works: it stores the seed and
 redirects to the lobby page.
@@ -212,9 +212,18 @@ needs about 25 Mbps on that one connection. So each mesh pair opens **media lane
 (`src/mesh/lane.ts`, `src/mesh/lanes.ts`): extra RTCPeerConnections that carry only an unordered
 `media` channel (same packet lifetime as the mesh link's) and a `bin` channel for headroom probes.
 
-- **Setting.** `lanes=N` (page or hash query), 1–4 connections per pair, **default 2** (the mesh
-  link plus one lane). `lanes=1` is exactly the single-connection behaviour. A pair uses the
-  smaller of the two peers' settings, so one side with `lanes=1` turns lanes off for its pairs.
+On a long path one connection carries far less. After a loss, Reno regrows by one packet per round
+trip, so throughput is roughly packet size / RTT × 1.2 / √loss: at a 300 ms round trip a single
+connection carried ~0.7 Mbps with 0.5% random loss (`e2e/diag-sctp.spec.ts` under `tc netem`:
+50 Mbit/s, 150 ms each way, a 1000-packet queue), and with no loss its slow start overflowed the
+path's queue and it then took tens of seconds to regrow. N lanes carry about N times that and
+recover N times faster, so a pair that far apart opens more of them.
+
+- **Setting.** `lanes=N` (page or hash query), 1–6 connections per pair. Without it, a pair opens
+  **2** (the mesh link plus one lane), or **6** (`FAR_LANES`, one per stripe of the default 4+2)
+  when its round trip is at least 100 ms (`FAR_RTT_MS`; the offerer pings over the mesh link before
+  opening lanes). `lanes=1` is exactly the single-connection behaviour. A pair uses the smaller of
+  the two peers' settings, so one side with `lanes=1` turns lanes off for its pairs.
 - **Signaling** goes over the pair's authenticated `ctl` channel (`lane-offer`, `lane-answer`,
   `lane-close`), never the tracker; the lower peer id offers. Lanes open 1 s after the mesh link
   opens (never during the tracker rendezvous), and not at all if the link's selected candidate
@@ -232,9 +241,9 @@ needs about 25 Mbps on that one connection. So each mesh pair opens **media lane
   they measure the lanes together rather than one connection's ceiling (see
   [Rate control](#rate-control)).
 - **Connection budget.** Chromium allows 500 RTCPeerConnections per page, and closed ones may
-  count until the page reloads. With the default of 2, a 50-peer lobby uses 98 per page. A failed
-  lane is retried after 5 s, then 30 s, and a pair that has had 3 lane failures gets no more
-  lanes; a page creates at most 200 lanes in its lifetime.
+  count until the page reloads. With the default of 2, a 50-peer lobby uses 98 per page; if every
+  pair were far apart, 294. A failed lane is retried after 5 s, then 30 s, and a pair that has had
+  3 lane failures gets no more lanes; a page creates at most 300 lanes in its lifetime.
 
 **Comparing.** Open the same lobby with `lanes=1`, the default, and `lanes=4` on both presenter
 and viewer (e.g. `…/#/lobby/<code>?lanes=4`; reload the page after changing it), share at 1080p
@@ -546,7 +555,12 @@ Rate control, in both profiles:
     unknown, and with viewers the bitrate starts at no more than 4 Mbps (`START_KBPS`), going
     straight to the target once measured; a window in which everything was backlogged (or a
     probe) sets a first, low value even if a connection stalled in it, so an uplink overloaded
-    from the start doesn't stay unmeasured.
+    from the start doesn't stay unmeasured. Before the first measurement, what was delivered is
+    still remembered, so it can't start below that: a long path's first counted window often
+    comes right after a loss. Backlogged in at least 5 ordinary windows over those 40 s
+    (`SUSTAINED_WINDOWS`; stalled ones included, probes not), it is at most what they delivered on
+    average: on a long, lossy path each connection alternates bursts with retransmission
+    timeouts, and the most it delivered between them was 1.3–2 times what it carried.
   - *Connection capacity*: the same max filter over windows in which the connection was
     backlogged while most were not (it alone was the bottleneck: a slow receiver, one SCTP
     congestion window); such a connection is a *limit*. When most are backlogged together, each
@@ -569,12 +583,19 @@ Rate control, in both profiles:
     doesn't throttle the rest: its own link sheds enhancement layers and its Auto quality can
     fall back to the preview. The target is 85% of the video bitrate that budget carries (the
     stripe overhead of `stripeKbpsFor`), never above the chosen quality or what the audience's
-    relay slots carry. Down at once (at most every 4 s), up by at most 25% per 10 s, changes
-    under 5% ignored. On loopback the probe measures 100–300 Mbps and a 16 or 20 Mbps stream
+    relay slots carry. Down at once (at most every 4 s) but by at most half (`MAX_CUT`), unless
+    capacity just fell at once (a fast drop, already ~6 s of evidence) or is unmeasured; up by at
+    most 25% per 10 s, changes under 5% ignored. Straight up to the target, though, once a probe
+    confirms it (`JumpGate`): after the presenter raises the quality, with a probe from the last
+    30 s (otherwise it asks for one, at most every 5 s, and stays at the old bitrate meanwhile,
+    rather than sending the new quality and its keyframe into an unverified link: the encoder is
+    rebuilt at the old bitrate), and after a cut, once a later probe shows capacity is back. With
+    no direct children, a raised quality applies at once. On loopback the probe measures 100–300 Mbps and a 16 or 20 Mbps stream
     keeps its chosen bitrate; under the `up=` debug cap (the token bucket backs up every queue at once)
     it settles at 85% of what the cap carries per child.
   - *Stalls.* A connection whose send buffer stopped draining for 750 ms (`STALL_MS` in
-    `net/uplink.ts`) is an SCTP association stuck in loss recovery by retransmission timeout
+    `net/uplink.ts`), or 4 of its path's round trips if longer (`STALL_RTTS`: a long path's
+    retransmission timeout is longer too), is an SCTP association stuck in loss recovery by retransmission timeout
     (≥ ~400 ms, doubling), typically after a burst overflowed the connection's 64 KB UDP socket
     buffer in Chromium; the whole association delivers nothing meanwhile. Its stripes, and what
     already waits for it, move to another of the pair's connections until it drains again
@@ -629,7 +650,8 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
 | `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*`, `mediaMaxPacketLifeTimeMs` | `tuning.ts` | see the table above | Uplink layer deadlines, jitter buffer and retransmits: latency vs complete, smooth frames |
-| `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `FAST_DROP_WINDOWS`, `BACKLOGGED_SHARE`, `FROZEN_LAG_MS` | `session/capacity.ts` | 40 s, half the base layer's queue limit (1.25 s / 450 ms), 3, 90%, 400 ms | Capacity memory, when a backlog sets it at once (and for how many windows in a row), what counts as backlogged, and when a window is the page's fault |
+| `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `FAST_DROP_WINDOWS`, `BACKLOGGED_SHARE`, `SUSTAINED_WINDOWS`, `FROZEN_LAG_MS` | `session/capacity.ts` | 40 s, half the base layer's queue limit (1.25 s / 450 ms), 3, 90%, 5, 400 ms | Capacity memory, when a backlog sets it at once (and for how many windows in a row), what counts as backlogged, how much backlog makes the average a cap, and when a window is the page's fault |
+| `FAR_RTT_MS`, `FAR_LANES` | `mesh/lanes.ts` | 100 ms, 6 | Which pairs count as far apart, and how many connections they open |
 | `TARGET_SHARE`, `DOWN_GAP_MS`, `UP_GAP_MS`, `UP_STEP`, `DEADBAND` | `session/congestion.ts` | 0.85, 4 s, 10 s, 1.25, 5% | Share of the measured budget used, and how fast the bitrate follows it |
 | `HEADROOM_EVERY_MS`, `PROBE_DURATION_MS` | `session/peerSession.ts`, `session/headroom.ts` | 30 s, 1.5 s | How often (while nothing is backlogged) and how long the headroom probe pushes background bytes |
 
@@ -686,7 +708,11 @@ rate control sees and does (bitrate and what limits it, uplink and peer capacity
 delivered rate, backlog and stalls, queueing, drops, send buffers, `packetsDiscardedOnSend`, path
 RTTs, headroom probes, main-thread lag on both pages); `DIAG_STALL=lane,ms,every` emulates SCTP
 association stalls, `DIAG_BLOCK=ms,every` a busy main thread and `DIAG_UP=kbps` caps the
-presenter's upload. `tools/diag-tabs.ts` runs the same with the presenter's (or viewer's) tab really in the
+presenter's upload. `E2E_LANES=N` sets `lanes=N` on every page. A long path can be emulated with
+`tc netem` on loopback, matching UDP only so the dev server isn't slowed, e.g. 150 ms each way,
+50 Mbit/s, a 1000-packet queue and 0.5% loss (`… netem delay 150ms rate 50mbit limit 1000 loss
+0.5%`). Without the rate and the realistic queue the loss is overstated: loopback delivers bursts
+faster than Chromium's 64 KB receive socket drains (`nstat UdpRcvbufErrors`). `tools/diag-tabs.ts` runs the same with the presenter's (or viewer's) tab really in the
 background (raw CDP under a display, e.g. `xvfb-run`: Playwright keeps every page visible).
 `e2e/diag-sctp.spec.ts` measures whether a deep send buffer stalls a bare SCTP association.
 

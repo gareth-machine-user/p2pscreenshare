@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type LinkState, type MediaLink } from '../src/net/link'
 import { resetTicker } from '../src/net/ticker'
-import { STALL_MS, Uplink } from '../src/net/uplink'
+import { STALL_MS, STALL_RTTS, Uplink } from '../src/net/uplink'
 import { tuning } from '../src/tuning'
 
 /** Every message any stub link sent, in order: [link name, first payload byte]. */
@@ -290,6 +290,24 @@ describe('Uplink stall detection', () => {
     vi.advanceTimersByTime(STALL_MS + 10)
     expect(u.isStalled(a)).toBe(true)
     expect(u.countersOf(a)).toMatchObject({ lastStallAt: performance.now() })
+  })
+
+  it('on a long path, waits STALL_RTTS round trips before calling it a stall', () => {
+    const u = new Uplink()
+    const a = new BufferLink('a')
+    u.setPathRtt(a, 300)
+    a.bufferedAmount = LINK_BUFFER_LOW + 1000
+    u.stalledMs(a)
+    vi.advanceTimersByTime(STALL_RTTS * 300 - 10)
+    expect(u.isStalled(a)).toBe(false)
+    vi.advanceTimersByTime(20)
+    expect(u.isStalled(a)).toBe(true)
+    // A short path keeps STALL_MS.
+    u.setPathRtt(a, 20)
+    a.bufferedAmount--
+    u.stalledMs(a)
+    vi.advanceTimersByTime(STALL_MS + 10)
+    expect(u.isStalled(a)).toBe(true)
   })
 
   it('does not count what was just sent into the buffer as draining', () => {

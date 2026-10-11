@@ -57,13 +57,14 @@ export function trackersFrom(params: URLSearchParams): string[] | undefined {
 }
 
 /**
- * Media lanes: connections per mesh pair, `?lanes=N` (page query or hash query), 1..4. Default 2;
- * `lanes=1` is a single connection per pair. Malformed values give the default, out-of-range ones
- * are clamped.
+ * Media lanes: connections per mesh pair, `?lanes=N` (page query or hash query), 1..6; `lanes=1` is
+ * a single connection per pair. Out-of-range values are clamped. Absent or malformed: undefined,
+ * and each pair picks by its round trip (mesh/lanes.ts lanesForRtt).
  */
-export function lanesFrom(params: URLSearchParams): number {
+export function lanesFrom(params: URLSearchParams): number | undefined {
   const raw = params.get('lanes') ?? new URLSearchParams(location.search).get('lanes')
-  return clampLanes(raw === null || raw.trim() === '' ? undefined : Number(raw))
+  const n = raw === null || raw.trim() === '' ? NaN : Number(raw)
+  return Number.isFinite(n) ? clampLanes(n) : undefined
 }
 
 export function numParam(params: URLSearchParams, key: string, fallback: number): number {

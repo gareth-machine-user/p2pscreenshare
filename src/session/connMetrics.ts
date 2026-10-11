@@ -160,6 +160,7 @@ export class ConnMetrics {
   sampleLinks(now: number, lagMs: number, quiet = false): void {
     const windows: ConnWindow[] = []
     for (const [conn, rec] of this.openConns()) {
+      this.uplink.setPathRtt(conn, rec.tracker.current(now)?.baselineMs ?? null)
       const snap = this.uplink.snapshot(conn, conn.probeLink, now)
       const last = rec.last
       rec.last = snap

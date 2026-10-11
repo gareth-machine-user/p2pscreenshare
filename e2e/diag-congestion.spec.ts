@@ -41,7 +41,8 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
     autoQuality: presetName === 'auto',
   })
   const viewer = await openViewer(browser, seed, 'v')
-  await waitFor(() => viewerSnapshot(viewer), (s) => s.decoded > 30, 60_000, 'viewer playing')
+  // A viewer that never gets going (a lossy, long path) is what the timeline should show, so go on.
+  await waitFor(() => viewerSnapshot(viewer), (s) => s.decoded > 30, 60_000, 'viewer playing').catch((e) => console.log(String(e).slice(0, 300)))
   const viewerId = (await viewerSnapshot(viewer)).id
   const hostId = await host.evaluate(() => window.__p2p!.selfId)
   await host.evaluate(INSTALL_LAG)

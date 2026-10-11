@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ban } from '../src/mesh/auth'
 import { generateIdentity, type PeerIdentity } from '../src/mesh/identity'
-import { DEFAULT_LANES, isLaneMsg, LANE_MAX_FAILURES, LANE_START_MS } from '../src/mesh/lanes'
+import { DEFAULT_LANES, FAR_LANES, FAR_RTT_MS, isLaneMsg, LANE_MAX_FAILURES, LANE_START_MS, lanesForRtt } from '../src/mesh/lanes'
 import { Mesh } from '../src/mesh/mesh'
 import { Uplink } from '../src/net/uplink'
 import { encodeFragment, NO_REF } from '../src/proto/framing'
@@ -95,6 +95,22 @@ describe('lane signaling', () => {
     expect(lobby.net.openLanes(b.selfId, a.selfId)).toHaveLength(3)
   })
 
+  it('opens FAR_LANES on a pair with a long round trip, unless the page set lanes=N', async () => {
+    // 60 ms each way: a 120 ms round trip.
+    const far = await makeLobby([undefined, undefined], new FakeNetwork({ delayMs: 60 }))
+    await startAll(far)
+    const [a, b] = far.meshes
+    await until(() => a.laneCount(b.selfId) === FAR_LANES && b.laneCount(a.selfId) === FAR_LANES, 10_000, 'far lanes open')
+    expect(lanesForRtt(FAR_RTT_MS - 1, undefined)).toBe(DEFAULT_LANES)
+    expect(lanesForRtt(null, undefined)).toBe(DEFAULT_LANES)
+
+    const fixed = await makeLobby([3, undefined], new FakeNetwork({ delayMs: 60 }))
+    await startAll(fixed)
+    await until(() => fixed.meshes[0].laneCount(fixed.meshes[1].selfId) === 3, 10_000, 'lanes open')
+    await advance(5000)
+    expect(fixed.meshes[1].laneCount(fixed.meshes[0].selfId)).toBe(3)
+  })
+
   it('makes no lanes with lanes=1', async () => {
     const lobby = await makeLobby([1, 1])
     await startAll(lobby)
@@ -140,7 +156,8 @@ describe('lane signaling', () => {
     expect(isLaneMsg({ t: 'lane-offer', i: 1, sdp: 'x' })).toBe(true)
     expect(isLaneMsg({ t: 'lane-close', i: 3, d: true })).toBe(true)
     expect(isLaneMsg({ t: 'lane-offer', i: 0, sdp: 'x' })).toBe(false) // lane 0 is the mesh link
-    expect(isLaneMsg({ t: 'lane-offer', i: 4, sdp: 'x' })).toBe(false)
+    expect(isLaneMsg({ t: 'lane-offer', i: 5, sdp: 'x' })).toBe(true)
+    expect(isLaneMsg({ t: 'lane-offer', i: 6, sdp: 'x' })).toBe(false)
     expect(isLaneMsg({ t: 'lane-offer', i: 1.5, sdp: 'x' })).toBe(false)
     expect(isLaneMsg({ t: 'lane-answer', i: 1 })).toBe(false)
     expect(isLaneMsg({ t: 'lane-answer', i: 1, sdp: 'x'.repeat(100_000) })).toBe(false)
@@ -312,17 +329,17 @@ describe('lane throughput', () => {
 
 describe('lanes flag', () => {
   afterEach(() => vi.unstubAllGlobals())
-  it('parses lanes=N from the hash or page query, 1..4, default 2', () => {
+  it('parses lanes=N from the hash or page query, 1..6, none: undefined (by round trip)', () => {
     vi.stubGlobal('location', { search: '' })
     const p = (q: string) => lanesFrom(new URLSearchParams(q))
-    expect(p('')).toBe(2)
+    expect(p('')).toBeUndefined()
     expect(p('lanes=1')).toBe(1)
     expect(p('lanes=4')).toBe(4)
-    expect(p('lanes=9')).toBe(4)
+    expect(p('lanes=9')).toBe(6)
     expect(p('lanes=0')).toBe(1)
     expect(p('lanes=2.7')).toBe(2)
-    expect(p('lanes=abc')).toBe(2)
-    expect(p('lanes=')).toBe(2)
+    expect(p('lanes=abc')).toBeUndefined()
+    expect(p('lanes=')).toBeUndefined()
     vi.stubGlobal('location', { search: '?lanes=3' })
     expect(p('')).toBe(3)
     expect(p('lanes=1')).toBe(1) // the hash query wins
