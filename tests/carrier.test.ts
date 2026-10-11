@@ -385,12 +385,22 @@ describe('padding and the receive side', () => {
     expect(unpackCarrierFrame(PREFIX)).toBeNull()
   })
 
-  it('pads only behind the last waiting message, at most what was asked, never less than the minimum', () => {
+  it('pads only in what waiting messages won’t need, at most what was asked, never less than the minimum', () => {
     const p = new CarrierPacker()
     p.push(bytes(100, 1))
     p.push(bytes(5000, 2))
     // The second message doesn't fit: no padding takes its room.
     expect(p.packFrame(1000, PREFIX, 10_000).padded).toBe(0)
+    // Waiting for the stripe rule, not the budget: padding fills the rest, the waiting ones' room kept.
+    const f = packetize(frame(1, 4000), K, M, 7)
+    const q = new CarrierPacker()
+    q.push(f[0][0])
+    q.push(f[1][0])
+    const budget = 20_000
+    const r = q.packFrame(budget, PREFIX, 1 << 20)
+    expect(r.taken).toBe(f[0][0].byteLength)
+    expect(r.frame.byteLength).toBe(budget - (CARRIER_LENGTH_SIZE + f[1][0].byteLength))
+    expect(r.padded).toBeGreaterThan(0)
     p.clear()
     expect(p.packFrame(1000, PREFIX, 300).padded).toBe(300)
     expect(p.packFrame(1000, PREFIX, CARRIER_MIN_PAD - 1).padded).toBe(0)

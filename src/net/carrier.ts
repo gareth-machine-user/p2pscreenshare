@@ -107,15 +107,16 @@ export class CarrierPacker {
   }
 
   /**
-   * As pack(), but always builds a frame, with no message if none waits. Then, if nothing is left
-   * waiting and the frame has room for one, a padding message of up to `padBytes` (and at least
-   * CARRIER_MIN_PAD) fills it towards `budgetBytes`: `padded` is its length (tag included).
+   * As pack(), but always builds a frame, with no message if none waits. Then a padding message of
+   * up to `padBytes` (and at least CARRIER_MIN_PAD) fills it towards `budgetBytes`, less what the
+   * messages still waiting need: `padded` is its length (tag included). Messages often wait only
+   * for the stripe rule (one stripe of a media frame per carrier frame), so padding can't wait for
+   * an empty queue, but it never takes the budget they will need.
    * `hold`: a bare frame (prefix and trailer only), leaving the queue as it is.
    */
   packFrame(budgetBytes: number, prefix: Uint8Array = new Uint8Array(0), padBytes = 0, hold = false): { frame: Uint8Array; taken: number; padded: number } {
     if (prefix.byteLength > MAX_PREFIX) throw new RangeError(`carrier prefix too long: ${prefix.byteLength} bytes`)
     const scan = hold ? 0 : Math.min(this.queue.length, CARRIER_LOOKAHEAD + 1)
-    const queueLen = this.queue.length
     const take: number[] = []
     // Media frame -> the stripe this carrier frame already holds pieces of.
     const stripes = new Map<string, number>()
@@ -134,10 +135,13 @@ export class CarrierPacker {
       // Nothing more fits, not even an empty message.
       if (size + CARRIER_LENGTH_SIZE > budgetBytes) break
     }
-    // Padding only behind the last waiting message: it must never take a waiting one's room.
+    // Padding only in what the waiting messages won't need: it must never take their room.
     let padded = 0
-    if (!hold && padBytes > 0 && take.length === queueLen) {
-      const room = Math.min(budgetBytes - size - CARRIER_LENGTH_SIZE, MAX_CARRIER_MESSAGE)
+    if (!hold && padBytes > 0) {
+      let waiting = this.bytes
+      for (const i of take) waiting -= this.queue[i].data.byteLength
+      waiting += (this.queue.length - take.length) * CARRIER_LENGTH_SIZE
+      const room = Math.min(budgetBytes - size - waiting - CARRIER_LENGTH_SIZE, MAX_CARRIER_MESSAGE)
       const n = Math.floor(Math.min(room, padBytes))
       if (n >= CARRIER_MIN_PAD) padded = n
     }
