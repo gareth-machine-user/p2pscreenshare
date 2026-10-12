@@ -17,9 +17,12 @@
 // unpackCarrierFrame leaves it out.
 //
 // A carrier frame is lost whole (RTP has no partial delivery to the transform), and everything in
-// it with it. So a carrier frame never holds pieces of two different stripes of one media frame:
-// one lost carrier frame then costs a media frame at most one of its k+m stripes, which its m
-// parity stripes cover. Pieces of other frames, or more fragments of the same stripe, may share it.
+// it with it. So on a long path a carrier frame never holds pieces of two different stripes of one
+// media frame (the stripe rule): one lost carrier frame then costs a media frame at most one of its
+// k+m stripes, which its m parity stripes cover, instead of a retransmission a round trip later.
+// Pieces of other frames, or more fragments of the same stripe, may share it. The rule has a price:
+// a media frame's k stripes take k carrier frames (30 ms at 4+2 and 100 fps), every frame. On a
+// short path a retransmission costs less than that, so there the rule is off (carrierStripeLimit).
 
 import { peekStripe } from '../proto/framing'
 
@@ -44,6 +47,19 @@ export const CARRIER_MIN_PAD = 64
  * others, and a pack stays cheap however long the queue is.
  */
 export const CARRIER_LOOKAHEAD = 64
+/**
+ * Round trips (ms, the lowest seen) up to which the stripe rule is off: a lost carrier frame's
+ * retransmission then comes back sooner than the 30 ms (at 4+2) the rule costs every media frame.
+ */
+export const CARRIER_SHORT_RTT_MS = 30
+
+/**
+ * How many stripes of one media frame a carrier frame may hold on a path with this round trip
+ * (ms, null when unknown): one (the stripe rule), or any number on a short path.
+ */
+export function carrierStripeLimit(rttMs: number | null): number {
+  return rttMs !== null && rttMs >= 0 && rttMs <= CARRIER_SHORT_RTT_MS ? Infinity : 1
+}
 
 interface Entry {
   data: Uint8Array
@@ -60,6 +76,8 @@ interface Entry {
 export class CarrierPacker {
   private queue: Entry[] = []
   private bytes = 0
+  /** Most stripes of one media frame a carrier frame holds (1: the stripe rule; see carrierStripeLimit). */
+  stripeLimit = 1
 
   /** Queues a message. Throws a RangeError if it is too long for a carrier frame. */
   push(msg: Uint8Array): void {
@@ -118,17 +136,21 @@ export class CarrierPacker {
     if (prefix.byteLength > MAX_PREFIX) throw new RangeError(`carrier prefix too long: ${prefix.byteLength} bytes`)
     const scan = hold ? 0 : Math.min(this.queue.length, CARRIER_LOOKAHEAD + 1)
     const take: number[] = []
-    // Media frame -> the stripe this carrier frame already holds pieces of.
-    const stripes = new Map<string, number>()
+    // Media frame -> the stripes this carrier frame already holds pieces of.
+    const stripes = new Map<string, number[]>()
+    const limit = this.stripeLimit
     let size = prefix.byteLength + CARRIER_TRAILER_SIZE
     for (let i = 0; i < scan; i++) {
       const e = this.queue[i]
       const cost = CARRIER_LENGTH_SIZE + e.data.byteLength
       if (take.length > 0 && size + cost > budgetBytes) continue
-      if (e.frame !== null) {
-        const s = stripes.get(e.frame)
-        if (s !== undefined && s !== e.stripe) continue
-        stripes.set(e.frame, e.stripe)
+      if (e.frame !== null && limit !== Infinity) {
+        const held = stripes.get(e.frame)
+        if (!held) stripes.set(e.frame, [e.stripe])
+        else if (!held.includes(e.stripe)) {
+          if (held.length >= limit) continue
+          held.push(e.stripe)
+        }
       }
       take.push(i)
       size += cost

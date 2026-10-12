@@ -466,7 +466,7 @@ export class CarrierLink {
     const bps = r?.availableBps
     if (bps != null && bps > 0 && this.worker && !this.closed) {
       this.rateKbps = Math.min(bps / 1000, this.maxKbps)
-      this.worker.postMessage({ op: 'rate', kbps: this.rateKbps })
+      this.worker.postMessage({ op: 'rate', kbps: this.rateKbps, rttMs: this.rttMs })
     }
   }
 

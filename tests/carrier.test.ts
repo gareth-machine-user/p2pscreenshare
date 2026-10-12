@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   CARRIER_BURST_MS,
+  CARRIER_SHORT_RTT_MS,
   CARRIER_LENGTH_SIZE,
   CARRIER_LOOKAHEAD,
   CARRIER_MIN_PAD,
@@ -8,6 +9,7 @@ import {
   CARRIER_TRAILER_SIZE,
   CarrierBudget,
   CarrierPacker,
+  carrierStripeLimit,
   nextCarrierFrame,
   unpackCarrier,
   unpackCarrierFrame,
@@ -151,6 +153,28 @@ describe('CarrierPacker', () => {
       const msgs = unpackCarrier(f)
       expect(msgs).toEqual(stripes[i])
     })
+  })
+
+  it('holds up to its stripe limit of one media frame, or any number on a short path', () => {
+    const stripes = packetize(frame(1, 4000), K, M, 7)
+    const two = new CarrierPacker()
+    two.stripeLimit = 2
+    for (const s of stripes) for (const f of s) two.push(f)
+    expect(drain(two, 1 << 20).length).toBe((K + M) / 2)
+    const all = new CarrierPacker()
+    all.stripeLimit = carrierStripeLimit(5)
+    for (const s of stripes) for (const f of s) all.push(f)
+    const frames = drain(all, 1 << 20)
+    expect(frames.length).toBe(1)
+    expect(unpackCarrier(frames[0])).toEqual(stripes.flat())
+  })
+
+  it('keeps the stripe rule unless the path is known to be short', () => {
+    expect(carrierStripeLimit(null)).toBe(1)
+    expect(carrierStripeLimit(CARRIER_SHORT_RTT_MS + 1)).toBe(1)
+    expect(carrierStripeLimit(300)).toBe(1)
+    expect(carrierStripeLimit(CARRIER_SHORT_RTT_MS)).toBe(Infinity)
+    expect(carrierStripeLimit(0)).toBe(Infinity)
   })
 
   it('packs fragments of one stripe piece together, and other frames alongside', () => {
