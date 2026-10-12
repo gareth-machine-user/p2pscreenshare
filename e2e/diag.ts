@@ -197,7 +197,7 @@ async function viewerSample(hostId: string, lag: typeof takeLag) {
   window.__transit = []
   const vid = tr.filter((x) => !x.audio && !x.key).map((x) => x.ms).sort((a, b) => a - b)
   const q = (a: number[], f: number) => (a.length ? Math.round(a[Math.min(a.length - 1, Math.floor(a.length * f))]) : null)
-  const keys = tr.filter((x) => x.key).map((x) => ({ ms: Math.round(x.ms), kb: Math.round(x.bytes / 1024) }))
+  const keys = tr.filter((x) => x.key && !x.audio).map((x) => ({ ms: Math.round(x.ms), kb: Math.round(x.bytes / 1024) }))
   const aud = tr.filter((x) => x.audio).map((x) => x.ms).sort((a, b) => a - b)
   const transit = { min: q(vid, 0), med: q(vid, 0.5), q99: q(vid, 0.99), max: q(vid, 1), keys, audMed: q(aud, 0.5), audMax: q(aud, 1) }
   const ps = sub?.player.stats
