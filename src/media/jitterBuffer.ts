@@ -17,7 +17,11 @@ export interface PlayoutClockOptions {
   /**
    * How long the largest recent buffer is kept after the spike that needed it (ms). A connection
    * that hiccups every half minute would otherwise shrink its buffer between hiccups (the transit
-   * window is only a few seconds) and stall on each one.
+   * window is only a few seconds) and stall on each one. Only a spike that recurs is kept that
+   * long, though, and only as large as it recurred: another one came within 2 x holdMs, more than
+   * 1.5 windows apart. One that doesn't (the first keyframe at a higher bitrate, a keyframe that
+   * needed a retransmission) is kept holdMs / 4: held for holdMs, a one-off spike set the delay for
+   * over a minute and then glided down at 8 ms/s.
    */
   holdMs: number
   /**
@@ -85,8 +89,10 @@ export class PlayoutClock {
   private lastUpdate = 0
   private opts: PlayoutClockOptions
   private readonly base: PlayoutClockOptions
-  /** The largest buffer needed lately (beyond the fastest path) and when it was last needed. */
-  private peak: { extra: number; at: number } | null = null
+  /** The buffer needed (beyond the fastest path), the most of each second, for 2 x holdMs. */
+  private needs: { extra: number; at: number }[] = []
+  /** What of `needs` is kept now (see holdMs), as of the last change. */
+  private heldExtra = 0
   /** When the first sample completed (warmupMs counts from it). */
   private firstAt: number | null = null
   /** The warm-up is over (for good). */
@@ -105,7 +111,8 @@ export class PlayoutClock {
    */
   setBuffering(b: Buffering): void {
     this.opts = { ...this.base, ...bufferingOptions(b) }
-    this.peak = null
+    this.needs = []
+    this.heldExtra = 0
     const now = this.lastUpdate
     this.recompute(now)
     if (this.delay !== null && this.target < this.delay) this.delay = this.target
@@ -131,9 +138,9 @@ export class PlayoutClock {
     const warming = !this.warm && this.warming(now, extra, minT + extra + this.opts.extraMs)
     if (!warming) this.warm = true
     // Keep the largest recent need for holdMs after it was last needed (not a join's transient).
-    if (warming) this.peak = null
-    else if (!this.peak || extra >= this.peak.extra || now - this.peak.at > this.opts.holdMs) this.peak = { extra, at: now }
-    extra = Math.max(extra, this.peak?.extra ?? 0) + this.opts.extraMs
+    if (warming) this.needs = []
+    else extra = Math.max(extra, this.held(now, extra))
+    extra += this.opts.extraMs
     this.target = minT + extra
     if (this.delay === null) {
       this.delay = this.target
@@ -146,6 +153,32 @@ export class PlayoutClock {
       this.delay += step
     }
     this.lastUpdate = now
+  }
+
+  /** Notes the buffer needed now; returns the most of what was needed lately to keep (see holdMs). */
+  private held(now: number, extra: number): number {
+    const last = this.needs.at(-1)
+    if (last && now >= last.at && now - last.at < 1000) {
+      if (extra <= last.extra) return this.heldExtra
+      last.extra = extra
+    } else {
+      this.needs.push({ extra, at: now })
+      while (now - this.needs[0].at > 2 * this.opts.holdMs) this.needs.shift()
+    }
+    // Every need for holdMs / 4; for holdMs, as much of it as came again apart from it.
+    const apart = 1.5 * this.opts.windowMs
+    let held = 0
+    for (const n of this.needs) {
+      const age = now - n.at
+      if (n.extra <= held || age > this.opts.holdMs) continue
+      if (age <= this.opts.holdMs / 4) {
+        held = n.extra
+        continue
+      }
+      for (const m of this.needs) if (m.extra > held && Math.abs(m.at - n.at) > apart) held = Math.min(n.extra, m.extra)
+    }
+    this.heldExtra = held
+    return held
   }
 
   /**

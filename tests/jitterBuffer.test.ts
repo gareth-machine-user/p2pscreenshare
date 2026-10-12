@@ -233,23 +233,39 @@ describe('PlayoutClock', () => {
     expect(c.renderAt(0)).toBeCloseTo(300, 6)
   })
 
-  it('keeps the buffer a spike needed for holdMs, then glides down', () => {
-    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000, warmupMs: 0 })
+  it('keeps the buffer a one-off spike needed for holdMs / 4, then glides down', () => {
+    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 40_000, warmupMs: 0 })
     // Steady 100 ms transit, then one 600 ms spike at t=1 s.
     for (let t = 0; t <= 1000; t += 20) c.addSample(t, t + 100)
     c.addSample(1000, 1600)
     expect(c.bufferMs).toBe(500)
-    // The spike leaves the 1 s window at t=2 s, but the buffer stays for the 30 s hold.
-    for (let t = 1020; t <= 30_000; t += 20) c.addSample(t, t + 100)
+    // The spike leaves the 1 s window at t=2.6 s, but the buffer stays for the 10 s hold.
+    for (let t = 1020; t <= 12_000; t += 20) c.addSample(t, t + 100)
     expect(c.bufferMs).toBe(500)
-    // The hold counts from when the spike was last needed: its sample (completed at 1.6 s) leaves
-    // the 1 s window at 2.6 s, so the hold ends at 32.6 s. Then the buffer falls at 100 ms/s.
-    for (let t = 30_020; t <= 34_600; t += 20) c.addSample(t, t + 100)
-    expect(c.bufferMs).toBeGreaterThan(280)
-    expect(c.bufferMs).toBeLessThan(320)
+    // The hold counts from when the spike was last needed (2.6 s, less up to the 1 s the needs
+    // are kept by), so it ends between 11.6 and 12.6 s. Then the buffer falls at 100 ms/s.
+    for (let t = 12_020; t <= 15_600; t += 20) c.addSample(t, t + 100)
+    expect(c.bufferMs).toBeGreaterThan(100)
+    expect(c.bufferMs).toBeLessThan(500)
     // Eventually back to the steady need.
-    for (let t = 34_620; t <= 40_000; t += 20) c.addSample(t, t + 100)
+    for (let t = 15_620; t <= 22_000; t += 20) c.addSample(t, t + 100)
     expect(c.bufferMs).toBe(0)
+  })
+
+  it('keeps a recurring spike for holdMs, but a one-off larger one only holdMs / 4', () => {
+    const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 1e9, holdMs: 40_000, warmupMs: 0 })
+    // 300 ms spikes every 15 s, and one of 600 ms at 31 s.
+    const spike = (t: number) => (t % 15_000 === 0 ? 300 : t === 31_000 ? 600 : 0)
+    let min = Infinity
+    let at45 = 0
+    for (let t = 0; t <= 90_000; t += 20) {
+      c.addSample(t, t + 100 + spike(t))
+      if (t > 16_000) min = Math.min(min, c.bufferMs)
+      if (t === 45_000 - 20) at45 = c.bufferMs
+    }
+    // The recurring 300 ms never goes once it recurred; the one-off 600 had gone by 45 s.
+    expect(min).toBe(300)
+    expect(at45).toBe(300)
   })
 
   it("a join's first spike is not held: the buffer comes back down within the warm-up", () => {
@@ -287,9 +303,9 @@ describe('PlayoutClock', () => {
     const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000, warmupMs: 0 })
     let min = Infinity
     for (let t = 0; t <= 120_000; t += 20) {
-      // A 400 ms hiccup every 25 s.
+      // A 400 ms hiccup every 25 s: from its second time on, it is held.
       c.addSample(t, t + 100 + (t % 25_000 === 0 ? 400 : 0))
-      if (t > 1000) min = Math.min(min, c.bufferMs)
+      if (t > 26_000) min = Math.min(min, c.bufferMs)
     }
     expect(min).toBe(400)
   })
