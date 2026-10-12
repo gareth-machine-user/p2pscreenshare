@@ -293,3 +293,23 @@ function walk(frame: Uint8Array, prefixLen: number): Uint8Array[] {
   }
   return out
 }
+
+/**
+ * Received messages copied into one compact buffer, for the receive transform to hand the page:
+ * `offs` holds [start, length] pairs into `buf`. A copy, not views into the carrier frame, so
+ * what the page keeps (a relay's GOP cache) holds only the messages, not the whole frame (its VP8
+ * prefix and padding).
+ */
+export function compactMessages(messages: Uint8Array[]): { buf: ArrayBuffer; offs: number[] } {
+  let total = 0
+  for (const m of messages) total += m.byteLength
+  const out = new Uint8Array(total)
+  const offs: number[] = []
+  let pos = 0
+  for (const m of messages) {
+    out.set(m, pos)
+    offs.push(pos, m.byteLength)
+    pos += m.byteLength
+  }
+  return { buf: out.buffer, offs }
+}

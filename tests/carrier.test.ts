@@ -8,6 +8,7 @@ import {
   CARRIER_TRAILER_SIZE,
   CarrierBudget,
   CarrierPacker,
+  compactMessages,
   nextCarrierFrame,
   unpackCarrier,
   unpackCarrierFrame,
@@ -357,6 +358,22 @@ describe('carrier frame loss', () => {
 })
 
 describe('padding and the receive side', () => {
+  it('hands the page the messages alone, in a buffer of their own', () => {
+    const p = new CarrierPacker()
+    p.push(bytes(100, 1))
+    p.push(bytes(50, 2))
+    const r = p.packFrame(2000, PREFIX, 10_000)
+    const u = unpackCarrierFrame(r.frame)!
+    const { buf, offs } = compactMessages(u.messages)
+    // No VP8 prefix, no padding: a cached fragment keeps nothing of the carrier frame alive.
+    expect(buf.byteLength).toBe(150)
+    expect(buf).not.toBe(r.frame.buffer)
+    expect(offs).toEqual([0, 100, 100, 50])
+    expect(new Uint8Array(buf, offs[0], offs[1])).toEqual(bytes(100, 1))
+    expect(new Uint8Array(buf, offs[2], offs[3])).toEqual(bytes(50, 2))
+    expect(compactMessages([])).toEqual({ buf: new ArrayBuffer(0), offs: [] })
+  })
+
   it('reports the head message’s cost', () => {
     const p = new CarrierPacker()
     expect(p.headBytes).toBe(0)

@@ -30,12 +30,15 @@
 //   { op: 'idle', idle }                       the clock slowed down (true) or sped up (false)
 //   { op: 'packed', media, pad }               bytes of messages / padding put in frames since the last
 //   { op: 'recv', buf, offs }                  received messages: [start, length] pairs into `buf`
+//                                              (just the messages, copied: compactMessages)
 //   { op: 'error', side, error }
-import { CarrierBudget, CarrierPacker, nextCarrierFrame, unpackCarrierFrame } from '../net/carrier'
+import { CarrierBudget, CarrierPacker, compactMessages, nextCarrierFrame, unpackCarrierFrame } from '../net/carrier'
 
 /** The parts of an encoded frame used here (RTCEncodedVideoFrame). */
 interface EncodedFrame {
   data: ArrayBuffer
+  /** The RTP timestamp, where getMetadata() has no rtpTimestamp (older Chromium). */
+  timestamp?: number
   getMetadata(): { rtpTimestamp?: number }
 }
 
@@ -117,22 +120,20 @@ function send(frame: EncodedFrame, controller: TransformStreamDefaultController<
 }
 
 function recv(frame: EncodedFrame, controller: TransformStreamDefaultController<EncodedFrame>): void {
-  const ts = frame.getMetadata().rtpTimestamp
+  const ts = frame.getMetadata().rtpTimestamp ?? frame.timestamp
   if (ts !== undefined) {
     if (seen.has(ts)) return
     seen.add(ts)
     seenOrder.push(ts)
     if (seenOrder.length > DEDUPE_WINDOW) seen.delete(seenOrder.shift()!)
   }
-  const buf = frame.data
-  const c = unpackCarrierFrame(new Uint8Array(buf))
+  const c = unpackCarrierFrame(new Uint8Array(frame.data))
   // Not a carrier frame: the decoder's as is.
   if (!c) return controller.enqueue(frame)
   frame.data = c.prefix.slice().buffer
   controller.enqueue(frame)
   if (!c.messages.length) return
-  const offs: number[] = []
-  for (const m of c.messages) offs.push(m.byteOffset, m.byteLength)
+  const { buf, offs } = compactMessages(c.messages)
   scope.postMessage({ op: 'recv', buf, offs }, [buf])
 }
 
