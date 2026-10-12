@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { CapacityModel, FROZEN_LAG_MS, SETTLE_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
-import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, JumpGate, MAX_CUT, PROBE_FRESH_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, ViewerSettle, type RateInputs } from '../src/session/congestion'
+import { CapacityModel, ESTIMATE_SETTLE_MS, FROZEN_LAG_MS, SETTLE_MS, stripeKbpsFor, type ConnWindow } from '../src/session/capacity'
+import { AUDIENCE_CUT_GAP_MS, AUDIENCE_LIFT_MS, AudienceCap, audienceLimit, BitrateController, DOWN_GAP_MS, JumpGate, MAX_CUT, UP_GAP_MS, PROBE_FRESH_MS, rateTarget, START_KBPS, TARGET_SHARE, upperMedian, videoKbpsForWire, ViewerSettle, type RateInputs } from '../src/session/congestion'
 import { LINK_BUFFER_HIGH } from '../src/net/link'
 import { PresenterRate } from '../src/session/presenterRate'
 import type { PublishedStream } from '../src/session/publishedStream'
@@ -39,6 +39,9 @@ describe('bitrate target', () => {
     expect(c.step(0, QUALITY, rateTarget(base))).toBe(START_KBPS)
     // Measured 2 s later: straight to the target, not +25% per 10 s.
     expect(c.step(2000, START_KBPS, rateTarget({ ...base, uplinkKbps: 200_000 }))).toBe(QUALITY)
+    // Every direct child known (the browser's estimates), the uplink not yet: no gentle start.
+    expect(rateTarget({ ...base, peerKbps: [30_000], estimated: true })).toMatchObject({ kbps: QUALITY, limit: 'chosen', estimated: true })
+    expect(rateTarget({ ...base, directChildren: 2, peerKbps: [30_000, null] }).limit).toBe('unmeasured')
   })
 
   it('a fixed-capacity link: 85% of what it carries', () => {
@@ -67,13 +70,26 @@ describe('bitrate target', () => {
     expect(upperMedian([5, 1, 3, 2])).toBe(3)
   })
 
+  it("with the browser's estimates: the children's median, not the uplink's share (their mean), unless the up= shaper binds", () => {
+    // 3 children at 20, 20 and 1.5 Mbps: the estimates' sum per child (13.8 Mbps) is their mean.
+    const i = { ...base, uplinkKbps: 41_500, directChildren: 3, peerKbps: [20_000, 20_000, 1500], estimated: true }
+    expect(rateTarget(i)).toMatchObject({ limit: 'viewers', medianPeerKbps: 20_000, estimated: true })
+    expect(rateTarget(i).kbps).toBeCloseTo(settleAt(20_000))
+    // Measured capacities: the share binds as before.
+    expect(rateTarget({ ...i, estimated: false }).limit).toBe('uplink')
+    // A 6 Mbps shaper: 2 Mbps each, followed carefully (not an estimate).
+    const capped = rateTarget({ ...i, uplinkCapKbps: 6000 })
+    expect(capped).toMatchObject({ limit: 'uplink', estimated: false })
+    expect(capped.kbps).toBeCloseTo(settleAt(2000))
+  })
+
   it('never above what the audience can relay', () => {
     expect(rateTarget({ ...base, uplinkKbps: 100_000, audienceKbps: 6000 })).toMatchObject({ kbps: 6000, limit: 'audience' })
   })
 })
 
 describe('bitrate pacing', () => {
-  const t = (kbps: number, limit: 'uplink' | 'chosen' = 'uplink') => ({ kbps, limit, uplinkPerChildKbps: null, medianPeerKbps: null })
+  const t = (kbps: number, limit: 'uplink' | 'chosen' | 'viewers' = 'uplink', estimated = false) => ({ kbps, limit, uplinkPerChildKbps: null, medianPeerKbps: null, estimated })
 
   it('down at once, at most every 4 s; up by at most 25% per 10 s; small changes ignored', () => {
     const c = new BitrateController()
@@ -101,6 +117,28 @@ describe('bitrate pacing', () => {
     expect(c.step(2 * DOWN_GAP_MS, 4000, t(1000), { fastDropAt: DOWN_GAP_MS + 1 })).toBe(1000)
     // The same fast drop doesn't steepen the next cut.
     expect(c.step(3 * DOWN_GAP_MS, 1000, t(300), { fastDropAt: DOWN_GAP_MS + 1 })).toBe(500)
+  })
+
+  it("the browser's estimate falling (20 → 3 Mbps): straight down to its target in one step", () => {
+    const c = new BitrateController()
+    const low = settleAt(3000)
+    expect(c.step(0, 13_000, t(low, 'viewers', true))).toBe(low)
+    // At most one cut per DOWN_GAP_MS still.
+    expect(c.step(2000, low, t(low / 2, 'viewers', true))).toBeNull()
+    expect(c.step(DOWN_GAP_MS, low, t(low / 2, 'viewers', true))).toBe(low / 2)
+  })
+
+  it("the browser's estimate rising: straight up to its target, not 25% per 10 s, and soon after a cut", () => {
+    const c = new BitrateController()
+    expect(c.step(0, 8000, t(4000, 'viewers', true))).toBe(4000)
+    // Within DOWN_GAP_MS of the cut: held (a dip and its recovery aren't two changes).
+    expect(c.step(2000, 4000, t(12_000, 'viewers', true))).toBeNull()
+    expect(c.step(DOWN_GAP_MS, 4000, t(12_000, 'viewers', true))).toBe(12_000)
+    expect(DOWN_GAP_MS).toBeLessThan(UP_GAP_MS)
+    // Then again DOWN_GAP_MS later, all the way to the chosen quality; under 5% is still noise.
+    expect(c.step(DOWN_GAP_MS + 2000, 12_000, t(16_000, 'chosen', true))).toBeNull()
+    expect(c.step(2 * DOWN_GAP_MS, 12_000, t(16_000, 'chosen', true))).toBe(16_000)
+    expect(c.step(4 * DOWN_GAP_MS, 15_000, t(15_500, 'viewers', true))).toBeNull()
   })
 
   it('a jump: straight to the target, then the usual pacing', () => {
@@ -444,33 +482,79 @@ describe('viewer settle', () => {
   })
 })
 
-describe("a viewer whose capacity is the browser's estimate (an RTP lane)", () => {
-  /** A presenter's stream with one direct child `v` fed every stripe (PublishedStream, as presenterRate.ts reads it). */
-  function stream(): PublishedStream {
-    const full = { stripes: STRIPES, k: K, withAudio: true, kbps: QUALITY, limited: null, subscribers: new Set(['v']), topology: { parents: { v: Array(STRIPES).fill('me') } } }
-    return { full, ceilingKbps: QUALITY, adaptBitrate: (kbps: number) => (full.kbps = kbps) } as unknown as PublishedStream
+describe("the browser's estimates, end to end (PresenterRate)", () => {
+  /** A presenter's stream feeding every stripe to each of `children` (PublishedStream, as presenterRate.ts reads it). */
+  function stream(children: string[], kbps = QUALITY): PublishedStream {
+    const parents = Object.fromEntries(children.map((c) => [c, Array(STRIPES).fill('me')]))
+    const full = { stripes: STRIPES, k: K, withAudio: true, kbps, limited: null, subscribers: new Set(children), topology: { parents } }
+    return { full, ceilingKbps: QUALITY, adaptBitrate: (v: number) => (full.kbps = applyRate(v, QUALITY)) } as unknown as PublishedStream
+  }
+  /** Every 2 s from `from` to `to` (ms): each viewer's estimate polled, then a window. */
+  function run(rate: PresenterRate, capacity: CapacityModel, s: PublishedStream, from: number, to: number, est: (t: number, peer: string) => number) {
+    const log: { t: number; kbps: number }[] = []
+    for (let t = from; t <= to; t += 2000) {
+      for (const peer of Object.keys(s.full!.topology.parents)) capacity.setKnown(`${peer}-conn`, peer, est(t, peer), t)
+      rate.adapt(s, t)
+      log.push({ t, kbps: s.full!.kbps })
+    }
+    return log
   }
 
-  it('is a limit: it counts towards the median once settled, like a peer that was its own bottleneck', () => {
+  it('leaves START_KBPS within a few seconds once the estimates are in, not after 30', () => {
     const capacity = new CapacityModel()
-    // The uplink has room to spare, and the mesh link to v was never its own bottleneck.
-    capacity.update(0, [{ id: 'v0', peer: 'v', kbps: 200_000, active: true, backlogged: true, stalled: false, queueMs: 0 }], { probe: true })
+    // Connections that would still be settling without an estimate: it doesn't matter with one.
+    const rate = new PresenterRate('me', capacity, () => false)
+    const s = stream(['v'], START_KBPS)
+    const log = run(rate, capacity, s, 0, 10_000, (t) => (t === 0 ? 2500 : 30_000))
+    expect(log[0].kbps).toBe(START_KBPS)
+    const leftAt = log.find((x) => x.kbps !== START_KBPS)!.t
+    expect(leftAt).toBeLessThanOrEqual(ESTIMATE_SETTLE_MS + 2000)
+    expect(leftAt).toBeLessThan(SETTLE_MS)
+    expect(s.full!.kbps).toBe(QUALITY)
+  })
+
+  it('a slow viewer of three: its estimate falling cuts neither the uplink nor the bitrate below the median', () => {
+    const capacity = new CapacityModel()
     const rate = new PresenterRate('me', capacity, () => true)
-    const s = stream()
+    const s = stream(['a', 'b', 'c'])
+    const est = (t: number, p: string) => (p === 'a' && t >= 20_000 ? 1500 : p === 'b' && t >= 20_000 ? 18_000 : 20_000)
+    run(rate, capacity, s, 0, 18_000, est)
+    const before = s.full!.kbps
+    // Every carrier backlogged by its own bucket: once taken as a full shared uplink.
+    const backed = (t: number) => ['a', 'b', 'c'].map((p): ConnWindow => ({ id: `${p}-conn`, peer: p, kbps: est(t, p), active: true, backlogged: true, stalled: false, queueMs: 2000 }))
+    for (let t = 20_000; t <= 40_000; t += 2000) {
+      capacity.update(t, backed(t))
+      run(rate, capacity, s, t, t, est)
+    }
+    expect(capacity.uplinkKbps).toBe(39_500)
+    expect(rate.target).toMatchObject({ limit: 'viewers', medianPeerKbps: 18_000 })
+    expect(s.full!.kbps).toBe(applyRate(settleAt(18_000), QUALITY))
+    expect(before).toBe(applyRate(settleAt(20_000), QUALITY))
+  })
+
+  it("a 20 → 3 Mbps estimate cuts to its target at the next window, and recovers as fast", () => {
+    const capacity = new CapacityModel()
+    const rate = new PresenterRate('me', capacity, () => true)
+    const s = stream(['v'])
+    const est = (t: number) => (t < 30_000 || t >= 50_000 ? 20_000 : 3000)
+    const log = run(rate, capacity, s, 0, 70_000, est)
+    const at = (t: number) => log.find((x) => x.t === t)!.kbps
+    expect(at(28_000)).toBe(applyRate(settleAt(20_000), QUALITY))
+    expect(at(30_000)).toBe(applyRate(settleAt(3000), QUALITY))
+    // Back up in one step (within DOWN_GAP_MS of the change), not 25% per 10 s.
+    expect(at(50_000 + DOWN_GAP_MS)).toBe(applyRate(settleAt(20_000), QUALITY))
+  })
+
+  it('a child without an estimate still waits out SETTLE_MS (ViewerSettle)', () => {
+    const capacity = new CapacityModel()
+    // The connection to v measured itself its own bottleneck: no estimate.
+    for (const t of [0, 2000, 4000]) capacity.update(t, [{ id: 'v0', peer: 'v', kbps: 8000, active: true, backlogged: true, stalled: false, queueMs: 2000 }, { id: 'w0', peer: 'w', kbps: 8000, active: true, backlogged: false, stalled: false, queueMs: 0 }, { id: 'x0', peer: 'x', kbps: 8000, active: true, backlogged: false, stalled: false, queueMs: 0 }])
+    expect(capacity.peer('v')).toEqual({ kbps: 8000, bound: true, estimated: false })
+    const rate = new PresenterRate('me', capacity, () => true)
+    const s = stream(['v'])
     rate.adapt(s, 0)
-    expect(rate.target).toMatchObject({ limit: 'chosen', medianPeerKbps: null })
-    // Its RTP lane reports 8 Mbps: the peer is bound, its capacity the mesh link's plus the estimate.
-    capacity.setKnown('v1', 'v', 8000)
-    expect(capacity.peer('v')).toEqual({ kbps: 208_000, bound: true })
-    // It counts only once fed SETTLE_MS (ViewerSettle), as any viewer.
-    rate.adapt(s, 2000)
     expect(rate.target!.medianPeerKbps).toBeNull()
     rate.adapt(s, SETTLE_MS)
-    expect(rate.target!.medianPeerKbps).toBe(208_000)
-    // With the RTP lane alone (the mesh link closed), the estimate sets the bitrate.
-    capacity.retain(new Set(['v1']))
-    rate.adapt(s, SETTLE_MS + 2000)
-    expect(rate.target).toMatchObject({ limit: 'viewers', medianPeerKbps: 8000 })
-    expect(rate.target!.kbps).toBeCloseTo(settleAt(8000))
+    expect(rate.target).toMatchObject({ limit: 'viewers', medianPeerKbps: 8000, estimated: false })
   })
 })

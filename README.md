@@ -176,12 +176,9 @@ variable `VITE_TRACKERS` (comma-separated `wss://` URLs).
    record; viewers send `subscribe` directly to the publisher, and relay only in channels they
    watch.
 5. **Capacity** (`src/session/capacity.ts`). Each connection's capacity is the browser's own
-   bandwidth estimate for its carrier track (see [Media transport](#media-transport-the-rtp-carrier)).
-   The uplink's is measured: what each connection *delivered* (bytes handed to its carrier, less
-   what waits in it) per 2 s window, and whether it was *backlogged* (its uplink queue never
-   emptied and live media queued ≥ 150 ms or was dropped: it carried all it could). The uplink's
-   capacity is the most delivered over the last 40 s in windows where most connections were
-   backlogged at once (see [Rate control](#rate-control)). 75% of the uplink's capacity is split into relay
+   bandwidth estimate for its carrier track (see [Media transport](#media-transport-the-rtp-carrier)),
+   counted once it has been polled for 3 s, and the uplink's is the sum of those estimates (see
+   [Rate control](#rate-control); a browser that publishes no estimate measures instead). 75% of the uplink's capacity is split into relay
    slots per watched channel (a publisher first reserves its own roots), weighted towards channels
    whose publisher reports a deficit, and gossiped with it.
 6. **Planning** (`src/session/channelPublisher.ts`, `src/topology/planner.ts`). The publisher replans
@@ -265,10 +262,13 @@ several SCTP connections per pair ("lanes") to multiply that ceiling; the carrie
   timers): 100 fps while there is something to send, 5 fps once nothing has been for 2 s, and back
   at once when something comes, so a lobby's idle pairs don't each run an encoder at 100 fps.
 - **Capacity and probes.** The estimate, capped, is the connection's capacity
-  (`CapacityModel.setKnown`). GCC only grows an estimate the sender uses (to about 1.5 times what it
-  sends), so a stream that sends less than it (a still screen) would never raise it. The headroom
-  probe's bytes therefore go into the carrier as padding, after the media and within the budget,
-  so every probe also pushes the estimate up; what it delivers measures the uplink as before.
+  (`CapacityModel.setKnown`), and the estimates' sum is the uplink's. GCC only grows an estimate the
+  sender uses (to about 1.5 times what it sends), so a stream that sends less than it (a still
+  screen) would never raise it. The headroom probe's bytes therefore go into the carrier as
+  padding, after the media and within the budget, so every probe pushes the estimate up (and,
+  loading every connection at once, lets their GCCs find a shared bottleneck). What a carrier
+  delivers is not taken as capacity: its token bucket lets through at most the estimate, so it
+  would only read the estimate back.
 - **Requirements.** Encoded transforms, a frame source (`MediaStreamTrackGenerator`, else a
   canvas's `captureStream`) and VP8. Without them the lobby says the browser isn't supported;
   there is no fallback transport.
@@ -542,76 +542,73 @@ Rate control, in both profiles:
 - **Frame-aware dropping.** When one fragment of a frame misses its deadline on a link, the rest of
   that frame's fragments on that link are dropped too, freeing upload for frames that can still
   play.
-- **Rate control.** <a id="rate-control"></a>One measured quantity, the rate each connection
-  delivered, replaces inferring "full" from proxies (`session/capacity.ts`, pure):
-  - *Windows.* Every 2 s, per connection: delivered = bytes handed to its carrier (media and probe
-    padding) minus the growth of its `bufferedAmount`, per second. The window
-    is *backlogged* if the connection's uplink queue held something for ≥ 90% of it (data waits
-    in the uplink only while the carrier holds 64 KiB) and live media queued 150 ms on average
-    or was dropped (`CONGESTED_QUEUE_MS`: a queue that is merely never empty is a busy link, not a
-    full one, and measuring it as capacity spiralled the bitrate down to the floor), *stalled* if the connection stalled in
-    it (`STALL_MS`, below), and the whole window is ignored if the page *froze* (the main thread
-    lagged ≥ 400 ms: what queued then is this computer's doing). A connection open less than
-    30 s (`SETTLE_MS`) is *settling*: it is backlogged by its catch-up (the GOP replay) and its
-    own slow start (and in Chromium, losses while it starts), so its windows, probes' too, only
-    raise estimates already made; a joiner's first burst used to read as a full uplink and cut
-    the bitrate at once. No probe runs while every connection is settling, so with a first
-    viewer the stream holds `START_KBPS` for its first 30 s, then measures; a viewer's pushback
-    waits until it has been fed, and its connections open, for 30 s. Windows in which a connection carried a
-    child's catch-up (a GOP replay), and the two after a quality change (the new encoder's
-    keyframe), are transient the same way.
-  - *Uplink capacity* (what a peer gossips as `capacityKbps`): the most delivered in total over
-    the last 40 s in windows where most active connections were backlogged at once, with no
-    stall: longer than the probes' 30 s cadence, so a backlogged window between probes doesn't
-    forget the last one. Between such windows it holds; any window raises it to at least what was
-    delivered; three backlogged windows in a row (about 6 s) queueing over half the base layer's
-    queue limit (`FAST_DROP_QUEUE_MS`: 1.25 s, or 450 ms with `priority=latency`) set it at once
-    to the most any of them delivered (no max filter). A single deep window is mostly a burst (a
-    keyframe at a new bitrate, a short stall), and what it delivered is the
-    burst being recovered, not the link's rate. Until one comes it is
-    unknown, and with viewers the bitrate starts at no more than 4 Mbps (`START_KBPS`), going
-    straight to the target once measured; a window in which everything was backlogged (or a
-    probe) sets a first, low value even if a connection stalled in it, so an uplink overloaded
-    from the start doesn't stay unmeasured. Before the first measurement, what was delivered is
-    still remembered, so it can't start below that: a long path's first counted window often
-    comes right after a loss. Backlogged in at least 5 ordinary windows over those 40 s
-    (`SUSTAINED_WINDOWS`; stalled ones included, probes not), it is at most what they delivered on
-    average: on a long, lossy path each connection alternates bursts with retransmission
-    timeouts, and the most it delivered between them was 1.3–2 times what it carried.
+- **Rate control.** <a id="rate-control"></a>Capacity is the browser's own congestion control
+  (`session/capacity.ts`, pure):
   - *Connection capacity*: the browser's estimate for the connection's carrier (getStats
-    `availableOutgoingBitrate` on its selected candidate pair), capped for its round trip,
-    polled every 2 s. It is a *limit*: delivered-rate windows don't set or cut it (no fast drop of
-    its own: the estimate already falls as fast as the browser sees loss or delay), though they
-    still count for the uplink. (Without an estimate, a connection falls back to a max filter over
-    windows in which it was backlogged while most were not.) A peer's capacity is its
-    connection's.
+    `availableOutgoingBitrate` on its selected candidate pair), capped for its round trip, polled
+    every 2 s. It is a *limit*, decided by GCC, which probes and backs off on its own, and it counts
+    once polled for 3 s (`ESTIMATE_SETTLE_MS`, so from the third poll): the first poll can still
+    read the seeded 2.5 Mbps start, and Chromium's initial probes take a second or two to show. A
+    peer's capacity is its connection's.
+  - *Uplink capacity* (what a peer gossips as `capacityKbps`): the sum of the settled estimates.
+    Each is what that connection carries now; where they share a bottleneck, each GCC backs off to
+    its share (a headroom probe loads them all at once). An idle connection's estimate can stay
+    high until the next probe. The `up=` debug shaper sits before the carriers, where no estimate
+    sees it, so its cap bounds the sum directly.
+  - *Windows.* Every 2 s, per connection: delivered = bytes handed to its carrier (media and probe
+    padding) minus the growth of its `bufferedAmount`, per second; *backlogged* if its uplink queue
+    held something for ≥ 90% of the window and live media queued 150 ms on average or was dropped
+    (`CONGESTED_QUEUE_MS`); *stalled* if it stalled (`STALL_MS`, below); the whole window is ignored
+    if the page *froze* (the main thread lagged ≥ 400 ms). With an estimate they are for display
+    (Peers, Topology) and stall detection only: each carrier is backlogged by its own token bucket,
+    and taking that as a full shared uplink let one slow viewer and a GCC dip on another cut the
+    uplink below what the fast viewers carried.
+  - *Without an estimate* (a browser that publishes none, such as Firefox or Safari), capacity is
+    measured from those windows instead. The uplink's is the most delivered in total over the last
+    40 s (`CAPACITY_WINDOW_MS`) in windows where most active connections were backlogged at once,
+    with no stall; between them it holds; any window raises it; three backlogged windows in a row
+    queueing over half the base layer's queue limit (`FAST_DROP_QUEUE_MS`: 1.25 s, or 450 ms with
+    `priority=latency`) set it at once to the most any of them delivered (a *fast drop*). A
+    connection's own is the same filter over windows in which it alone was backlogged. A
+    connection open less than 30 s (`SETTLE_MS`) is *settling*: its windows (backlogged by its
+    catch-up and its start) only raise what is already measured, no probe runs while every
+    connection is settling, and a viewer's pushback waits until it has been fed, and its
+    connections open, for 30 s. Windows that carried a child's catch-up (a GOP replay), and the two
+    after a quality change, are transient the same way. A window in which everything was backlogged
+    (or a probe) gives an unmeasured uplink a first, low value even if a connection stalled in it.
   - *Headroom discovery*, the only probing (`session/headroom.ts`): once 1 s after the first link
     opens (10 s for a peer not presenting: it only sizes relay offers, and probing during its join
     saturated its uplink just as its stream arrived), then every 30 s (5 s while a capacity
     estimate holds the bitrate below the chosen quality and the encoder uses at least 70% of it)
-    while no media connection is backlogged, the uplink's background slot
-    pushes padding into every open connection's carrier for 1.5 s (64 KB waiting at most per
-    connection, refilled from buffer-low events, so it measures in a hidden tab too; a starved probe
-    is discarded), after all live media and within the browser's estimate, which it lets grow.
-    Those windows count as backlogged. Nobody replies: the receiver drops the padding.
-  - *Bitrate* (`session/congestion.ts`, pure): the wire budget per direct child is the smaller of
-    the uplink's capacity divided by the direct children ((child, stripe) edges / stripes) and the
-    median capacity of the peers fed directly (only those that are a limit and have been fed, and
-    connected, for 30 s, `SETTLE_MS`, since a joiner's first windows say little; one fed some stripes
-    counts its capacity × stripes / those stripes; of two, the larger), so one slow viewer
-    doesn't throttle the rest: its own link sheds enhancement layers and its Auto quality can
-    fall back to the preview. The target is 85% of the video bitrate that budget carries (the
-    stripe overhead of `stripeKbpsFor`), never above the chosen quality or what the audience's
-    relay slots carry. Down at once (at most every 4 s) but by at most half (`MAX_CUT`), unless
-    capacity just fell at once (a fast drop, already ~6 s of evidence) or is unmeasured; up by at
-    most 25% per 10 s, changes under 5% ignored. Straight up to the target, though, once a probe
-    confirms it (`JumpGate`): after the presenter raises the quality, with a probe from the last
-    30 s (otherwise it asks for one, at most every 5 s, and stays at the old bitrate meanwhile,
-    rather than sending the new quality and its keyframe into an unverified link: the encoder is
-    rebuilt at the old bitrate), and after a cut, once a later probe shows capacity is back. With
-    no direct children, a raised quality applies at once. On loopback the probe measures 100–300 Mbps and a 16 or 20 Mbps stream
-    keeps its chosen bitrate; under the `up=` debug cap (the token bucket backs up every queue at once)
-    it settles at 85% of what the cap carries per child.
+    while no media connection is backlogged (a backlogged carrier already sends at its estimate,
+    which then grows on its own), the uplink's background slot pushes padding into every open
+    connection's carrier for 1.5 s (64 KB waiting at most per connection, refilled from buffer-low
+    events, so it runs in a hidden tab too; a starved probe is discarded), after all live media
+    and within the browser's estimate, which it lets grow. Nobody replies: the receiver drops the
+    padding.
+  - *Bitrate* (`session/congestion.ts`, pure): the wire budget per direct child is the median
+    capacity of the peers fed directly (a peer fed some stripes counts its capacity × stripes /
+    those stripes; of two, the larger), so one slow viewer doesn't throttle the rest: its own link
+    sheds enhancement layers and its Auto quality can fall back to the preview. While most direct
+    children's estimates are still settling it is the uplink's capacity divided by the direct
+    children ((child, stripe) edges / stripes) instead, and without estimates the smaller of the
+    two. (With estimates the uplink's share doesn't bind otherwise: it is the children's mean,
+    which one slow viewer drags down, and a shared bottleneck shows in each child's estimate
+    anyway; the `up=` shaper's share always binds.) The target is 85% of the video bitrate that budget carries (the stripe overhead of
+    `stripeKbpsFor`), never above the chosen quality or what the audience's relay slots carry.
+    With viewers but nothing known yet (no settled estimate, and a child unknown), the bitrate
+    starts at no more than 4 Mbps (`START_KBPS`), going straight to the target once known: 4–6 s
+    after a new connection opens, at once for viewers already connected. Changes under 5% are
+    ignored. A target the estimates set is followed straight away, down or up (a 20 → 3 Mbps
+    estimate cuts in one step), at most one cut and one raise per 4 s and no raise within 4 s of a
+    cut; GCC grows only to about 1.5 times what is sent, so a rise climbs in steps. A measured
+    target (no estimates) is followed carefully: down at once (at most every 4 s) but by at most
+    half (`MAX_CUT`) unless capacity just fell at once (a fast drop) or is unmeasured, up by at
+    most 25% per 10 s. Straight up to the target, though, once a probe confirms it (`JumpGate`):
+    after the presenter raises the quality, with a probe from the last 30 s (otherwise it asks
+    for one, at most every 5 s, and stays at the old bitrate meanwhile: the encoder is rebuilt at
+    the old bitrate), and after a cut, once a later probe shows capacity is back. With no direct
+    children, a raised quality applies at once.
   - *Stalls.* A connection whose carrier took nothing for 750 ms (`STALL_MS` in
     `net/uplink.ts`), or 4 of its path's round trips if longer (`STALL_RTTS`), with more than
     16 KiB waiting, is *stalled*: a frozen page or worker, or an estimate so low that one fragment
@@ -631,7 +628,7 @@ Rate control, in both profiles:
   connection has none). The **Peers** panel shows, per peer, live **Sending** and **Receiving**
   rates (on the wire), **RTT now / base** (with "+N ms" when the path queues), what your connection
   to it **Carries** (the browser's estimate, capped), and its gossiped **Est. upload** as a
-  secondary column (its measured capacity, not current use); expanding a peer shows the
+  secondary column (its capacity, not current use); expanding a peer shows the
   connection's send/receive rate, RTT now / baseline, live-media queueing and drops/s, delivered
   rate and capacity, the estimate, stalled and relayed.
   `window.__p2p.linkStatsFor(peerId)` and `window.__p2p.peerCapacity(peerId)` expose the same
@@ -664,12 +661,14 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `SUSPECT_MS`, `GONE_MS` | `mesh/mesh.ts` | 1500, 6000 | When a silent link is taken out of the trees, and when a silent peer is declared gone |
 | `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*` | `tuning.ts` | see the table above | Uplink layer deadlines and the jitter buffer: latency vs complete, smooth frames |
-| `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `FAST_DROP_WINDOWS`, `BACKLOGGED_SHARE`, `SUSTAINED_WINDOWS`, `FROZEN_LAG_MS` | `session/capacity.ts` | 40 s, half the base layer's queue limit (1.25 s / 450 ms), 3, 90%, 5, 400 ms | Capacity memory, when a backlog sets it at once (and for how many windows in a row), what counts as backlogged, how much backlog makes the average a cap, and when a window is the page's fault |
+| `ESTIMATE_SETTLE_MS` | `session/capacity.ts` | 3 s | How long a connection's estimate is polled before it counts (past the seeded start and Chromium's initial probes). Shorter starts sooner from a less certain estimate |
+| `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `FAST_DROP_WINDOWS`, `BACKLOGGED_SHARE`, `SETTLE_MS`, `FROZEN_LAG_MS` | `session/capacity.ts` | 40 s, half the base layer's queue limit (1.25 s / 450 ms), 3, 90%, 30 s, 400 ms | Without an estimate only: measured capacity's memory, when a backlog sets it at once (and for how many windows in a row), what counts as backlogged, and how long a new connection's windows are ignored. And when a window is the page's fault |
 | `CARRIER_MAX_KBPS`, `CARRIER_INFLIGHT_KBIT`, `CARRIER_UNKNOWN_RTT_KBPS`, `CARRIER_MIN_CAP_KBPS`, `CARRIER_START_KBPS` | `mesh/carrierLink.ts` | 50 Mbps, 6000 kbit, 20 Mbps, 8 Mbps, 2.5 Mbps | The most one connection sends on a short path, the rate × round trip that caps a long one, the cap before the round trip is known and its floor, and the estimate it starts from |
 | `CARRIER_BUFFER_MS` | `mesh/carrierLink.ts` | 120 ms | How much of its send rate the uplink may hand a carrier at once (at least `LINK_BUFFER_HIGH`) |
 | `CARRIER_FPS`, `CARRIER_IDLE_FPS`, `CARRIER_IDLE_MS` | `mesh/carrierLink.ts` | 100, 5, 2 s | Carrier frames per second while sending, and the keepalive rate after this long idle |
 | `CARRIER_BURST_MS` | `net/carrier.ts` | 40 ms | The send budget's burst |
-| `TARGET_SHARE`, `DOWN_GAP_MS`, `UP_GAP_MS`, `UP_STEP`, `DEADBAND` | `session/congestion.ts` | 0.85, 4 s, 10 s, 1.25, 5% | Share of the measured budget used, and how fast the bitrate follows it |
+| `TARGET_SHARE`, `DOWN_GAP_MS`, `DEADBAND` | `session/congestion.ts` | 0.85, 4 s, 5% | Share of the budget used; at most one cut (and, following estimates, one raise) per gap; smaller changes ignored |
+| `UP_GAP_MS`, `UP_STEP`, `MAX_CUT`, `START_KBPS` | `session/congestion.ts` | 10 s, 1.25, 0.5, 4 Mbps | How carefully a measured (no estimate) target is followed, and the bitrate before anything is known |
 | `HEADROOM_EVERY_MS`, `PROBE_DURATION_MS` | `session/peerSession.ts`, `session/headroom.ts` | 30 s, 1.5 s | How often (while nothing is backlogged) and how long the headroom probe pushes background bytes |
 
 ## Tests

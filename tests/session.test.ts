@@ -310,18 +310,31 @@ describe('headroom probe', () => {
       const c = conn(true, { stats: async () => pair(), maxKbps: 20_000 })
       const { m } = metrics([c])
       await m.pollLinkStats()
-      expect(m.capacity.conn(c)).toEqual({ kbps: 5000, bound: true })
+      expect(m.capacity.conn(c)).toEqual({ kbps: 5000, bound: true, estimated: true })
       expect(m.linkStatsFor('v0')).toMatchObject({ estimateKbps: 5000, capKbps: 5000 })
       expect(m.linkStatsFor('nobody')).toBeNull()
       // Above the carrier's own limit: the limit.
       bps = 50_000_000
       await m.pollLinkStats()
-      expect(m.capacity.conn(c)).toEqual({ kbps: 20_000, bound: true })
+      expect(m.capacity.conn(c)).toEqual({ kbps: 20_000, bound: true, estimated: true })
       expect(m.linkStatsFor('v0')).toMatchObject({ estimateKbps: 50_000, capKbps: 20_000 })
       // Gone from the report: cleared.
       bps = undefined
       await m.pollLinkStats()
       expect(m.capacity.conn(c)).toBeNull()
+    })
+
+    it("a new connection holds probes and its peer's pushback back (SETTLE_MS) only without an estimate", async () => {
+      let bps: number | undefined
+      const c = conn(true, { stats: async () => [{ id: 'p', type: 'candidate-pair', selected: true, ...(bps === undefined ? {} : { availableOutgoingBitrate: bps }) }] })
+      const { m } = metrics([c])
+      const now = performance.now()
+      expect(m.allSettling(now)).toBe(true)
+      expect(m.peerSettled('v0', now)).toBe(false)
+      bps = 2_500_000
+      await m.pollLinkStats()
+      expect(m.allSettling(now)).toBe(false)
+      expect(m.peerSettled('v0', now)).toBe(true)
     })
 
     it('with no open probe link, no probe runs', async () => {
