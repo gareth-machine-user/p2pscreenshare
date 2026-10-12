@@ -29,6 +29,7 @@ declare global {
     __bufPeak?: Map<string, number>
     __stalls?: number[]
     __transit?: { key: boolean; audio: boolean; ms: number; bytes: number }[]
+    __encKeys?: number[]
   }
 }
 
@@ -112,6 +113,18 @@ async function hostSample(vid: string, lag: typeof takeLag) {
     })
     return out
   }
+  // How long keyframes take to encode (capture to encoded), by wrapping the video pipeline's output.
+  const video = (p.publishing as Any)?.video as { onFrame: (f: Any) => void; __diag?: boolean } | undefined
+  if (video && !video.__diag) {
+    video.__diag = true
+    const emit = video.onFrame
+    video.onFrame = (f) => {
+      if (f.key) (window.__encKeys ??= []).push(Math.round(performance.timeOrigin + performance.now() - f.captureTime))
+      emit(f)
+    }
+  }
+  const encKeys = window.__encKeys ?? []
+  window.__encKeys = []
   const c = p.mesh.linkFor(vid) as PageConn | undefined
   const pair = c ? await pairStats(c.pc).catch(() => null) : null
   const conn = c
@@ -140,6 +153,7 @@ async function hostSample(vid: string, lag: typeof takeLag) {
     cap: p.capacity.uplinkKbps,
     lastProbeAt: p.lastProbeAt,
     enc: p.encoderStatsNow,
+    encKeys,
     now: performance.now(),
     lag: lag(),
   }
@@ -203,7 +217,7 @@ export interface DiagRow {
 /** The per-second table (deltas of cumulative counters) and a summary line. */
 export function formatTimeline(rows: DiagRow[]): string {
   const lines: string[] = []
-  lines.push('t     kbps  limit    enc   upKbps qMs  q1s  P stall drop(t0,t1,t2) capUp  capPeer   link(del,B,S) est    rtt    peakBuf(KB) discards tx(kB/s) rx(kB/s) fps lat  buf  tMin tMed t99  tMax key(ms/KB) lagH lagV vis  cfps')
+  lines.push('t     kbps  limit    enc   upKbps qMs  q1s  P stall drop(t0,t1,t2) capUp  capPeer   link(del,B,S) est    rtt    peakBuf(KB) discards tx(kB/s) rx(kB/s) fps lat  buf  tMin tMed t99  tMax key(ms/KB) kEnc   lagH lagV vis  cfps')
   for (let i = 1; i < rows.length; i++) {
     const a = rows[i - 1]
     const b = rows[i]
@@ -251,6 +265,7 @@ export function formatTimeline(rows: DiagRow[]): string {
         String(b.v.transit.q99 ?? '-').padEnd(4),
         String(b.v.transit.max ?? '-').padEnd(4),
         (b.v.transit.keys.map((k) => `${k.ms}/${k.kb}`).join(',') || '-').padEnd(11),
+        (b.h.encKeys.join(',') || '-').padEnd(6),
         `${b.h.lag.maxMs}`.padEnd(4),
         `${b.v.lag.maxMs}`.padEnd(4),
         `${b.h.lag.visible[0]}${b.v.lag.visible[0]}`.padEnd(4),
