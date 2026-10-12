@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   CARRIER_BURST_MS,
+  CARRIER_SHORT_RTT_MS,
   CARRIER_LENGTH_SIZE,
   CARRIER_LOOKAHEAD,
   CARRIER_MIN_PAD,
@@ -8,6 +9,7 @@ import {
   CARRIER_TRAILER_SIZE,
   CarrierBudget,
   CarrierPacker,
+  carrierStripeLimit,
   compactMessages,
   nextCarrierFrame,
   unpackCarrier,
@@ -70,7 +72,7 @@ function sameBytes(a: Uint8Array | undefined, b: Uint8Array): boolean {
 describe('CarrierPacker', () => {
   it('round trips messages through a frame, keeping the prefix in front', () => {
     const p = new CarrierPacker()
-    const msgs = [bytes(5, 1), bytes(0, 0), bytes(300, 2), bytes(16 * 1024, 3)]
+    const msgs = [bytes(5, 1), bytes(0, 0), bytes(300, 2), bytes(16 * 1024, 4)]
     for (const m of msgs) p.push(m)
     expect(p.queuedBytes).toBe(5 + 300 + 16 * 1024)
     const r = p.pack(1 << 20, PREFIX)!
@@ -154,6 +156,28 @@ describe('CarrierPacker', () => {
     })
   })
 
+  it('holds up to its stripe limit of one media frame, or any number on a short path', () => {
+    const stripes = packetize(frame(1, 4000), K, M, 7)
+    const two = new CarrierPacker()
+    two.stripeLimit = 2
+    for (const s of stripes) for (const f of s) two.push(f)
+    expect(drain(two, 1 << 20).length).toBe((K + M) / 2)
+    const all = new CarrierPacker()
+    all.stripeLimit = carrierStripeLimit(5)
+    for (const s of stripes) for (const f of s) all.push(f)
+    const frames = drain(all, 1 << 20)
+    expect(frames.length).toBe(1)
+    expect(unpackCarrier(frames[0])).toEqual(stripes.flat())
+  })
+
+  it('keeps the stripe rule unless the path is known to be short', () => {
+    expect(carrierStripeLimit(null)).toBe(1)
+    expect(carrierStripeLimit(CARRIER_SHORT_RTT_MS + 1)).toBe(1)
+    expect(carrierStripeLimit(300)).toBe(1)
+    expect(carrierStripeLimit(CARRIER_SHORT_RTT_MS)).toBe(Infinity)
+    expect(carrierStripeLimit(0)).toBe(Infinity)
+  })
+
   it('packs fragments of one stripe piece together, and other frames alongside', () => {
     // A 200 KB frame: 50 KB pieces, 4 fragments each.
     const a = packetize(frame(1, 200_000), K, M, 7)
@@ -183,6 +207,24 @@ describe('CarrierPacker', () => {
     const second = unpackCarrier(p.pack(1 << 20)!.frame)
     expect(second[0]).toEqual(f1[1][0])
     expect(second.length).toBe(1 + 11)
+  })
+
+  it('sends audio first, past the lookahead and while the budget holds the rest', () => {
+    const p = new CarrierPacker()
+    const video = packetize(frame(1, 200_000), K, M, 7).flat()
+    const audio = packetize(frame(1, 300, true), K, M, 7)
+    for (const f of video) p.push(f)
+    for (let i = 0; i < CARRIER_LOOKAHEAD + 10; i++) p.push(bytes(10, i))
+    for (const f of audio[0]) p.push(f)
+    for (const f of audio[1]) p.push(f)
+    expect(p.length).toBe(video.length + CARRIER_LOOKAHEAD + 10 + audio[0].length + audio[1].length)
+    // Held (no credit for the head): only audio goes, one stripe of it under the stripe rule.
+    const held = unpackCarrierFrame(p.packFrame(0, PREFIX, 0, true).frame)!
+    expect(held.messages).toEqual(audio[0])
+    // Then the next audio stripe, ahead of the head, which goes too.
+    const next = unpackCarrier(p.pack(0, PREFIX)!.frame)
+    expect(next).toEqual([...audio[1], video[0]])
+    expect(p.headBytes).toBe(CARRIER_LENGTH_SIZE + video[1].byteLength)
   })
 
   it('exempts non-fragments from the stripe rule', () => {

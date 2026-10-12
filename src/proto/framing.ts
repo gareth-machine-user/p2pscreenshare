@@ -196,6 +196,8 @@ export interface StripeRef {
   /** `channel:a|v:epoch:frameSeq`, the same frame identity the Reassembler uses. */
   frame: string
   stripe: number
+  /** An audio frame's fragment. */
+  audio: boolean
 }
 
 /**
@@ -206,5 +208,5 @@ export function peekStripe(raw: Uint8Array): StripeRef | null {
   if (raw.byteLength < HEADER_SIZE + SIG_SIZE || raw[0] !== WIRE_VERSION) return null
   const v = new DataView(raw.buffer, raw.byteOffset, HEADER_SIZE)
   const kind = (raw[1] & FLAG_AUDIO) !== 0 ? 'a' : 'v'
-  return { frame: `${v.getUint32(36, true)}:${kind}:${v.getUint16(2, true)}:${v.getUint32(4, true)}`, stripe: raw[27] }
+  return { frame: `${v.getUint32(36, true)}:${kind}:${v.getUint16(2, true)}:${v.getUint32(4, true)}`, stripe: raw[27], audio: kind === 'a' }
 }

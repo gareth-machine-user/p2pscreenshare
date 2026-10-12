@@ -23,7 +23,7 @@
 //   { op: 'start', fps, idleFps, idleMs }      start the frame clock
 //   { op: 'send', msgs: ArrayBuffer[] }        messages to pack (in order)
 //   { op: 'pad', bytes }                       padding to add when there is room
-//   { op: 'rate', kbps }                       the send budget's rate
+//   { op: 'rate', kbps, rttMs? }               the send budget's rate, the path's lowest round trip
 //   { op: 'stream', side, readable, writable } a transform's streams
 // worker -> page:
 //   { op: 'tick' }                             write the next carrier track frame
@@ -32,7 +32,7 @@
 //   { op: 'recv', buf, offs }                  received messages: [start, length] pairs into `buf`
 //                                              (just the messages, copied: compactMessages)
 //   { op: 'error', side, error }
-import { CarrierBudget, CarrierPacker, compactMessages, nextCarrierFrame, unpackCarrierFrame } from '../net/carrier'
+import { CarrierBudget, CarrierPacker, carrierStripeLimit, compactMessages, nextCarrierFrame, unpackCarrierFrame } from '../net/carrier'
 
 /** The parts of an encoded frame used here (RTCEncodedVideoFrame). */
 interface EncodedFrame {
@@ -162,6 +162,7 @@ scope.onmessage = (ev: MessageEvent) => {
       return
     case 'rate':
       budget.rateKbps = d.kbps as number
+      if (d.rttMs !== undefined) packer.stripeLimit = carrierStripeLimit(d.rttMs as number | null)
       return
     case 'start':
       // A worker's timers aren't throttled in a hidden tab, the page's are.

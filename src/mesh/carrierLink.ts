@@ -616,7 +616,7 @@ export class CarrierLink {
     if (bps != null && bps > 0 && this.worker && !this.closed) {
       const kbps = Math.min(bps / 1000, this.maxKbps)
       const wake = this.buf.setRate(kbps)
-      this.worker.postMessage({ op: 'rate', kbps })
+      this.worker.postMessage({ op: 'rate', kbps, rttMs: this.rttMs })
       if (wake) this.onBufferLow()
     }
   }

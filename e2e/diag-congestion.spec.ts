@@ -14,7 +14,7 @@ import { blockMainThreadExpr, DIAG_PRESETS, formatTimeline, hostSampleExpr, INST
 // Presets (e2e/diag.ts): ultra (1080p 16 Mbps), hi (1080p 8 Mbps), 4k (2160p 20 Mbps), auto (1080p
 // 2.5 Mbps, Auto quality). DIAG_PATTERN=bars: the plain test pattern (~2 Mbps whatever the
 // preset); bursty: still, with a burst of motion every 4 s (a mostly static screen).
-// DIAG_BLOCK=ms,everyMs blocks the presenter's main thread. DIAG_UP=kbps caps the presenter's upload.
+// DIAG_KEYINT=ms sets the keyframe interval. DIAG_BLOCK=ms,everyMs blocks the presenter's main thread. DIAG_UP=kbps caps the presenter's upload.
 // Playwright keeps every page visible; tools/diag-tabs.ts runs the same with real background tabs.
 
 test.afterEach(closeContexts)
@@ -38,10 +38,17 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
     up,
     pattern: process.env.DIAG_PATTERN === 'bars' ? undefined : process.env.DIAG_PATTERN === 'bursty' ? 'bursty' : 'busy',
     autoQuality: presetName === 'auto',
+    // DIAG_AUDIO=1: with the test source's audio.
+    audio: !!process.env.DIAG_AUDIO,
   })
   const viewer = await openViewer(browser, seed, 'v')
   // A viewer that never gets going (a lossy, long path) is what the timeline should show, so go on.
   await waitFor(() => viewerSnapshot(viewer), (s) => s.decoded > 30, 60_000, 'viewer playing').catch((e) => console.log(String(e).slice(0, 300)))
+  // DIAG_KEYINT=ms: the presenter's periodic keyframe interval instead of tuning's (e.g. 1e9: none
+  // after the viewer started, to see what keyframes cost the latency).
+  if (process.env.DIAG_KEYINT) {
+    await host.evaluate((ms) => ((window.__p2p!.publishing as any).video.opts.keyframeIntervalMs = ms), Number(process.env.DIAG_KEYINT))
+  }
   const viewerId = (await viewerSnapshot(viewer)).id
   const hostId = await host.evaluate(() => window.__p2p!.selfId)
   await host.evaluate(INSTALL_LAG)
