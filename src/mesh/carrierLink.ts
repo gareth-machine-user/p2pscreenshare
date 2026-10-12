@@ -243,6 +243,32 @@ function canRequestFrames(): boolean {
   return typeof g.CanvasCaptureMediaStreamTrack?.prototype?.requestFrame === 'function' || typeof g.CanvasCaptureMediaStream?.prototype?.requestFrame === 'function'
 }
 
+/**
+ * A peer whose connection has no carrier: an incompatible build (one that sent media over data
+ * channels, say). Its connection would open and carry nothing.
+ */
+export class IncompatiblePeerError extends Error {
+  constructor(what: string) {
+    super(`carrier: the ${what} has no carrier (the peer runs an incompatible version)`)
+    this.name = 'IncompatiblePeerError'
+  }
+}
+
+/**
+ * Whether a remote SDP has a carrier: a video section that isn't rejected (port 0), sends and
+ * receives, and has VP8.
+ */
+export function hasCarrierSection(sdp: string): boolean {
+  for (const section of sdp.split(/\r?\n(?=m=)/).slice(1)) {
+    const lines = section.split(/\r?\n/)
+    const m = /^m=video (\d+) /.exec(lines[0])
+    if (!m || m[1] === '0') continue
+    if (lines.some((l) => /^a=(sendonly|recvonly|inactive)\s*$/.test(l))) continue
+    if (lines.some((l) => /^a=rtpmap:\d+ VP8\/90000/i.test(l))) return true
+  }
+  return false
+}
+
 /** The carrier track and how to write its next frame; `onFail` if a frame can't be written. */
 function carrierTrack(onFail: () => void): { track: MediaStreamTrack; next: () => void; stop: () => void } {
   let n = 0
@@ -383,12 +409,20 @@ export class CarrierLink {
     this.attach(this.answerSender, 'send')
   }
 
-  /** Answerer, after the remote offer is set: the transceiver it took over, before the answer. */
-  afterRemoteOffer(): void {
+  /**
+   * Answerer, after the remote offer (`sdp`) is set: the transceiver it took over, before the
+   * answer. An offer without a carrier leaves the addTrack transceiver unmatched (no mid).
+   */
+  afterRemoteOffer(sdp: string): void {
     const tr = this.pc.getTransceivers().find((t) => t.sender === this.answerSender)
-    if (!tr) throw new Error('carrier: the offer has no video section')
+    if (!tr || tr.mid === null || !hasCarrierSection(sdp)) throw new IncompatiblePeerError('offer')
     tr.direction = 'sendrecv'
     this.setup(tr)
+  }
+
+  /** Offerer, after the remote answer (`sdp`) is set: it must carry the carrier both ways. */
+  afterRemoteAnswer(sdp: string): void {
+    if (!hasCarrierSection(sdp)) throw new IncompatiblePeerError('answer')
   }
 
   /** The remote description as the browser should take it (the start bitrate seeded). */

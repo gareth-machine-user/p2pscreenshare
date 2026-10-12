@@ -5,6 +5,7 @@ import { seal, type Envelope } from '../src/mesh/envelope'
 import { generateIdentity, peerIdOf, type PeerIdentity } from '../src/mesh/identity'
 import { toBase64Url } from '../src/net/lobby'
 import { Mesh, type MeshOptions } from '../src/mesh/mesh'
+import { IncompatiblePeerError } from '../src/mesh/carrierLink'
 import { CHAT_KEEP, ChatLog } from '../src/mesh/chatLog'
 import { GONE_MS, type MemberRecord } from '../src/mesh/records'
 import { advance, installClock, settle, uninstallClock, until } from './fakes/clock'
@@ -74,6 +75,32 @@ describe('mesh (in-memory network)', () => {
     lobby.meshes[3].updateRecord({ capacityKbps: 1234 })
     await until(() => lobby.meshes.every((m) => m.member(lobby.ids[3].id)?.capacityKbps === 1234), 3000, 'record update')
     for (const m of lobby.meshes) expect(m.memberCount).toBe(5)
+  })
+
+  it('reports a peer whose connection is refused as incompatible', async () => {
+    let net: FakeNetwork | null = null
+    // Peer 1's connections all find the other side incompatible.
+    const lobby = await makeLobby(2, (i) =>
+      i !== 1
+        ? {}
+        : {
+            connect: (_ice, remoteId) => {
+              const c = net!.makeConn(lobby.ids[1].id, remoteId)
+              c.acceptOffer = c.acceptAnswer = async () => {
+                c.onIncompatible?.()
+                throw new IncompatiblePeerError('offer')
+              }
+              return c
+            },
+          },
+    )
+    net = lobby.net
+    let changed = false
+    lobby.meshes[1].onChange = () => (changed = true)
+    for (const m of lobby.meshes) await m.start()
+    await until(() => lobby.meshes[1].incompatiblePeer, 15_000, 'incompatible peer')
+    expect(changed).toBe(true)
+    expect(lobby.meshes[1].linkFor(lobby.ids[0].id)).toBeFalsy()
   })
 
   it('declares a silent peer gone within the gone timeout', async () => {

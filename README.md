@@ -228,6 +228,10 @@ several SCTP connections per pair ("lanes") to multiply that ceiling; the carrie
   frame rate (`maintain-framerate`), and the estimate starts at 2.5 Mbps
   (`x-google-start-bitrate`, seeded into the remote description's VP8 format; Chromium starts at
   300 kbps and grows ~8% a second otherwise).
+- **Versions.** A remote offer or answer without a carrier (a live sendrecv VP8 video section:
+  an older build that sent media over data channels) is refused, as is a peer whose first `ctl`
+  message (`__hello`) names another `MESH_PROTOCOL`: the connection would open and carry nothing.
+  The lobby then says that someone runs a different version.
 - **Transforms.** A worker per open connection owns the encoded transforms: Chromium's
   `createEncodedStreams()` (with `encodedInsertableStreams`) where it exists, the standard
   `RTCRtpScriptTransform` elsewhere. Chromium 150's `RTCRtpScriptTransform` ran only one of a

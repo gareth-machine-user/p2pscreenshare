@@ -4,7 +4,7 @@
 import type { LinkState, MediaLink, ProbeLink } from '../net/link'
 import { parseLinkStats, type StatsLike } from '../net/linkStats'
 import { after } from '../net/ticker'
-import { carrierConfig, CarrierLink } from './carrierLink'
+import { carrierConfig, CarrierLink, IncompatiblePeerError } from './carrierLink'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
 export const CONNECT_TIMEOUT_MS = 15_000
@@ -27,6 +27,8 @@ export interface PairConn extends MediaLink {
   onMedia: (data: Uint8Array) => void
   onStateChange: (state: LinkState) => void
   onBufferLow: () => void
+  /** The remote runs an incompatible version (the connection is then refused). */
+  onIncompatible?: () => void
   armTimeout(ms?: number): void
   createOffer(): Promise<string>
   acceptOffer(sdp: string): Promise<string>
@@ -75,6 +77,7 @@ export abstract class DataConn implements PairConn {
   onMedia: (data: Uint8Array) => void = () => {}
   onStateChange: (state: LinkState) => void = () => {}
   onBufferLow: () => void = () => {}
+  onIncompatible: () => void = () => {}
 
   private timeout: (() => void) | null = null
 
@@ -137,7 +140,7 @@ export abstract class DataConn implements PairConn {
     await this.pc.setRemoteDescription({ type: 'offer', sdp: this.carrier.remoteSdp(sdp) })
     this.haveRemote = true
     this.armTimeout()
-    this.carrier.afterRemoteOffer()
+    this.checked(() => this.carrier.afterRemoteOffer(sdp))
     await this.pc.setLocalDescription(await this.pc.createAnswer())
     return gatherComplete(this.pc)
   }
@@ -146,6 +149,17 @@ export abstract class DataConn implements PairConn {
     await this.pc.setRemoteDescription({ type: 'answer', sdp: this.carrier.remoteSdp(sdp) })
     this.haveRemote = true
     this.armTimeout()
+    this.checked(() => this.carrier.afterRemoteAnswer(sdp))
+  }
+
+  /** Runs a compatibility check: an incompatible peer is reported, then thrown (the caller closes). */
+  protected checked(check: () => void): void {
+    try {
+      check()
+    } catch (err) {
+      if (err instanceof IncompatiblePeerError) this.onIncompatible()
+      throw err
+    }
   }
 
   /** Whether the selected candidate pair goes through a TURN relay (null: unknown). */

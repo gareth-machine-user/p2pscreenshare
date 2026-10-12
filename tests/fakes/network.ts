@@ -76,8 +76,8 @@ export class FakeNetwork {
 
   /** The rendezvous factory for the peer `localId` (Mesh's `rendezvous` option). */
   rendezvousFor(localId: string): (opts: RendezvousOptions<FakeConn>) => RendezvousPort<FakeConn> {
-    return () => {
-      const r = new FakeRendezvous(this, localId)
+    return (opts) => {
+      const r = new FakeRendezvous(this, localId, opts.connect)
       this.rendezvous.push(r)
       return r
     }
@@ -471,6 +471,8 @@ export class FakeRendezvous implements RendezvousPort<FakeConn> {
   constructor(
     private net: FakeNetwork,
     readonly id: string,
+    /** The mesh's connection factory, as net/bootstrap.ts uses it. */
+    private connect: (iceServers: RTCIceServer[], remoteId: string) => FakeConn = (_ice, remoteId) => net.makeConn(id, remoteId),
   ) {}
 
   async start(): Promise<void> {
@@ -509,15 +511,21 @@ export class FakeRendezvous implements RendezvousPort<FakeConn> {
   }
 
   private async pair(answerer: FakeRendezvous): Promise<void> {
-    const mine = this.net.makeConn(this.id, '')
+    const mine = this.connect([], '')
     mine.offerer = this.id
-    const theirs = this.net.makeConn(answerer.id, this.id)
+    const theirs = answerer.connect([], this.id)
     theirs.offerer = this.id
-    const offer = await mine.createOffer()
-    const answer = await theirs.acceptOffer(offer)
-    answerer.onConnection(theirs)
-    mine.remoteId = answerer.id
-    await mine.acceptAnswer(answer)
-    this.onConnection(mine)
+    try {
+      const offer = await mine.createOffer()
+      const answer = await theirs.acceptOffer(offer)
+      answerer.onConnection(theirs)
+      mine.remoteId = answerer.id
+      await mine.acceptAnswer(answer)
+      this.onConnection(mine)
+    } catch {
+      // As net/bootstrap.ts: a failed attempt is closed.
+      mine.close()
+      theirs.close()
+    }
   }
 }

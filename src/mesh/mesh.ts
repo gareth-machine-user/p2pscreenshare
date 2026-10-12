@@ -127,6 +127,8 @@ export class Mesh<C extends PeerConn = MeshConn> {
   trackersConnected = 0
   /** Joined: connected to at least one member, or started the lobby. */
   joined = false
+  /** A peer runs an incompatible version of the app: its connection was refused. */
+  incompatiblePeer = false
 
   /** A member's record was first seen. */
   onMemberJoin: (id: string) => void = () => {}
@@ -212,7 +214,16 @@ export class Mesh<C extends PeerConn = MeshConn> {
       channels: [],
     }
     // Without a factory, C is MeshConn (the type parameter's default).
-    this.connect = opts.connect ?? (((ice, id) => new MeshConn(ice, id)) as ConnFactory as ConnFactory<C>)
+    const connect = opts.connect ?? (((ice, id) => new MeshConn(ice, id)) as ConnFactory as ConnFactory<C>)
+    this.connect = (ice, id) => {
+      const conn = connect(ice, id)
+      conn.onIncompatible = () => {
+        if (this.incompatiblePeer) return
+        this.incompatiblePeer = true
+        this.onChange()
+      }
+      return conn
+    }
     const rendezvousOpts: RendezvousOptions<C> = {
       joinCode: opts.joinCode,
       identity: opts.identity,

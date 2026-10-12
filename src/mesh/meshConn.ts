@@ -9,6 +9,13 @@ import { DataConn, type PairConn } from './dataConn'
 export type Ctl = { t: string; [k: string]: unknown }
 
 /**
+ * The mesh protocol's version, exchanged first on `ctl` (`__hello`): a connection opens only
+ * between peers of the same one. Bump it when a build can't work with the previous one. (A build
+ * without a carrier is refused earlier, by its SDP: carrierLink.ts hasCarrierSection.)
+ */
+export const MESH_PROTOCOL = 1
+
+/**
  * What the mesh and the rendezvous use of a mesh connection, so tests can substitute an in-memory
  * one (tests/fakes/). MeshConn is the real thing.
  */
@@ -49,7 +56,8 @@ export class MeshConn extends DataConn implements PeerConn {
   constructor(iceServers: RTCIceServer[], remoteId: string) {
     super(iceServers, remoteId)
     this.ctl = this.pc.createDataChannel('ctl', { negotiated: true, id: 1, ordered: true })
-    this.ctl.onopen = () => this.setState('open')
+    // Open once the remote's hello says it speaks this protocol.
+    this.ctl.onopen = () => this.sendCtl({ t: '__hello', v: MESH_PROTOCOL })
     this.ctl.onclose = () => this.setState('closed')
     this.ctl.onmessage = (ev) => {
       let msg: Ctl
@@ -62,7 +70,8 @@ export class MeshConn extends DataConn implements PeerConn {
       // Answered here, from the message handler: background-tab timer throttling can't delay it.
       if (msg.t === '__ping') this.sendCtl({ t: '__pong', id: msg.id, now: wallClock() })
       else if (msg.t === '__pong') this.onPong(msg.id as number, msg.now as number)
-      else this.onCtl(msg)
+      else if (msg.t === '__hello') this.onHello(msg.v)
+      else if (this.isOpen) this.onCtl(msg) // nothing before the hello
     }
   }
 
@@ -100,6 +109,13 @@ export class MeshConn extends DataConn implements PeerConn {
         reject(new Error('not connected'))
       }
     })
+  }
+
+  private onHello(v: unknown): void {
+    if (v === MESH_PROTOCOL) return this.setState('open')
+    console.warn(`peer ${this.remoteId} speaks mesh protocol ${String(v)}, not ${MESH_PROTOCOL}`)
+    this.onIncompatible()
+    this.setState('failed')
   }
 
   private onPong(id: number, remoteClock: number): void {

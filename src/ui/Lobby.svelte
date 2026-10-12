@@ -277,6 +277,7 @@
       limited: session.publishing?.full?.limited ?? null,
       clamp: rateLine,
       kicked: session.kicked,
+      incompatible: mesh.incompatiblePeer,
       uploading: session.publishing
         ? uploadBadge({
             sendKbps: session.liveRates().sendKbps,
@@ -544,6 +545,9 @@
   {/if}
   {#if lobby?.kicked}
     <div class="banner" data-testid="kicked">The owner removed you from the lobby.</div>
+  {/if}
+  {#if lobby?.incompatible}
+    <div class="banner" data-testid="incompatible">Someone here runs a different version of this app and can't connect. Reload the page (everyone should).</div>
   {/if}
 
   <div class="lobby-body">

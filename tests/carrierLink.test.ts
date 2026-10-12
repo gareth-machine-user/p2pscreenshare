@@ -10,6 +10,7 @@ import {
   carrierCapKbps,
   carrierUnsupported,
   frameRequester,
+  hasCarrierSection,
   seedStartBitrate,
   TickWatch,
 } from '../src/mesh/carrierLink'
@@ -140,5 +141,27 @@ describe('TickWatch', () => {
     expect(w.hung(5000)).toBe(false)
     w.tick(5010)
     expect(w.hung(6000)).toBe(false)
+  })
+})
+
+describe('hasCarrierSection', () => {
+  const head = ['v=0', 'o=- 1 2 IN IP4 127.0.0.1', 's=-', 't=0 0', 'a=group:BUNDLE 0 1']
+  const data = ['m=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:0', 'a=sctp-port:5000']
+  const video = (port: number, dir: string, codec = 'VP8') => [`m=video ${port} UDP/TLS/RTP/SAVPF 96`, 'a=mid:1', `a=${dir}`, `a=rtpmap:96 ${codec}/90000`]
+  const sdp = (...sections: string[][]) => [...head, ...sections.flat(), ''].join('\r\n')
+
+  it('finds a live sendrecv VP8 video section', () => {
+    expect(hasCarrierSection(sdp(data, video(9, 'sendrecv')))).toBe(true)
+    // No direction attribute means sendrecv.
+    expect(hasCarrierSection(sdp(video(9, 'mid:2')))).toBe(true)
+  })
+
+  it('refuses an SDP without one: an old build (data channels only), a rejected or one-way section, no VP8', () => {
+    expect(hasCarrierSection(sdp(data))).toBe(false)
+    expect(hasCarrierSection(sdp(data, video(0, 'sendrecv')))).toBe(false)
+    expect(hasCarrierSection(sdp(data, video(9, 'recvonly')))).toBe(false)
+    expect(hasCarrierSection(sdp(data, video(9, 'inactive')))).toBe(false)
+    expect(hasCarrierSection(sdp(data, video(9, 'sendrecv', 'H264')))).toBe(false)
+    expect(hasCarrierSection('')).toBe(false)
   })
 })
