@@ -38,6 +38,8 @@ test('diagnostic: congestion between two local tabs', async ({ browser }) => {
     up,
     pattern: process.env.DIAG_PATTERN === 'bars' ? undefined : process.env.DIAG_PATTERN === 'bursty' ? 'bursty' : 'busy',
     autoQuality: presetName === 'auto',
+    // DIAG_AUDIO=1: with the test source's audio.
+    audio: !!process.env.DIAG_AUDIO,
   })
   const viewer = await openViewer(browser, seed, 'v')
   // A viewer that never gets going (a lossy, long path) is what the timeline should show, so go on.

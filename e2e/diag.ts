@@ -199,8 +199,11 @@ async function viewerSample(hostId: string, lag: typeof takeLag) {
   const q = (a: number[], f: number) => (a.length ? Math.round(a[Math.min(a.length - 1, Math.floor(a.length * f))]) : null)
   const keys = tr.filter((x) => x.key).map((x) => ({ ms: Math.round(x.ms), kb: Math.round(x.bytes / 1024) }))
   const aud = tr.filter((x) => x.audio).map((x) => x.ms).sort((a, b) => a - b)
-  const transit = { min: q(vid, 0), med: q(vid, 0.5), q99: q(vid, 0.99), max: q(vid, 1), keys, audMax: q(aud, 1) }
-  return { fps: d.fps, latencyMs: d.latencyMs, bufferMs: d.bufferMs, decoded: d.decoded, dropped: d.dropped, loss: sub ? sub.loss : null, recv, transit, now: performance.now(), lag: lag() }
+  const transit = { min: q(vid, 0), med: q(vid, 0.5), q99: q(vid, 0.99), max: q(vid, 1), keys, audMed: q(aud, 0.5), audMax: q(aud, 1) }
+  const ps = sub?.player.stats
+  // Frames that came after their play time, or were skipped waiting for a missing one (stalls).
+  const late = ps ? ps.late + ps.skipped : null
+  return { fps: d.fps, latencyMs: d.latencyMs, bufferMs: d.bufferMs, decoded: d.decoded, dropped: d.dropped, late, loss: sub ? sub.loss : null, recv, transit, now: performance.now(), lag: lag() }
 }
 
 /** One viewer sample (page-side expression), for its link from `hostId`. */
@@ -292,8 +295,9 @@ export function formatTimeline(rows: DiagRow[]): string {
     return a.length ? Math.round(a[Math.floor(a.length / 2)]) : null
   }
   const txs = tail.slice(1).map((r, i) => (r.h.conn?.sent != null && tail[i].h.conn?.sent != null ? ((r.h.conn.sent - tail[i].h.conn!.sent!) * 8) / (r.h.now - tail[i].h.now) : null))
+  const lateIn = (rs: DiagRow[]) => (rs.length > 1 && rs[0].v.late != null && rs.at(-1)!.v.late != null ? rs.at(-1)!.v.late! - rs[0].v.late! : null)
   lines.push(
-    `second half: lat=${med(tail.map((r) => r.v.latencyMs))} buf=${med(tail.map((r) => r.v.bufferMs))} tMin=${med(tail.map((r) => r.v.transit.min))} tMed=${med(tail.map((r) => r.v.transit.med))} t99=${med(tail.map((r) => r.v.transit.q99))} fps=${med(tail.map((r) => r.v.fps))} kbps=${med(tail.map((r) => r.h.kbps))} txKbps=${med(txs)} keyTransit=${tail.flatMap((r) => r.v.transit.keys.map((k) => k.ms)).join(',')}`,
+    `second half: late=${lateIn(tail)} (whole run ${lateIn(rows)}) lat=${med(tail.map((r) => r.v.latencyMs))} buf=${med(tail.map((r) => r.v.bufferMs))} tMin=${med(tail.map((r) => r.v.transit.min))} tMed=${med(tail.map((r) => r.v.transit.med))} audMed=${med(tail.map((r) => r.v.transit.audMed))} audMax=${med(tail.map((r) => r.v.transit.audMax))} t99=${med(tail.map((r) => r.v.transit.q99))} fps=${med(tail.map((r) => r.v.fps))} kbps=${med(tail.map((r) => r.h.kbps))} txKbps=${med(txs)} keyTransit=${tail.flatMap((r) => r.v.transit.keys.map((k) => k.ms)).join(',')}`,
   )
   return lines.join('\n')
 }
