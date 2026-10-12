@@ -25,8 +25,15 @@ export interface PlayoutClockOptions {
    * slew rate. A join's first seconds are its worst (the presenter's uplink bursts with the new
    * child's catch-up, SCTP retransmits what that burst lost): held for holdMs and then glided down
    * at the quality profile's 8 ms/s, a 3 s spike there took over 6 minutes to go.
+   * The warm-up goes on past warmupMs until it has settled, up to warmupMaxMs: the buffer needed
+   * back near the least it has needed since the start (within twice WARMUP_SETTLED_MS: whatever
+   * spike there was has left the window), and the delay within WARMUP_SETTLED_MS of it. A join whose
+   * turmoil lasted past warmupMs (a long lossy path's estimate ramping up) would otherwise keep
+   * seconds of buffer for minutes.
    */
   warmupMs: number
+  /** Defaults to 3 x warmupMs. */
+  warmupMaxMs?: number
   /** Added on top of the computed buffer (the viewer's "extra smooth" choice). */
   extraMs: number
 }
@@ -39,6 +46,8 @@ export type Buffering = 'low' | 'auto' | 'extra'
 export const BUFFERINGS: readonly Buffering[] = ['low', 'auto', 'extra']
 /** The cushion `extra` adds (ms). */
 export const EXTRA_BUFFER_MS = 1500
+/** The warm-up ends once the delay is this close to its target (ms), see warmupMs. */
+export const WARMUP_SETTLED_MS = 25
 
 const QUALITY = tuning.priority === 'quality'
 const DEFAULT_CLOCK: PlayoutClockOptions = {
@@ -80,6 +89,10 @@ export class PlayoutClock {
   private peak: { extra: number; at: number } | null = null
   /** When the first sample completed (warmupMs counts from it). */
   private firstAt: number | null = null
+  /** The warm-up is over (for good). */
+  private warm = false
+  /** The least buffer needed (beyond the fastest path) since the first sample. */
+  private lowExtra = Infinity
 
   constructor(opts: Partial<PlayoutClockOptions> = {}) {
     this.base = { ...DEFAULT_CLOCK, ...opts }
@@ -114,7 +127,9 @@ export class PlayoutClock {
     const q = this.samples.quantile(this.opts.quantile)!
     // Express bounds relative to the fastest observed transit (absolute offset is unknown).
     let extra = Math.min(Math.max(q - minT + this.opts.safetyMs, this.opts.minDelayMs), this.opts.maxDelayMs)
-    const warming = this.firstAt !== null && now - this.firstAt < this.opts.warmupMs
+    this.lowExtra = Math.min(this.lowExtra, extra)
+    const warming = !this.warm && this.warming(now, extra, minT + extra + this.opts.extraMs)
+    if (!warming) this.warm = true
     // Keep the largest recent need for holdMs after it was last needed (not a join's transient).
     if (warming) this.peak = null
     else if (!this.peak || extra >= this.peak.extra || now - this.peak.at > this.opts.holdMs) this.peak = { extra, at: now }
@@ -131,6 +146,19 @@ export class PlayoutClock {
       this.delay += step
     }
     this.lastUpdate = now
+  }
+
+  /**
+   * Whether the warm-up goes on (see warmupMs): `extra` is the buffer needed now beyond the fastest
+   * path and `target` the delay wanted now, neither with a peak held.
+   */
+  private warming(now: number, extra: number, target: number): boolean {
+    if (this.firstAt === null) return true
+    const age = now - this.firstAt
+    if (age < this.opts.warmupMs) return true
+    if (age >= Math.max(this.opts.warmupMs, this.opts.warmupMaxMs ?? 3 * this.opts.warmupMs)) return false
+    if (this.delay === null) return true
+    return extra > this.lowExtra + 2 * WARMUP_SETTLED_MS || Math.abs(this.delay - target) > WARMUP_SETTLED_MS
   }
 
   /** Local time at which a frame captured at `captureTime` should be shown. */

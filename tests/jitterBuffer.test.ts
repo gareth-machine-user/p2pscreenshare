@@ -263,6 +263,26 @@ describe('PlayoutClock', () => {
     expect(c.bufferMs).toBe(3000)
   })
 
+  it('the warm-up lasts until the delay has settled after a late join burst, up to warmupMaxMs', () => {
+    const opts = { quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 8000, slewMsPerSec: 250, slewDownMsPerSec: 8, holdMs: 60_000, warmupMs: 30_000, warmupMaxMs: 90_000 }
+    const c = new PlayoutClock(opts)
+    // 100 ms transit, with frames 3 s late from 25 to 29 s (a long path's join, not over at 30 s).
+    const late = (t: number) => (t >= 25_000 && t < 29_000 ? 3000 : 0)
+    for (let t = 0; t <= 55_000; t += 50) c.addSample(t, t + 100 + late(t))
+    // Not held: the burst left the window at ~37 s, and the delay fell at the full rate since.
+    expect(c.bufferMs).toBe(0)
+    // Settled: a spike now is held as before.
+    for (let t = 55_050; t <= 65_000; t += 50) c.addSample(t, t + 100 + (t >= 56_000 && t < 56_200 ? 3000 : 0))
+    expect(c.bufferMs).toBe(3000)
+
+    // Turmoil that never settles ends the warm-up at warmupMaxMs all the same.
+    const d = new PlayoutClock(opts)
+    for (let t = 0; t <= 95_000; t += 50) d.addSample(t, t + 100 + (Math.floor(t / 5000) % 2 ? 3000 : 0))
+    expect(d.bufferMs).toBe(3000)
+    for (let t = 95_050; t <= 105_000; t += 50) d.addSample(t, t + 100)
+    expect(d.bufferMs).toBeGreaterThan(2900)
+  })
+
   it('a repeated spike within the hold never lets the buffer shrink', () => {
     const c = new PlayoutClock({ quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 1000, slewMsPerSec: 1e9, slewDownMsPerSec: 100, holdMs: 30_000, warmupMs: 0 })
     let min = Infinity
