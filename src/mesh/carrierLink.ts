@@ -70,8 +70,10 @@ export const CARRIER_START_KBPS = 2500
  * keeps enough media frames waiting.
  */
 export const CARRIER_BUFFER_MS = 120
-/** How often the estimate is read while the carrier is busy (ms). */
+/** How often the estimate is read while the carrier is busy, and the worker's clock checked (ms). */
 const ESTIMATE_POLL_MS = 1000
+/** The worker has hung if its clock hasn't ticked for this long (ms; it ticks at least every 200). */
+export const CARRIER_HUNG_MS = 2000
 /** The carrier track's frame size (px): as small as the encoder takes. */
 const CARRIER_SIZE = 16
 
@@ -124,6 +126,30 @@ export class CarrierBuffer {
   }
 }
 
+/**
+ * Whether the carrier worker's clock has stopped (the worker hung): no tick for CARRIER_HUNG_MS,
+ * checked every ESTIMATE_POLL_MS. Not if the page itself stalled since the last check: its own
+ * queued ticks may not have been handled yet.
+ */
+export class TickWatch {
+  private lastTickAt: number
+  private lastCheckAt: number
+
+  constructor(now: number) {
+    this.lastTickAt = this.lastCheckAt = now
+  }
+
+  tick(now: number): void {
+    this.lastTickAt = now
+  }
+
+  hung(now: number): boolean {
+    const pageRan = now - this.lastCheckAt < ESTIMATE_POLL_MS * 1.5
+    this.lastCheckAt = now
+    return pageRan && now - this.lastTickAt > CARRIER_HUNG_MS
+  }
+}
+
 type TransformApi = 'script' | 'legacy'
 
 /** The minimal MediaStreamTrackGenerator (Chromium, main thread) the carrier track uses. */
@@ -156,7 +182,8 @@ export function carrierUnsupported(): string | null {
     if (typeof RTCPeerConnection !== 'function') return 'WebRTC'
     if (typeof Worker !== 'function') return 'Web Workers'
     if (!transformApi()) return 'WebRTC encoded transforms'
-    if (!hasGenerator() && typeof HTMLCanvasElement?.prototype.captureStream !== 'function') return 'a video frame source (MediaStreamTrackGenerator or canvas.captureStream)'
+    if (!hasGenerator() && (typeof HTMLCanvasElement?.prototype.captureStream !== 'function' || !canRequestFrames()))
+      return 'a video frame source (MediaStreamTrackGenerator or canvas.captureStream)'
     if (!RTCRtpSender.getCapabilities('video')?.codecs.some((c) => /^video\/VP8$/i.test(c.mimeType))) return 'the VP8 codec'
     return null
   } catch {
@@ -198,8 +225,26 @@ export function seedStartBitrate(sdp: string, kbps: number): string {
   return res.join('\r\n')
 }
 
-/** The carrier track and how to write its next frame. */
-function carrierTrack(): { track: MediaStreamTrack; next: () => void; stop: () => void } {
+/**
+ * How to make a canvas capture produce a frame: the track's requestFrame() (Chromium), else the
+ * stream's (Firefox has it on CanvasCaptureMediaStream only). Null if neither has one.
+ */
+export function frameRequester(stream: MediaStream, track: MediaStreamTrack): (() => void) | null {
+  const t = track as MediaStreamTrack & { requestFrame?: () => void }
+  if (typeof t.requestFrame === 'function') return () => t.requestFrame!()
+  const st = stream as MediaStream & { requestFrame?: () => void }
+  if (typeof st.requestFrame === 'function') return () => st.requestFrame!()
+  return null
+}
+
+/** Whether a canvas capture can be asked for frames (see frameRequester), without making one. */
+function canRequestFrames(): boolean {
+  const g = globalThis as unknown as Record<string, { prototype?: { requestFrame?: unknown } } | undefined>
+  return typeof g.CanvasCaptureMediaStreamTrack?.prototype?.requestFrame === 'function' || typeof g.CanvasCaptureMediaStream?.prototype?.requestFrame === 'function'
+}
+
+/** The carrier track and how to write its next frame; `onFail` if a frame can't be written. */
+function carrierTrack(onFail: () => void): { track: MediaStreamTrack; next: () => void; stop: () => void } {
   let n = 0
   if (hasGenerator()) {
     const gen = new MediaStreamTrackGenerator!({ kind: 'video' })
@@ -207,17 +252,25 @@ function carrierTrack(): { track: MediaStreamTrack; next: () => void; stop: () =
     // I420: a mid-grey frame with one changing pixel, so each frame is a (tiny) delta.
     const buf = new Uint8Array((CARRIER_SIZE * CARRIER_SIZE * 3) / 2).fill(128)
     let pending = false
+    let failed = false
     return {
       track: gen,
       next: () => {
         // A frame still being written (the page was busy): skip a tick rather than queue them.
-        if (pending) return
+        if (pending || failed) return
         buf[n % (CARRIER_SIZE * CARRIER_SIZE)] = (n * 37) & 0xff
         const f = new VideoFrame(buf, { format: 'I420', codedWidth: CARRIER_SIZE, codedHeight: CARRIER_SIZE, timestamp: Math.round((n++ * 1e6) / CARRIER_FPS) })
         pending = true
         writer.write(f).then(
           () => (pending = false),
-          () => f.close(),
+          (err) => {
+            // The writer is errored for good: no more frames, so the connection carries nothing.
+            pending = false
+            failed = true
+            f.close()
+            console.warn('carrier: track write failed', err)
+            onFail()
+          },
         )
       },
       stop: () => {
@@ -229,13 +282,15 @@ function carrierTrack(): { track: MediaStreamTrack; next: () => void; stop: () =
   const canvas = document.createElement('canvas')
   canvas.width = canvas.height = CARRIER_SIZE
   const ctx = canvas.getContext('2d')!
-  const track = canvas.captureStream(0).getVideoTracks()[0] as MediaStreamTrack & { requestFrame(): void }
+  const stream = canvas.captureStream(0)
+  const track = stream.getVideoTracks()[0]
+  const requestFrame = frameRequester(stream, track) ?? (() => {})
   return {
     track,
     next: () => {
       ctx.fillStyle = `rgb(${(n++ * 37) & 0xff},128,128)`
       ctx.fillRect(0, 0, 1, 1)
-      track.requestFrame()
+      requestFrame()
     },
     stop: () => track.stop(),
   }
@@ -270,6 +325,7 @@ export class CarrierLink {
   private started = false
   private closed = false
   private poll: (() => void) | null = null
+  private watch: TickWatch | null = null
   private lastStatsAt = -Infinity
   /** The lowest round trip seen (ms), which sets the cap. */
   private rttMs: number | null = null
@@ -279,11 +335,11 @@ export class CarrierLink {
     /** Whether the connection carries media now (its owner's state). */
     private readonly open: () => boolean,
     private readonly linkState: () => LinkState,
-    /** The carrier failed (its transform errored): the connection should go. */
+    /** The carrier failed (its worker, a transform or the track): the connection should go. */
     private readonly onFail: () => void,
   ) {
     this.api = transformApi() ?? 'legacy'
-    this.carrier = carrierTrack()
+    this.carrier = carrierTrack(() => this.fail())
     pc.addEventListener('track', (ev) => this.attach(ev.receiver, 'recv'))
     const link = this
     this.probeLink = {
@@ -358,7 +414,11 @@ export class CarrierLink {
     w.onmessage = (ev) => this.fromWorker(ev.data as Record<string, unknown>)
     w.onerror = (ev) => {
       console.warn('carrier worker failed', ev.message)
-      this.onFail()
+      this.fail()
+    }
+    w.onmessageerror = () => {
+      console.warn('carrier worker: a message could not be read')
+      this.fail()
     }
     this.buf.rateKbps = Math.min(CARRIER_START_KBPS, this.maxKbps)
     w.postMessage({ op: 'rate', kbps: this.buf.rateKbps })
@@ -394,8 +454,23 @@ export class CarrierLink {
     this.streams = []
     w.postMessage({ op: 'start', fps: CARRIER_FPS, idleFps: CARRIER_IDLE_FPS, idleMs: CARRIER_IDLE_MS })
     void this.tuneSender()
-    this.poll = every(ESTIMATE_POLL_MS, () => void this.pollEstimate())
+    const watch = (this.watch = new TickWatch(performance.now()))
+    this.poll = every(ESTIMATE_POLL_MS, () => {
+      if (watch.hung(performance.now())) {
+        console.warn('carrier worker stopped ticking')
+        this.fail()
+        return
+      }
+      void this.pollEstimate()
+    })
     this.flush()
+  }
+
+  /** The carrier can't go on (its worker, transform or track failed): the connection should go. */
+  private fail(): void {
+    if (this.closed) return
+    this.close()
+    this.onFail()
   }
 
   /** Bytes handed over and not yet packed into a carrier frame. */
@@ -441,10 +516,13 @@ export class CarrierLink {
     if (this.closed) return
     switch (d.op) {
       case 'tick':
+        this.watch?.tick(performance.now())
         this.carrier.next()
         return
       case 'idle':
         this.idle = !!d.idle
+        // Busy again: the rate it has may be seconds old.
+        if (!this.idle) void this.pollEstimate()
         return
       case 'packed': {
         const media = d.media as number
@@ -467,7 +545,7 @@ export class CarrierLink {
       }
       case 'error':
         console.warn(`carrier ${d.side} transform failed`, d.error)
-        this.onFail()
+        this.fail()
         return
     }
   }

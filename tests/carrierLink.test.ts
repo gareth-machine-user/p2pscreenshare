@@ -5,10 +5,13 @@ import {
   CARRIER_MAX_KBPS,
   CARRIER_MIN_CAP_KBPS,
   CARRIER_UNKNOWN_RTT_KBPS,
+  CARRIER_HUNG_MS,
   CarrierBuffer,
   carrierCapKbps,
   carrierUnsupported,
+  frameRequester,
   seedStartBitrate,
+  TickWatch,
 } from '../src/mesh/carrierLink'
 import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW } from '../src/net/link'
 
@@ -53,6 +56,10 @@ describe('carrierUnsupported', () => {
     expect(carrierUnsupported()).toBe('WebRTC encoded transforms')
     vi.stubGlobal('RTCRtpScriptTransform', function () {})
     vi.stubGlobal('HTMLCanvasElement', Object.assign(function () {}, { prototype: { captureStream() {} } }))
+    // A canvas capture that can't be asked for frames is no frame source.
+    expect(carrierUnsupported()).toMatch(/frame source/)
+    // Firefox: requestFrame() on the stream only.
+    vi.stubGlobal('CanvasCaptureMediaStream', Object.assign(function () {}, { prototype: { requestFrame() {} } }))
     expect(carrierUnsupported()).toBe('the VP8 codec')
     vi.stubGlobal('RTCRtpSender', Object.assign(function () {}, { getCapabilities: () => ({ codecs: [{ mimeType: 'video/VP8' }] }) }))
     expect(carrierUnsupported()).toBeNull()
@@ -100,5 +107,38 @@ describe('CarrierBuffer', () => {
     expect(b.setRate(20_000)).toBe(false) // unchanged: no repeat
     // Higher, but still under what it holds: the drain wakes it.
     expect(holding(1000, 200_000).setRate(2000)).toBe(false)
+  })
+})
+
+describe('frameRequester', () => {
+  it("uses the track's requestFrame, else the stream's", () => {
+    const calls: string[] = []
+    const stream = { requestFrame: () => calls.push('stream') } as unknown as MediaStream
+    const track = { requestFrame: () => calls.push('track') } as unknown as MediaStreamTrack
+    frameRequester(stream, track)!()
+    frameRequester(stream, {} as MediaStreamTrack)!()
+    expect(calls).toEqual(['track', 'stream'])
+    expect(frameRequester({} as MediaStream, {} as MediaStreamTrack)).toBeNull()
+  })
+})
+
+describe('TickWatch', () => {
+  it('reports a worker whose clock stopped', () => {
+    const w = new TickWatch(0)
+    w.tick(500)
+    expect(w.hung(1000)).toBe(false)
+    expect(w.hung(2000)).toBe(false)
+    expect(w.hung(2000 + CARRIER_HUNG_MS)).toBe(false) // the page itself was away: wait a check
+    expect(w.hung(3000 + CARRIER_HUNG_MS)).toBe(true)
+    w.tick(3000 + CARRIER_HUNG_MS)
+    expect(w.hung(4000 + CARRIER_HUNG_MS)).toBe(false)
+  })
+
+  it("doesn't blame the worker for a stalled page", () => {
+    const w = new TickWatch(0)
+    // The page was busy for 5 s: its queued ticks come after this check.
+    expect(w.hung(5000)).toBe(false)
+    w.tick(5010)
+    expect(w.hung(6000)).toBe(false)
   })
 })
