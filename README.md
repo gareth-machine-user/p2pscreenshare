@@ -27,8 +27,8 @@ only to find the lobby; no media server is involved.
 - **Cut-through forwarding and low latency.** Relays forward each fragment as soon as it arrives.
   A jitter buffer that tracks reference dependencies plays out at a high percentile of frame
   arrival times, per viewer, so a laggy viewer buffers more without delaying anyone else. It keeps
-  the buffer a delay spike needed for a minute and shrinks it gently, so a connection that
-  hiccups every half minute doesn't stall on each hiccup. The default profile favours complete frames over delay (see
+  the buffer a recurring delay spike needed for a minute and shrinks it gently, so a connection
+  that hiccups every half minute doesn't stall on each hiccup. The default profile favours complete frames over delay (see
   [Quality versus latency](#quality-versus-latency)); the low-latency profile measured about
   **70 ms** glass-to-glass in local e2e tests.
 - **Gapless audio.** 192 kbps Opus tuned for music, in 40 ms frames erasure coded across the full
@@ -234,9 +234,15 @@ several SCTP connections per pair ("lanes") to multiply that ceiling; the carrie
   connection's two transforms (whichever was set first got frames), so it is the fallback there.
 - **Carrier frame.** Every frame the encoder produces (~70 bytes, at most ~180) is replaced by
   `[original frame][len u16][message]…[len u16][message][original length u16][version u8]['PC']`.
-  A message is one fragment, or padding (first byte 0, which no fragment starts with). A carrier
-  frame holds at most one stripe of any media frame, so losing it costs that frame one stripe,
-  which parity covers.
+  A message is one fragment, or padding (first byte 0, which no fragment starts with). On a long
+  path a carrier frame holds at most one stripe of any media frame (the stripe rule), so losing it
+  costs that frame one stripe, which parity covers, instead of a retransmission a round trip later.
+  The rule costs every frame time, though: its k stripes take k carrier frames (~30 ms at 4+2). On
+  a path whose round trip is at most `CARRIER_SHORT_RTT_MS` (30 ms) a retransmission is cheaper
+  than that, so there the rule is off and a frame goes in as few carrier frames as the budget
+  allows (localhost: lowest transit 41 → 12 ms). Audio fragments have a queue of their own that
+  every carrier frame empties first, whatever the budget: audio plays on the video's clock, so
+  audio waiting behind a keyframe would hold back the whole playout.
 - **Receive side.** The receive transform unpacks the messages and hands the decoder the original
   tiny frame back. That is not optional: Chromium frees its RTP packet buffer only as frames are
   decoded, and with nothing decoded it overflows, drops frames with no packet lost and asks for a
@@ -249,11 +255,16 @@ several SCTP connections per pair ("lanes") to multiply that ceiling; the carrie
   its estimate reached a bottleneck at ~4300 packets/s at 300 ms (the receiver's packet buffer
   overflowed, hundreds of keyframe requests followed and the estimate crashed); a flat 20 Mbps cap
   held a sharp 60 fps screen with parity back on a LAN. The uplink may hand a carrier up to
-  `CARRIER_BUFFER_MS` (120 ms) of its send rate at once, not just `LINK_BUFFER_HIGH` (64 KiB): a
-  carrier frame takes one stripe of a media frame at most, so with only one media frame waiting it
-  moved ~15 KiB per 10 ms frame (~20 Mbps) however high the estimate. The rate is a token bucket
+  `CARRIER_BUFFER_MS` (120 ms) of its send rate at once, not just `LINK_BUFFER_HIGH` (64 KiB): under
+  the stripe rule a carrier frame takes one stripe of a media frame at most, so with only one media
+  frame waiting it moved ~15 KiB per 10 ms frame (~20 Mbps) however high the estimate. The rate is a token bucket
   (`CarrierBudget`): credit accrues at that rate, up to 40 ms of it or one waiting message, and a
-  frame takes only what its credit covers, the head message first and never past it. For the
+  frame takes only what its credit covers, the head message first and never past it. Bursting
+  above the estimate wouldn't make a keyframe go faster: Chromium paces the carrier at about its
+  estimate (a 180 KB carrier frame took ~80 ms to arrive at a 16 Mbps estimate on localhost), so a
+  keyframe with parity takes its size over the estimate (~135 ms for 450 KB at 4+2 and 40 Mbps)
+  whatever the budget, and a burst would only move the queue into the pacer, where audio can't get
+  past it. For the
   uplink the carrier is a link like any other: its `bufferedAmount` is what was handed over and
   not yet packed (at most 64 KiB, so the backlog builds in the uplink queue, where priorities and
   deadlines apply), and a buffer-low event refills it.
@@ -525,7 +536,7 @@ k  m | stall % | degraded % | p50 ms    stall % | degraded % | p50 ms
 | Uplink deadlines T0 / T1 / T2+ | 2500 / 1500 / 800 ms | 900 / 350 / 180 ms | Bursts drain from the queue instead of costing frames |
 | Keyframe / replay deadline | 4 s | 2 / 2.5 s | Keyframes and GOP replays survive overload |
 | Jitter buffer | 99th percentile + 120 ms, ≥ 150 ms | 95th percentile + 40 ms, ≥ 30 ms | Far fewer late or skipped frames on jittery paths |
-| Jitter buffer memory | a spike's buffer is kept 60 s, then shrinks ≤ 8 ms/s; for the first 30 s of playback none is kept and it shrinks ≤ 250 ms/s | 5 s, then ≤ 250 ms/s | Periodic hiccups don't stall each time; shrinking slower than audio's 1% catch-up keeps sound gapless. A join's own burst isn't a hiccup: held, a 3 s one took 6 minutes to go |
+| Jitter buffer memory | a spike's buffer is kept 15 s, or 60 s once a spike as large came again (more than 12 s apart, within 2 minutes), then shrinks ≤ 8 ms/s; for the first 30 s of playback, and on while a join's turmoil lasts (a need over 1 s above the least, up to 90 s), none is kept and it shrinks ≤ 250 ms/s | 1.25 s, or 5 s if recurring, then ≤ 250 ms/s | Periodic hiccups don't stall each time; shrinking slower than audio's 1% catch-up keeps sound gapless. A one-off spike (the first keyframe after the bitrate stepped up) isn't held a minute. A join's own burst isn't a hiccup: held, a 3 s one took 6 minutes to go, and on a long lossy path it can outlast 30 s |
 | Stripe-silence detection | 1.5 s | 1 s | Fewer false reattaches |
 | Keyframe interval | 10 s | 2 s | Keyframes are expensive, and with constant bitrate each one briefly blurs the picture to fit the budget; joiners start from the cached GOP and a viewer that loses its decode chain asks for one |
 
@@ -665,6 +676,7 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `CARRIER_BUFFER_MS` | `mesh/carrierLink.ts` | 120 ms | How much of its send rate the uplink may hand a carrier at once (at least `LINK_BUFFER_HIGH`) |
 | `CARRIER_FPS`, `CARRIER_IDLE_FPS`, `CARRIER_IDLE_MS` | `mesh/carrierLink.ts` | 100, 5, 2 s | Carrier frames per second while sending, and the keepalive rate after this long idle |
 | `CARRIER_BURST_MS` | `net/carrier.ts` | 40 ms | The send budget's burst |
+| `CARRIER_SHORT_RTT_MS` | `net/carrier.ts` | 30 ms | Round trips up to which the stripe rule is off: ~30 ms less delay per frame, but a lost carrier frame may cost a frame more stripes than parity covers (a retransmission) |
 | `TARGET_SHARE`, `DOWN_GAP_MS`, `UP_GAP_MS`, `UP_STEP`, `DEADBAND` | `session/congestion.ts` | 0.85, 4 s, 10 s, 1.25, 5% | Share of the measured budget used, and how fast the bitrate follows it |
 | `HEADROOM_EVERY_MS`, `PROBE_DURATION_MS` | `session/peerSession.ts`, `session/headroom.ts` | 30 s, 1.5 s | How often (while nothing is backlogged) and how long the headroom probe pushes background bytes |
 
@@ -685,7 +697,7 @@ The unit tests (`tests/`) cover:
   signing
 - per-link stats: parsing Chrome and Firefox `getStats()` shapes, RTT baseline and staleness,
   path inflation (display); stall detection; the browser's estimate as capacity, capped
-- the carrier: packing fragments into carrier frames (the one-stripe rule, padding, the original
+- the carrier: packing fragments into carrier frames (the stripe rule and short paths, audio first, padding, the original
   frame back), the token-bucket send budget, frame loss covered by parity, SDP start-bitrate
   seeding and feature detection
 - rate control: delivered rate from counters and `bufferedAmount`, the max filter (exclusions,
