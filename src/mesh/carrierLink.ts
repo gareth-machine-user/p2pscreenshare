@@ -75,6 +75,55 @@ const ESTIMATE_POLL_MS = 1000
 /** The carrier track's frame size (px): as small as the encoder takes. */
 const CARRIER_SIZE = 16
 
+/**
+ * The carrier's send buffer as the uplink sees it: bytes handed over and not yet packed, its
+ * watermarks (which move with the send rate), and when to wake the uplink (onBufferLow).
+ */
+export class CarrierBuffer {
+  handed = 0
+  packed = 0
+  /** The send rate (kbps), which sets the watermarks. */
+  rateKbps = CARRIER_START_KBPS
+
+  /** Bytes handed over and not yet packed into a carrier frame. */
+  get amount(): number {
+    return this.handed - this.packed
+  }
+
+  /** How much the uplink may hand over at once (see CARRIER_BUFFER_MS). */
+  get high(): number {
+    return Math.max(LINK_BUFFER_HIGH, Math.round((this.rateKbps / 8) * CARRIER_BUFFER_MS))
+  }
+
+  /** The uplink is woken as the buffer falls to this. */
+  get low(): number {
+    return Math.max(LINK_BUFFER_LOW, Math.round(this.high / 4))
+  }
+
+  /**
+   * `bytes` were packed: whether that should wake the uplink. It falls through the low mark, or
+   * through BACKGROUND_BUFFER_MAX (a fast carrier's low mark is above it): GOP-cache replays and
+   * probes wait for that one, and with no live media to send nothing else would wake them.
+   */
+  pack(bytes: number): boolean {
+    const before = this.amount
+    this.packed += bytes
+    const after = this.amount
+    const low = this.low
+    return (before > low && after <= low) || (low > BACKGROUND_BUFFER_MAX && before > BACKGROUND_BUFFER_MAX && after <= BACKGROUND_BUFFER_MAX)
+  }
+
+  /**
+   * A new send rate: whether it should wake the uplink. A higher rate raises the high mark, and an
+   * uplink waiting under the old one sees no fall through a mark (the low one moved up past it).
+   */
+  setRate(kbps: number): boolean {
+    const high = this.high
+    this.rateKbps = kbps
+    return this.high > high && this.amount <= this.high
+  }
+}
+
 type TransformApi = 'script' | 'legacy'
 
 /** The minimal MediaStreamTrackGenerator (Chromium, main thread) the carrier track uses. */
@@ -210,9 +259,9 @@ export class CarrierLink {
   private streams: { side: 'send' | 'recv'; s: Streams }[] = []
   private transceiver: RTCRtpTransceiver | null = null
   private answerSender: RTCRtpSender | null = null
-  /** Media bytes handed to the worker, and packed by it; padding likewise. */
-  private handed = 0
-  private packed = 0
+  /** Media bytes handed to the worker and packed by it, and the send rate the worker has. */
+  private readonly buf = new CarrierBuffer()
+  /** Padding likewise. */
   private padHanded = 0
   private padPacked = 0
   private outbox: ArrayBuffer[] = []
@@ -224,8 +273,6 @@ export class CarrierLink {
   private lastStatsAt = -Infinity
   /** The lowest round trip seen (ms), which sets the cap. */
   private rttMs: number | null = null
-  /** The send rate the worker has (kbps). */
-  private rateKbps = CARRIER_START_KBPS
 
   constructor(
     private readonly pc: RTCPeerConnection,
@@ -313,8 +360,8 @@ export class CarrierLink {
       console.warn('carrier worker failed', ev.message)
       this.onFail()
     }
-    this.rateKbps = Math.min(CARRIER_START_KBPS, this.maxKbps)
-    w.postMessage({ op: 'rate', kbps: this.rateKbps })
+    this.buf.rateKbps = Math.min(CARRIER_START_KBPS, this.maxKbps)
+    w.postMessage({ op: 'rate', kbps: this.buf.rateKbps })
     this.worker = w
     return w
   }
@@ -353,24 +400,19 @@ export class CarrierLink {
 
   /** Bytes handed over and not yet packed into a carrier frame. */
   get bufferedAmount(): number {
-    return this.handed - this.packed
+    return this.buf.amount
   }
 
   /** How much the uplink may hand over at once (see CARRIER_BUFFER_MS). */
   get bufferHigh(): number {
-    return Math.max(LINK_BUFFER_HIGH, Math.round((this.rateKbps / 8) * CARRIER_BUFFER_MS))
-  }
-
-  /** onBufferLow fires as the buffer falls to this. */
-  private get bufferLow(): number {
-    return Math.max(LINK_BUFFER_LOW, Math.round(this.bufferHigh / 4))
+    return this.buf.high
   }
 
   send(data: Uint8Array): boolean {
     if (!this.open() || data.byteLength > MAX_CARRIER_MESSAGE) return false
     // A copy: the same fragment may be queued for other links, and the copy is transferred.
     this.outbox.push(data.slice().buffer)
-    this.handed += data.byteLength
+    this.buf.handed += data.byteLength
     this.scheduleFlush()
     return true
   }
@@ -407,12 +449,7 @@ export class CarrierLink {
       case 'packed': {
         const media = d.media as number
         const pad = d.pad as number
-        if (media) {
-          const before = this.bufferedAmount
-          this.packed += media
-          const low = this.bufferLow
-          if (before > low && this.bufferedAmount <= low) this.onBufferLow()
-        }
+        if (media && this.buf.pack(media)) this.onBufferLow()
         if (pad) {
           const before = this.probeLink.bufferedAmount
           this.padPacked += pad
@@ -465,8 +502,10 @@ export class CarrierLink {
     if (rtt != null && rtt >= 0) this.rttMs = this.rttMs === null ? rtt : Math.min(this.rttMs, rtt)
     const bps = r?.availableBps
     if (bps != null && bps > 0 && this.worker && !this.closed) {
-      this.rateKbps = Math.min(bps / 1000, this.maxKbps)
-      this.worker.postMessage({ op: 'rate', kbps: this.rateKbps })
+      const kbps = Math.min(bps / 1000, this.maxKbps)
+      const wake = this.buf.setRate(kbps)
+      this.worker.postMessage({ op: 'rate', kbps })
+      if (wake) this.onBufferLow()
     }
   }
 
