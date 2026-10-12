@@ -242,7 +242,9 @@ several SCTP connections per pair ("lanes") to multiply that ceiling; the carrie
   than that, so there the rule is off and a frame goes in as few carrier frames as the budget
   allows (localhost: lowest transit 41 → 12 ms). Audio fragments have a queue of their own that
   every carrier frame empties first, whatever the budget: audio plays on the video's clock, so
-  audio waiting behind a keyframe would hold back the whole playout.
+  audio waiting behind a keyframe would hold back the whole playout. (The uplink's queue before
+  the carrier is still first in, first out: there audio still waits for a keyframe, ~140 ms at
+  16 Mbps on localhost.)
 - **Receive side.** The receive transform unpacks the messages and hands the decoder the original
   tiny frame back. That is not optional: Chromium frees its RTP packet buffer only as frames are
   decoded, and with nothing decoded it overflows, drops frames with no packet lost and asks for a
