@@ -312,14 +312,21 @@ export class CapacityModel {
   private known = new Map<unknown, { peer: string; kbps: number; since: number; settled: boolean }>()
 
   /**
+   * The uplink's own shaper (the up= debug cap, kbps; net/uplink.ts), if any. It sits before the
+   * carriers, where no estimate sees it, so it bounds the estimates' sum directly. (Measured
+   * capacity sees it, as it sees any bottleneck.)
+   */
+  capKbps: number | null = null
+
+  /**
    * The uplink's capacity (kbps), null until known: what a peer gossips as capacityKbps. The sum of
-   * the settled estimates, or, on a browser that publishes none, measured.
+   * the settled estimates (at most capKbps), or, on a browser that publishes none, measured.
    */
   get uplinkKbps(): number | null {
     if (!this.known.size) return this.uplink.kbps
     let sum: number | null = null
     for (const k of this.known.values()) if (k.settled) sum = (sum ?? 0) + k.kbps
-    return sum
+    return sum === null ? null : Math.min(sum, this.capKbps ?? Infinity)
   }
 
   /** The uplink's capacity is the browser's estimates, not a measurement. */

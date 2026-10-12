@@ -95,6 +95,8 @@ export interface RateInputs {
   uplinkKbps: number | null
   /** The capacities are the browser's estimates (CapacityModel.estimated), not measured: the median of the children's decides, and is followed at once. */
   estimated?: boolean
+  /** The uplink's own shaper, if any (the up= debug cap, kbps): estimates don't see it. */
+  uplinkCapKbps?: number | null
   /** (child, stripe) edges from the publisher / stripes. */
   directChildren: number
   /**
@@ -129,7 +131,9 @@ export function rateTarget(i: RateInputs): RateTarget {
   // known: the estimates' sum over the children is their mean, which one slow viewer drags down,
   // and a shared bottleneck shows in each child's estimate anyway (their GCCs split it).
   const byMedian = !!i.estimated && medianPeerKbps !== null
-  const share = byMedian ? Infinity : (perChild ?? Infinity)
+  // The uplink's own shaper (the up= debug cap) is a hard limit no estimate sees: its share always binds.
+  const capPerChild = children && i.uplinkCapKbps != null ? i.uplinkCapKbps / i.directChildren : Infinity
+  const share = Math.min(byMedian ? Infinity : (perChild ?? Infinity), capPerChild)
   const wire = Math.min(share, median)
   let kbps = i.chosenKbps
   let limit: RateLimit = 'chosen'

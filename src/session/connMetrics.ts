@@ -105,6 +105,7 @@ export class ConnMetrics {
     private uplink: Uplink,
   ) {
     this.uplinkWindow.sample(uplinkCounters(uplink.stats))
+    this.capacity.capKbps = uplink.capKbps
   }
 
   /** The uplink's rates since the last call. */
@@ -178,6 +179,8 @@ export class ConnMetrics {
         stalled: w.stalled,
       }
     }
+    // The up= debug shaper, which no estimate sees (it can change at run time: e2e).
+    this.capacity.capKbps = this.uplink.capKbps
     this.capacity.update(now, windows, { frozen: lagMs >= FROZEN_LAG_MS })
     this.backloggedNow = windows.some((w) => w.active && w.backlogged)
   }

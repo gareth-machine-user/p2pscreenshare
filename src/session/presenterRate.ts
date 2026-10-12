@@ -92,6 +92,7 @@ export class PresenterRate {
       audienceKbps: audienceLimit(this.autoBitrate ? this.audienceCap.kbps : null, full.limited, full.kbps),
       uplinkKbps: this.capacity.uplinkKbps,
       estimated: this.capacity.estimated,
+      uplinkCapKbps: this.capacity.capKbps,
       directChildren: edges.children,
       peerKbps,
       wireAt: (v) => stripes * stripeKbpsFor(v, full.k, full.withAudio),

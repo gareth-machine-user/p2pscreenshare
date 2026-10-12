@@ -70,13 +70,17 @@ describe('bitrate target', () => {
     expect(upperMedian([5, 1, 3, 2])).toBe(3)
   })
 
-  it("with the browser's estimates: the children's median, not the uplink's share (their mean)", () => {
+  it("with the browser's estimates: the children's median, not the uplink's share (their mean), unless the up= shaper binds", () => {
     // 3 children at 20, 20 and 1.5 Mbps: the estimates' sum per child (13.8 Mbps) is their mean.
     const i = { ...base, uplinkKbps: 41_500, directChildren: 3, peerKbps: [20_000, 20_000, 1500], estimated: true }
     expect(rateTarget(i)).toMatchObject({ limit: 'viewers', medianPeerKbps: 20_000, estimated: true })
     expect(rateTarget(i).kbps).toBeCloseTo(settleAt(20_000))
     // Measured capacities: the share binds as before.
     expect(rateTarget({ ...i, estimated: false }).limit).toBe('uplink')
+    // A 6 Mbps shaper: 2 Mbps each, followed carefully (not an estimate).
+    const capped = rateTarget({ ...i, uplinkCapKbps: 6000 })
+    expect(capped).toMatchObject({ limit: 'uplink', estimated: false })
+    expect(capped.kbps).toBeCloseTo(settleAt(2000))
   })
 
   it('never above what the audience can relay', () => {

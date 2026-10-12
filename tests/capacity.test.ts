@@ -365,6 +365,16 @@ describe('capacity model', () => {
       expect(m.peer('b').kbps).toBe(17_000)
     })
 
+    it("the uplink's own shaper (up=), which no estimate sees, bounds their sum", () => {
+      const m = new CapacityModel()
+      settled(m, 'a', 'a', 20_000)
+      settled(m, 'b', 'b', 20_000)
+      m.capKbps = 2500
+      expect(m.uplinkKbps).toBe(2500)
+      m.capKbps = null
+      expect(m.uplinkKbps).toBe(40_000)
+    })
+
     it('null (or no usable number) clears it: the connection measures afresh, and settles again', () => {
       const m = new CapacityModel()
       m.update(0, [w('a', 'a', 30_000, { backlogged: true }), w('b', 'b', 30_000, { backlogged: true })], { probe: true })
