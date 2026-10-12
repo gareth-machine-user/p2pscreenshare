@@ -6,7 +6,7 @@
 // - Subscriber: one Subscription per watched channel (session/subscription.ts).
 // - Publish rights: requests to publish and the owner's answers (session/publishRights.ts).
 // - Relay: one RelayNode for every channel, forwarding over the mesh links' carriers.
-// - Capacity: each connection's delivered rate (session/connMetrics.ts, capacity.ts), split into
+// - Capacity: each connection's bandwidth estimate (session/connMetrics.ts, capacity.ts), split into
 //   relay slots per watched channel; the presenter's bitrate follows it (session/presenterRate.ts).
 import type { PublishPolicy } from '../mesh/auth'
 import { importPublicKey, type PeerIdentity } from '../mesh/identity'
@@ -79,7 +79,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
   readonly mesh: Mesh
   readonly uplink: Uplink
   readonly relay: RelayNode
-  /** Delivered-rate capacity per connection, per peer and of the uplink (session/capacity.ts). */
+  /** Capacity per connection (the browser's estimates), per peer and of the uplink (session/capacity.ts). */
   readonly capacity: CapacityModel
   /** What this peer measures of its uplink and connections (session/connMetrics.ts). */
   readonly metrics: ConnMetrics
@@ -633,9 +633,9 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
   /**
    * Headroom discovery, the only probing: once shortly after the first link opens, then every 30 s
    * (5 s while a capacity estimate limits a bitrate the stream would use: discoveryDue) while no
-   * media connection is backlogged (a backlogged one already shows what it carries) and some
-   * connection has been open SETTLE_MS (so a presenter's first probe waits for its first viewer).
-   * Also when a raised quality waits for one (PresenterRate.probeWanted).
+   * media connection is backlogged (a backlogged carrier already sends at its estimate, which grows
+   * on its own then) and some connection has the browser's estimate or, without one, has been open
+   * SETTLE_MS. Also when a raised quality waits for one (PresenterRate.probeWanted).
    */
   private maybeDiscover(): void {
     if (this.headroom.running || this.firstLinkAt === null) return
@@ -655,7 +655,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
         encoderKbps: enc?.kbps ?? null,
         targetKbps: enc?.targetKbps ?? null,
       })
-    // Not while every connection is settling: a probe then measures its join (capacity.ts SETTLE_MS).
+    // Not while every connection is settling: a probe then would only measure its join (capacity.ts SETTLE_MS).
     if (due && !this.metrics.backloggedNow && !this.metrics.allSettling(now)) void this.discover()
   }
 

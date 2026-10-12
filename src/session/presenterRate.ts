@@ -25,7 +25,7 @@ export class PresenterRate {
   private ctl = new BitrateController()
   /** Auto quality's cap, apart from the chosen quality. */
   private audienceCap = new AudienceCap()
-  /** Direct children count towards the median only once settled. */
+  /** Direct children without the browser's estimate count towards the median only once settled. */
   private settle = new ViewerSettle()
   /** When to go straight to the target (a raised quality, a cut a probe no longer bears out). */
   private gate = new JumpGate()
@@ -33,7 +33,7 @@ export class PresenterRate {
   constructor(
     private selfId: string,
     private capacity: CapacityModel,
-    /** Every open connection to `peer` has been open SETTLE_MS. */
+    /** No open connection to `peer` is settling (ConnMetrics.peerSettled: no estimate, open less than SETTLE_MS). */
     private connsSettled: (peer: string) => boolean,
   ) {}
 
@@ -63,8 +63,8 @@ export class PresenterRate {
   /**
    * The presenter's bitrate (session/congestion.ts): 85% of what the wire budget per direct child
    * carries, the budget being the smaller of the uplink's capacity shared by the direct children
-   * and the median capacity of the peers it feeds directly (those fed, and connected, for SETTLE_MS). Runs
-   * on each 2 s window.
+   * and the median capacity of the peers it feeds directly (the browser's estimate once it has been
+   * polled a few seconds; a measured one once fed, and connected, for SETTLE_MS). Runs on each 2 s window.
    */
   adapt(s: PublishedStream | null, now: number): void {
     const full = s?.full
@@ -76,19 +76,22 @@ export class PresenterRate {
     const stripes = full.stripes
     this.settle.update(now, edges.byPeer.keys())
     const peerKbps = [...edges.byPeer].map(([peer, e]) => {
-      // A newly fed or newly connected child doesn't push back yet: its first windows say little.
-      if (!this.settle.settled(now, peer) || !this.connsSettled(peer)) return null
       const c = this.capacity.peer(peer)
-      // Only a limit counts: a connection that was its own bottleneck, or one whose browser
-      // estimates its bandwidth (the carrier: CapacityModel.setKnown). A peer fed only some
-      // stripes needs only that share of a full copy.
-      return c.bound && c.kbps !== null ? (c.kbps * stripes) / e : null
+      // Only a limit counts: the browser's estimate for the connection's carrier
+      // (CapacityModel.setKnown), or, without one, a connection that was its own bottleneck.
+      if (!c.bound || c.kbps === null) return null
+      // A newly fed or newly connected child without an estimate doesn't push back yet: its first
+      // measured windows say little.
+      if (!c.estimated && (!this.settle.settled(now, peer) || !this.connsSettled(peer))) return null
+      // A peer fed only some stripes needs only that share of a full copy.
+      return (c.kbps * stripes) / e
     })
     const t = rateTarget({
       chosenKbps: s.ceilingKbps,
       // The audience's relay slots: never climb past what they carry (Auto quality cuts to it).
       audienceKbps: audienceLimit(this.autoBitrate ? this.audienceCap.kbps : null, full.limited, full.kbps),
       uplinkKbps: this.capacity.uplinkKbps,
+      estimated: this.capacity.estimated,
       directChildren: edges.children,
       peerKbps,
       wireAt: (v) => stripes * stripeKbpsFor(v, full.k, full.withAudio),

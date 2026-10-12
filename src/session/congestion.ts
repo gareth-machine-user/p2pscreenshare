@@ -6,44 +6,48 @@
 //   - the uplink's capacity shared by the direct children, and
 //   - the median capacity of the peers it feeds directly (scaled to a full copy for a peer fed
 //     only some stripes), so one slow viewer can't hold everyone else down: it sheds enhancement
-//     layers on its own link, and Auto quality can show it the preview;
+//     layers on its own link, and Auto quality can show it the preview. With the browser's
+//     estimates, once most direct children are known, the median alone (see rateTarget);
 // and the target is 85% of the video bitrate that budget carries (stripeKbpsFor's overhead), never
 // above the chosen quality or what the audience's relay slots can carry.
 //
-// A direct child counts towards the median only once it has been fed for SETTLE_MS: a joiner's first
-// windows (GOP replay, its own connections still ramping up) say little about what it can take. Its
-// connections' backlog sets no capacity for as long (session/capacity.ts).
+// Capacities are normally the browser's estimates (session/capacity.ts), counted once polled for a
+// few seconds. A child without one (a browser that publishes none) counts towards the median only
+// once it has been fed for SETTLE_MS: its first measured windows (GOP replay, its connections still
+// starting) say little about what it can take (session/presenterRate.ts).
 //
-// Pacing: down at once (at most every 4 s), by at most half unless capacity just fell at once (a
-// fast drop: ~6 s of evidence), up by at most 25% per 10 s; changes under 5% are noise. Straight up
-// to the target, though, once a probe confirms it (JumpGate): after the chosen quality went up, and
-// after a cut that capacity no longer bears out.
-// With viewers but the uplink not measured yet (the first join: the first headroom probe runs 1 s
-// in), it starts at no more than START_KBPS, and goes straight to the target once measured.
+// Pacing: changes under 5% are noise. A target set by the browser's estimates is authoritative:
+// the bitrate goes straight to it, down or up, at most one cut and one raise per 4 s (and no raise
+// within 4 s of a cut). A measured one is followed carefully: down at once (at most every 4 s) but
+// by at most half unless capacity just fell at once (a fast drop: ~6 s of evidence), up by at most
+// 25% per 10 s. Straight up to the target, though, once a probe confirms it (JumpGate): after the
+// chosen quality went up, and after a cut that capacity no longer bears out.
+// With viewers but nothing known yet (a first connection's estimate still settling, or the uplink
+// unmeasured), it starts at no more than START_KBPS, and goes straight to the target once known.
 import { SETTLE_MS } from './capacity'
 
 /** Settle at this share of what the wire budget carries. */
 export const TARGET_SHARE = 0.85
-/** At most one cut per this long (ms). */
+/** At most one cut per this long (ms); with the browser's estimates, one raise too, and none this soon after a cut. */
 export const DOWN_GAP_MS = 4000
-/** At most one raise per this long (ms), and none this soon after a cut. */
+/** Measured capacity: at most one raise per this long (ms), and none this soon after a cut. */
 export const UP_GAP_MS = 10_000
-/** A raise is at most this factor. */
+/** Measured capacity: a raise is at most this factor. */
 export const UP_STEP = 1.25
 /** Changes smaller than this share are ignored. */
 export const DEADBAND = 0.05
-/** A cut is at most to this share of the bitrate, unless capacity just fell at once or is unmeasured. */
+/** Measured capacity: a cut is at most to this share of the bitrate, unless it just fell at once or is unmeasured. */
 export const MAX_CUT = 0.5
 /** A probe this recent (ms) confirms a raised quality: the bitrate goes straight to it. */
 export const PROBE_FRESH_MS = 30_000
 /**
- * Most a stream sends to its first viewers before the uplink is measured (kbps). Sending the chosen
- * quality, plus the new child's GOP replay, into an unmeasured 8 Mbit uplink overflowed its queue
- * and stalled the connection's SCTP association (control channel included) for seconds.
+ * Most a stream sends to its first viewers before anything is known of the uplink or them (kbps).
+ * Sending the chosen quality, plus the new child's GOP replay, into an unmeasured 8 Mbit uplink
+ * overflowed its queue and stalled the connection (control channel included) for seconds.
  */
 export const START_KBPS = 4000
 
-/** When each direct child started being fed, to hold off its pushback until SETTLE_MS. */
+/** When each direct child started being fed, to hold off a measured pushback until SETTLE_MS. */
 export class ViewerSettle {
   private since = new Map<string, number>()
 
@@ -87,13 +91,15 @@ export interface RateInputs {
   chosenKbps: number
   /** What the audience's relay slots can carry (ChannelPublisher.limited), if that limits. */
   audienceKbps: number | null
-  /** The uplink's capacity (kbps), null until measured. */
+  /** The uplink's capacity (kbps), null until known. */
   uplinkKbps: number | null
+  /** The capacities are the browser's estimates (CapacityModel.estimated), not measured: the median of the children's decides, and is followed at once. */
+  estimated?: boolean
   /** (child, stripe) edges from the publisher / stripes. */
   directChildren: number
   /**
-   * Per peer fed directly: the full-copy wire rate its connections carry (kbps), or null when none
-   * of them has been its own bottleneck (it can take more than it is sent).
+   * Per peer fed directly: the full-copy wire rate its connections carry (kbps), or null when that
+   * isn't known yet, or none of them has been its own bottleneck (it can take more than it is sent).
    */
   peerKbps: (number | null)[]
   /** Wire kbps of one full copy (every stripe) at a video bitrate. */
@@ -109,6 +115,8 @@ export interface RateTarget {
   /** The uplink's capacity per direct child, and the viewers' median (kbps), when known. */
   uplinkPerChildKbps: number | null
   medianPeerKbps: number | null
+  /** It comes from the browser's estimates: the controller goes straight to it. */
+  estimated?: boolean
 }
 
 /** The bitrate the stream should run at, and why. */
@@ -117,17 +125,24 @@ export function rateTarget(i: RateInputs): RateTarget {
   const perChild = children && i.uplinkKbps !== null ? i.uplinkKbps / i.directChildren : null
   const median = children ? upperMedian(i.peerKbps.map((x) => x ?? Infinity)) : Infinity
   const medianPeerKbps = Number.isFinite(median) ? median : null
-  const wire = Math.min(perChild ?? Infinity, median)
+  // With the browser's estimates, the uplink's share per child doesn't bind once most children are
+  // known: the estimates' sum over the children is their mean, which one slow viewer drags down,
+  // and a shared bottleneck shows in each child's estimate anyway (their GCCs split it).
+  const byMedian = !!i.estimated && medianPeerKbps !== null
+  const share = byMedian ? Infinity : (perChild ?? Infinity)
+  const wire = Math.min(share, median)
   let kbps = i.chosenKbps
   let limit: RateLimit = 'chosen'
   if (Number.isFinite(wire)) {
     const v = TARGET_SHARE * videoKbpsForWire(wire, i.wireAt)
     if (v < kbps) {
       kbps = v
-      limit = medianPeerKbps !== null && medianPeerKbps < (perChild ?? Infinity) ? 'viewers' : 'uplink'
+      limit = medianPeerKbps !== null && medianPeerKbps < share ? 'viewers' : 'uplink'
     }
   }
-  if (children && i.uplinkKbps === null && START_KBPS < kbps) {
+  // Nothing known, of the uplink or of every child: start gently.
+  const unknown = i.uplinkKbps === null && i.peerKbps.some((x) => x === null)
+  if (children && unknown && START_KBPS < kbps) {
     kbps = START_KBPS
     limit = 'unmeasured'
   }
@@ -135,7 +150,8 @@ export function rateTarget(i: RateInputs): RateTarget {
     kbps = i.audienceKbps
     limit = 'audience'
   }
-  return { kbps, limit, uplinkPerChildKbps: perChild, medianPeerKbps }
+  const estimated = byMedian && (limit === 'chosen' || limit === 'viewers')
+  return { kbps, limit, uplinkPerChildKbps: perChild, medianPeerKbps, estimated }
 }
 
 /** Paces moves towards the target (see the top of the file). */
@@ -146,8 +162,8 @@ export class BitrateController {
   private unmeasured = false
 
   /**
-   * The next bitrate, or null to stay. `fastDropAt`: when capacity last fell at once (CapacityModel):
-   * one since the last cut lets this cut go all the way to the target.
+   * The next bitrate, or null to stay. `fastDropAt`: when a measured capacity last fell at once
+   * (CapacityModel): one since the last cut lets this cut go all the way to the target.
    */
   step(now: number, currentKbps: number, t: RateTarget, o: { fastDropAt?: number } = {}): number | null {
     const wasUnmeasured = this.unmeasured
@@ -159,13 +175,21 @@ export class BitrateController {
     }
     if (t.kbps < currentKbps * (1 - DEADBAND)) {
       if (now - this.lastDown < DOWN_GAP_MS) return null
-      const steep = (o.fastDropAt ?? -Infinity) > this.lastDown || this.unmeasured
+      // The browser's estimate fell (20 → 3 Mbps): it already reflects the loss or delay it saw.
+      const steep = t.estimated || (o.fastDropAt ?? -Infinity) > this.lastDown || this.unmeasured
       this.lastDown = now
       return steep ? t.kbps : Math.max(t.kbps, currentKbps * MAX_CUT)
     }
     // Back to the chosen quality even from just below it; elsewhere small moves are noise.
     const up = t.kbps > currentKbps * (1 + DEADBAND) || (t.limit === 'chosen' && t.kbps > currentKbps)
-    if (!up || now - this.lastUp < UP_GAP_MS || now - this.lastDown < UP_GAP_MS) return null
+    if (!up) return null
+    if (t.estimated) {
+      // The estimate grew (GCC grows only to about 1.5 times what is sent, so this climbs in steps).
+      if (now - this.lastUp < DOWN_GAP_MS || now - this.lastDown < DOWN_GAP_MS) return null
+      this.lastUp = now
+      return t.kbps
+    }
+    if (now - this.lastUp < UP_GAP_MS || now - this.lastDown < UP_GAP_MS) return null
     this.lastUp = now
     return Math.min(t.kbps, currentKbps * UP_STEP)
   }

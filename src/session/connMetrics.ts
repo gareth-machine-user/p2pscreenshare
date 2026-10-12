@@ -72,10 +72,6 @@ function uplinkCounters(s: Uplink['stats']): UplinkCounters {
   return { bytes: s.sentBytes, items: s.sentItems, dropped: s.droppedItems, t0: d[0], t1: d[1], t2: d[2] + d[3], stalls: s.bufferStalls, queueSum: s.queueDelaySum, queueN: s.queueDelayN }
 }
 
-/** A connection open less than SETTLE_MS: its backlog says nothing of capacity yet (capacity.ts). */
-function settling(r: ConnRecord, now: number): boolean {
-  return now - r.openedAt < SETTLE_MS
-}
 
 /** What is kept per open connection, in one place. */
 interface ConnRecord {
@@ -90,7 +86,7 @@ interface ConnRecord {
 }
 
 export class ConnMetrics {
-  /** Delivered-rate capacity per connection, per peer and of the uplink (session/capacity.ts). */
+  /** Capacity per connection (the browser's estimates), per peer and of the uplink (session/capacity.ts). */
   readonly capacity = new CapacityModel()
   /** The uplink's send rate and drop ratio over the last window. */
   uplinkNow = { kbps: 0, dropRate: 0 }
@@ -127,6 +123,14 @@ export class ConnMetrics {
   }
 
   /**
+   * A connection without the browser's estimate, open less than SETTLE_MS: its backlog says nothing
+   * of capacity yet (capacity.ts). One with an estimate never settles: its windows measure nothing.
+   */
+  private settling(conn: PairConn, r: ConnRecord, now: number): boolean {
+    return now - r.openedAt < SETTLE_MS && !this.capacity.conn(conn)?.estimated
+  }
+
+  /**
    * Every open connection with its record. Records of connections that are no longer open are
    * dropped here, so this is the one place they are pruned.
    */
@@ -149,7 +153,7 @@ export class ConnMetrics {
   /**
    * One capacity window (session/capacity.ts): what each connection delivered since the last one,
    * whether it was backlogged or stalled meanwhile. Its backlog sets no capacity (`transient`)
-   * while the connection is settling (open less than SETTLE_MS), when it carried a catch-up replay,
+   * while the connection is settling (no estimate, open less than SETTLE_MS), when it carried a catch-up replay,
    * or while `quiet` (the stream just changed quality). A window in which the page froze (the main
    * thread lagged FROZEN_LAG_MS or more) says nothing about the network and is left out.
    */
@@ -164,7 +168,7 @@ export class ConnMetrics {
       // A connection's counters restart if the uplink forgot it (closed and reopened).
       if (!last || snap.handed < last.handed || snap.items < last.items) continue
       const w = linkWindow(conn, rec.peer, last, snap)
-      windows.push({ ...w, transient: w.transient || quiet || settling(rec, now) })
+      windows.push({ ...w, transient: w.transient || quiet || this.settling(conn, rec, now) })
       rec.rate = {
         mediaKbps: Math.round(w.mediaKbps),
         deliveredKbps: Math.round(w.kbps),
@@ -181,9 +185,9 @@ export class ConnMetrics {
   /**
    * Pushes background bytes onto every open connection for 1.5 s (session/headroom.ts) and takes
    * what each delivered as a backlogged window. False if no probe ran. A probe link is padding in
-   * the connection's carrier frames, within the browser's estimate: what it delivers counts for the
-   * uplink's capacity, the connection's own stays the estimate (CapacityModel.setKnown), and the
-   * padding is what lets that estimate grow while the stream sends less than it.
+   * the connection's carrier frames, within the browser's estimate: the padding is what lets that
+   * estimate grow while the stream sends less than it. Only a connection without an estimate
+   * measures anything by it (CapacityModel).
    */
   async probe(headroom: HeadroomProbe): Promise<boolean> {
     const conns = this.openConns().filter(([conn]) => conn.probeLink.isOpen)
@@ -199,22 +203,25 @@ export class ConnMetrics {
       const a = r.start.get(conn)
       const b = r.end.get(conn)
       if (!a || !b || !conn.isOpen || !conn.probeLink.isOpen) continue
-      windows.push({ ...linkWindow(conn, rec.peer, a, b), active: true, backlogged: true, transient: settling(rec, now) })
+      windows.push({ ...linkWindow(conn, rec.peer, a, b), active: true, backlogged: true, transient: this.settling(conn, rec, now) })
     }
     this.capacity.update(now, windows, { probe: true })
     return true
   }
 
-  /** Every open connection is still settling (SETTLE_MS): a probe now would measure nothing. */
+  /**
+   * Every open connection is still settling (no estimate, open less than SETTLE_MS): a probe now
+   * would measure nothing. One with an estimate never holds a probe back: its padding grows it.
+   */
   allSettling(now: number): boolean {
     const conns = this.openConns()
-    return conns.length > 0 && conns.every(([, r]) => settling(r, now))
+    return conns.length > 0 && conns.every(([c, r]) => this.settling(c, r, now))
   }
 
-  /** Every open connection to `peer` has been open SETTLE_MS (false with none). */
+  /** No open connection to `peer` is settling (false with none). */
   peerSettled(peer: string, now: number): boolean {
     const rs = this.openConns().filter(([, r]) => r.peer === peer)
-    return rs.length > 0 && rs.every(([, r]) => !settling(r, now))
+    return rs.length > 0 && rs.every(([c, r]) => !this.settling(c, r, now))
   }
 
   /**
@@ -235,7 +242,7 @@ export class ConnMetrics {
           // Closed meanwhile (retain() already dropped it): don't bring its estimate back.
           const est = stats.availableKbps
           const known = est === null || conn.maxKbps === undefined ? est : Math.min(est, conn.maxKbps)
-          if (conn.isOpen) this.capacity.setKnown(conn, rec.peer, known)
+          if (conn.isOpen) this.capacity.setKnown(conn, rec.peer, known, performance.now())
         }),
       )
     } finally {
