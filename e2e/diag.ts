@@ -28,6 +28,7 @@ declare global {
     __lag?: Lag
     __bufPeak?: Map<string, number>
     __stalls?: number[]
+    __transit?: { key: boolean; audio: boolean; ms: number; bytes: number }[]
   }
 }
 
@@ -164,7 +165,28 @@ async function viewerSample(hostId: string, lag: typeof takeLag) {
   }
   const c = p.mesh.linkFor(hostId) as PageConn | undefined
   const recv = c?.pc ? await recvOf(c.pc).catch(() => null) : null
-  return { fps: d.fps, latencyMs: d.latencyMs, bufferMs: d.bufferMs, decoded: d.decoded, dropped: d.dropped, loss: sub ? sub.loss : null, recv, now: performance.now(), lag: lag() }
+  // Each frame's transit (completion here - capture there, through the clock offset when known),
+  // by wrapping the stage player's push (installed on the first sample, again for a new player).
+  const player = sub?.player as (NonNullable<typeof sub>['player'] & { __diag?: boolean }) | undefined
+  if (player && !player.__diag) {
+    player.__diag = true
+    const push = player.push.bind(player)
+    player.push = (f) => {
+      if (!f.replay) {
+        const ms = f.completedAt + (player.clockOffset ?? 0) - f.captureTime
+        ;(window.__transit ??= []).push({ key: f.key, audio: !!f.audio, ms, bytes: f.data.byteLength })
+      }
+      push(f)
+    }
+  }
+  const tr = window.__transit ?? []
+  window.__transit = []
+  const vid = tr.filter((x) => !x.audio && !x.key).map((x) => x.ms).sort((a, b) => a - b)
+  const q = (a: number[], f: number) => (a.length ? Math.round(a[Math.min(a.length - 1, Math.floor(a.length * f))]) : null)
+  const keys = tr.filter((x) => x.key).map((x) => ({ ms: Math.round(x.ms), kb: Math.round(x.bytes / 1024) }))
+  const aud = tr.filter((x) => x.audio).map((x) => x.ms).sort((a, b) => a - b)
+  const transit = { min: q(vid, 0), med: q(vid, 0.5), q99: q(vid, 0.99), max: q(vid, 1), keys, audMax: q(aud, 1) }
+  return { fps: d.fps, latencyMs: d.latencyMs, bufferMs: d.bufferMs, decoded: d.decoded, dropped: d.dropped, loss: sub ? sub.loss : null, recv, transit, now: performance.now(), lag: lag() }
 }
 
 /** One viewer sample (page-side expression), for its link from `hostId`. */
@@ -181,7 +203,7 @@ export interface DiagRow {
 /** The per-second table (deltas of cumulative counters) and a summary line. */
 export function formatTimeline(rows: DiagRow[]): string {
   const lines: string[] = []
-  lines.push('t     kbps  limit    enc   upKbps qMs  q1s  P stall drop(t0,t1,t2) capUp  capPeer   link(del,B,S) est    rtt    peakBuf(KB) discards tx(kB/s) rx(kB/s) fps lat  lagH lagV vis  cfps')
+  lines.push('t     kbps  limit    enc   upKbps qMs  q1s  P stall drop(t0,t1,t2) capUp  capPeer   link(del,B,S) est    rtt    peakBuf(KB) discards tx(kB/s) rx(kB/s) fps lat  buf  tMin tMed t99  tMax key(ms/KB) lagH lagV vis  cfps')
   for (let i = 1; i < rows.length; i++) {
     const a = rows[i - 1]
     const b = rows[i]
@@ -223,6 +245,12 @@ export function formatTimeline(rows: DiagRow[]): string {
         String(rx).padEnd(8),
         String(b.v.fps).padEnd(3),
         String(b.v.latencyMs == null ? '-' : Math.round(b.v.latencyMs)).padEnd(4),
+        String(Math.round(b.v.bufferMs)).padEnd(4),
+        String(b.v.transit.min ?? '-').padEnd(4),
+        String(b.v.transit.med ?? '-').padEnd(4),
+        String(b.v.transit.q99 ?? '-').padEnd(4),
+        String(b.v.transit.max ?? '-').padEnd(4),
+        (b.v.transit.keys.map((k) => `${k.ms}/${k.kb}`).join(',') || '-').padEnd(11),
         `${b.h.lag.maxMs}`.padEnd(4),
         `${b.v.lag.maxMs}`.padEnd(4),
         `${b.h.lag.visible[0]}${b.v.lag.visible[0]}`.padEnd(4),
@@ -242,6 +270,16 @@ export function formatTimeline(rows: DiagRow[]): string {
     `summary: cuts=${cuts} limitedSamples=${limited}/${rows.length} backloggedSamples=${backlogged} stalledSamples=${stalled} localLoadSamples=${local} probes=${probes} lowestKbps=${lowestKbps} finalKbps=${last?.h.kbps} uplinkCap=${Math.round(last?.h.cap ?? 0)} peerCap=${Math.round(last?.h.peerCap?.kbps ?? 0)}`,
   )
   lines.push(`encoder last: ${JSON.stringify(last?.h.enc)}`)
+  // The second half of the run (past the jitter buffer's warmup): medians of the per-second values.
+  const tail = rows.slice(Math.floor(rows.length / 2))
+  const med = (xs: (number | null | undefined)[]) => {
+    const a = xs.filter((x): x is number => x != null).sort((x, y) => x - y)
+    return a.length ? Math.round(a[Math.floor(a.length / 2)]) : null
+  }
+  const txs = tail.slice(1).map((r, i) => (r.h.conn?.sent != null && tail[i].h.conn?.sent != null ? ((r.h.conn.sent - tail[i].h.conn!.sent!) * 8) / (r.h.now - tail[i].h.now) : null))
+  lines.push(
+    `second half: lat=${med(tail.map((r) => r.v.latencyMs))} buf=${med(tail.map((r) => r.v.bufferMs))} tMin=${med(tail.map((r) => r.v.transit.min))} tMed=${med(tail.map((r) => r.v.transit.med))} t99=${med(tail.map((r) => r.v.transit.q99))} fps=${med(tail.map((r) => r.v.fps))} kbps=${med(tail.map((r) => r.h.kbps))} txKbps=${med(txs)} keyTransit=${tail.flatMap((r) => r.v.transit.keys.map((k) => k.ms)).join(',')}`,
+  )
   return lines.join('\n')
 }
 
