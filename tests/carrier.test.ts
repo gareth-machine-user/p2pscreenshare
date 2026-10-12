@@ -71,7 +71,7 @@ function sameBytes(a: Uint8Array | undefined, b: Uint8Array): boolean {
 describe('CarrierPacker', () => {
   it('round trips messages through a frame, keeping the prefix in front', () => {
     const p = new CarrierPacker()
-    const msgs = [bytes(5, 1), bytes(0, 0), bytes(300, 2), bytes(16 * 1024, 3)]
+    const msgs = [bytes(5, 1), bytes(0, 0), bytes(300, 2), bytes(16 * 1024, 4)]
     for (const m of msgs) p.push(m)
     expect(p.queuedBytes).toBe(5 + 300 + 16 * 1024)
     const r = p.pack(1 << 20, PREFIX)!
@@ -206,6 +206,24 @@ describe('CarrierPacker', () => {
     const second = unpackCarrier(p.pack(1 << 20)!.frame)
     expect(second[0]).toEqual(f1[1][0])
     expect(second.length).toBe(1 + 11)
+  })
+
+  it('sends audio first, past the lookahead and while the budget holds the rest', () => {
+    const p = new CarrierPacker()
+    const video = packetize(frame(1, 200_000), K, M, 7).flat()
+    const audio = packetize(frame(1, 300, true), K, M, 7)
+    for (const f of video) p.push(f)
+    for (let i = 0; i < CARRIER_LOOKAHEAD + 10; i++) p.push(bytes(10, i))
+    for (const f of audio[0]) p.push(f)
+    for (const f of audio[1]) p.push(f)
+    expect(p.length).toBe(video.length + CARRIER_LOOKAHEAD + 10 + audio[0].length + audio[1].length)
+    // Held (no credit for the head): only audio goes, one stripe of it under the stripe rule.
+    const held = unpackCarrierFrame(p.packFrame(0, PREFIX, 0, true).frame)!
+    expect(held.messages).toEqual(audio[0])
+    // Then the next audio stripe, ahead of the head, which goes too.
+    const next = unpackCarrier(p.pack(0, PREFIX)!.frame)
+    expect(next).toEqual([...audio[1], video[0]])
+    expect(p.headBytes).toBe(CARRIER_LENGTH_SIZE + video[1].byteLength)
   })
 
   it('exempts non-fragments from the stripe rule', () => {
