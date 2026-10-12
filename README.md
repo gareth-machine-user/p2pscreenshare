@@ -243,9 +243,15 @@ several SCTP connections per pair ("lanes") to multiply that ceiling; the carrie
   keyframe several times a second. Duplicate frames (a few reach the transform) are dropped by RTP
   timestamp; the relay de-duplicates fragments by id anyway.
 - **Sending.** The worker packs at the browser's estimate (`availableOutgoingBitrate` on the
-  selected candidate pair), capped at `CARRIER_MAX_KBPS` (20 Mbps): one carrier once collapsed when
-  its estimate reached a bottleneck at ~4300 packets/s (the receiver's packet buffer overflowed,
-  hundreds of keyframe requests followed and the estimate crashed). The rate is a token bucket
+  selected candidate pair), capped for the path's round trip (`carrierCapKbps`): at most
+  `CARRIER_INFLIGHT_KBIT` (6000 kbit) in flight, so 20 Mbps at 300 ms, and `CARRIER_MAX_KBPS`
+  (50 Mbps) on short paths; 20 Mbps until the round trip is known. One carrier once collapsed when
+  its estimate reached a bottleneck at ~4300 packets/s at 300 ms (the receiver's packet buffer
+  overflowed, hundreds of keyframe requests followed and the estimate crashed); a flat 20 Mbps cap
+  held a sharp 60 fps screen with parity back on a LAN. The uplink may hand a carrier up to
+  `CARRIER_BUFFER_MS` (120 ms) of its send rate at once, not just `LINK_BUFFER_HIGH` (64 KiB): a
+  carrier frame takes one stripe of a media frame at most, so with only one media frame waiting it
+  moved ~15 KiB per 10 ms frame (~20 Mbps) however high the estimate. The rate is a token bucket
   (`CarrierBudget`): credit accrues at that rate, up to 40 ms of it or one waiting message, and a
   frame takes only what its credit covers, the head message first and never past it. For the
   uplink the carrier is a link like any other: its `bufferedAmount` is what was handed over and
@@ -569,7 +575,7 @@ Rate control, in both profiles:
     average: on a long, lossy path each connection alternates bursts with retransmission
     timeouts, and the most it delivered between them was 1.3–2 times what it carried.
   - *Connection capacity*: the browser's estimate for the connection's carrier (getStats
-    `availableOutgoingBitrate` on its selected candidate pair), capped at `CARRIER_MAX_KBPS`,
+    `availableOutgoingBitrate` on its selected candidate pair), capped for its round trip,
     polled every 2 s. It is a *limit*: delivered-rate windows don't set or cut it (no fast drop of
     its own: the estimate already falls as fast as the browser sees loss or delay), though they
     still count for the uplink. (Without an estimate, a connection falls back to a max filter over
@@ -655,7 +661,8 @@ queueing delay, and frames a viewer received incomplete, late, undecodable or sk
 | `keyframeIntervalMs` | `tuning.ts` | 10000 (quality), 2000 (latency) | Shorter means faster joins and smaller GOP caches, but more bits spent on keyframes |
 | `maxAgeByLayer`, `keyMaxAgeMs`, `replayMaxAgeMs`, `playout*` | `tuning.ts` | see the table above | Uplink layer deadlines and the jitter buffer: latency vs complete, smooth frames |
 | `CAPACITY_WINDOW_MS`, `FAST_DROP_QUEUE_MS`, `FAST_DROP_WINDOWS`, `BACKLOGGED_SHARE`, `SUSTAINED_WINDOWS`, `FROZEN_LAG_MS` | `session/capacity.ts` | 40 s, half the base layer's queue limit (1.25 s / 450 ms), 3, 90%, 5, 400 ms | Capacity memory, when a backlog sets it at once (and for how many windows in a row), what counts as backlogged, how much backlog makes the average a cap, and when a window is the page's fault |
-| `CARRIER_MAX_KBPS`, `CARRIER_START_KBPS` | `mesh/carrierLink.ts` | 20 Mbps, 2.5 Mbps | The most one connection sends, and the estimate it starts from |
+| `CARRIER_MAX_KBPS`, `CARRIER_INFLIGHT_KBIT`, `CARRIER_UNKNOWN_RTT_KBPS`, `CARRIER_MIN_CAP_KBPS`, `CARRIER_START_KBPS` | `mesh/carrierLink.ts` | 50 Mbps, 6000 kbit, 20 Mbps, 8 Mbps, 2.5 Mbps | The most one connection sends on a short path, the rate × round trip that caps a long one, the cap before the round trip is known and its floor, and the estimate it starts from |
+| `CARRIER_BUFFER_MS` | `mesh/carrierLink.ts` | 120 ms | How much of its send rate the uplink may hand a carrier at once (at least `LINK_BUFFER_HIGH`) |
 | `CARRIER_FPS`, `CARRIER_IDLE_FPS`, `CARRIER_IDLE_MS` | `mesh/carrierLink.ts` | 100, 5, 2 s | Carrier frames per second while sending, and the keepalive rate after this long idle |
 | `CARRIER_BURST_MS` | `net/carrier.ts` | 40 ms | The send budget's burst |
 | `TARGET_SHARE`, `DOWN_GAP_MS`, `UP_GAP_MS`, `UP_STEP`, `DEADBAND` | `session/congestion.ts` | 0.85, 4 s, 10 s, 1.25, 5% | Share of the measured budget used, and how fast the bitrate follows it |

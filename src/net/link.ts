@@ -8,10 +8,15 @@ export type LinkState = 'connecting' | 'open' | 'closed' | 'failed'
  * frame. Small on purpose: time spent there is invisible to the uplink's per-layer deadlines (and
  * its priorities), so the backlog should build in the uplink queue instead, where late fragments
  * are dropped and live ones go first. The carrier packs at the browser's estimate (64 KiB is ~26 ms
- * at 20 Mbps, ~0.5 s at 1 Mbps), and the low mark refills it on an event.
+ * at 20 Mbps, ~0.5 s at 1 Mbps), and the low mark refills it on an event. A fast carrier raises its
+ * own high mark (MediaLink.bufferHigh, mesh/carrierLink.ts): it needs several media frames at once.
  */
 export const LINK_BUFFER_HIGH = 64 * 1024
 export const LINK_BUFFER_LOW = 16 * 1024
+/** How much live media the uplink hands `link` at most (bytes). */
+export function bufferHighOf(link: MediaLink): number {
+  return link.bufferHigh ?? LINK_BUFFER_HIGH
+}
 /**
  * Low-priority data (GOP-cache replays, headroom probes) is only handed to a link while its send
  * buffer holds less than this (bytes): it shares the carrier with live media.
@@ -22,6 +27,8 @@ export interface MediaLink {
   readonly isOpen: boolean
   readonly state: LinkState
   readonly bufferedAmount: number
+  /** The link's own high watermark (bytes), if it isn't LINK_BUFFER_HIGH (see bufferHighOf). */
+  readonly bufferHigh?: number
   /** Sends one message. Returns false if the link is not open. */
   send(data: Uint8Array): boolean
 }

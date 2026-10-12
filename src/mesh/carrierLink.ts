@@ -15,24 +15,42 @@
 // decoder each received frame's original bytes back.
 //
 // For the uplink (net/uplink.ts) it is a MediaLink like a data channel was: bufferedAmount is what
-// was handed over and not yet packed, and onBufferLow fires as it falls to LINK_BUFFER_LOW. The
+// was handed over and not yet packed (up to bufferHigh), and onBufferLow fires as it falls. The
 // probe link is padding: probe bytes go into carrier frames after the media, within the same
 // budget, so a headroom probe (session/headroom.ts) makes the estimate grow on a stream that sends
 // less than it (GCC only grows what is used). The receiver drops the padding.
 //
-// The browser's estimate (getStats availableOutgoingBitrate), capped at CARRIER_MAX_KBPS, is the
+// The browser's estimate (getStats availableOutgoingBitrate), capped for the round trip, is the
 // send rate, and, through session/connMetrics.ts, the connection's capacity.
-import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../net/link'
+import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type LinkState, type ProbeLink } from '../net/link'
 import { MAX_CARRIER_MESSAGE } from '../net/carrier'
 import { parseLinkStats, type StatsLike } from '../net/linkStats'
 import { every } from '../net/ticker'
 
+/** Most a connection sends (kbps), whatever the browser estimates: on a short path. */
+export const CARRIER_MAX_KBPS = 50_000
 /**
- * Most a connection sends (kbps), whatever the browser estimates. One carrier collapsed once its
- * estimate reached a bottleneck at ~4300 packets/s (300 ms round trip): the receiver's packet
- * buffer overflowed, hundreds of keyframe requests followed and the estimate crashed.
+ * On a long path, at most this much in flight (kbit: rate × round trip). One carrier collapsed once
+ * its estimate reached a bottleneck at ~4300 packets/s (~40 Mbps, 300 ms round trip): the
+ * receiver's packet buffer overflowed, hundreds of keyframe requests followed and the estimate
+ * crashed. This allows 20 Mbps there.
  */
-export const CARRIER_MAX_KBPS = 20_000
+export const CARRIER_INFLIGHT_KBIT = 6000
+/** The cap until the round trip is known (kbps)... */
+export const CARRIER_UNKNOWN_RTT_KBPS = 20_000
+/** ...and the least it gets on the longest paths. */
+export const CARRIER_MIN_CAP_KBPS = 8000
+
+/**
+ * The most a connection sends (kbps) for its round trip (ms, the lowest seen): a short path's
+ * capped at CARRIER_MAX_KBPS (a localhost or LAN stream isn't held to a long path's limit, which
+ * a sharp screen at 60 fps with parity outgrows), a long one by CARRIER_INFLIGHT_KBIT.
+ */
+export function carrierCapKbps(rttMs: number | null): number {
+  if (rttMs === null || !(rttMs >= 0)) return CARRIER_UNKNOWN_RTT_KBPS
+  const cap = (CARRIER_INFLIGHT_KBIT * 1000) / Math.max(rttMs, 1)
+  return Math.round(Math.min(CARRIER_MAX_KBPS, Math.max(CARRIER_MIN_CAP_KBPS, cap)))
+}
 /** Carrier frames per second while there is something to send: each carries what the budget allows. */
 export const CARRIER_FPS = 100
 /** ...and once nothing has been for CARRIER_IDLE_MS: a keepalive (a lobby has many idle pairs). */
@@ -44,6 +62,14 @@ export const CARRIER_IDLE_MS = 2000
  * the first estimate is read.
  */
 export const CARRIER_START_KBPS = 2500
+/**
+ * How much sending time the uplink may hand the carrier at once (ms of its send rate; at least
+ * LINK_BUFFER_HIGH). A carrier frame takes one stripe of a media frame at most (net/carrier.ts), so
+ * with only one media frame waiting it carries one stripe per frame interval, whatever the
+ * estimate: ~15 KiB per 10 ms caps it near 12-20 Mbps. Twice a 4+2 frame's six carrier frames
+ * keeps enough media frames waiting.
+ */
+export const CARRIER_BUFFER_MS = 120
 /** How often the estimate is read while the carrier is busy (ms). */
 const ESTIMATE_POLL_MS = 1000
 /** The carrier track's frame size (px): as small as the encoder takes. */
@@ -196,6 +222,10 @@ export class CarrierLink {
   private closed = false
   private poll: (() => void) | null = null
   private lastStatsAt = -Infinity
+  /** The lowest round trip seen (ms), which sets the cap. */
+  private rttMs: number | null = null
+  /** The send rate the worker has (kbps). */
+  private rateKbps = CARRIER_START_KBPS
 
   constructor(
     private readonly pc: RTCPeerConnection,
@@ -283,7 +313,8 @@ export class CarrierLink {
       console.warn('carrier worker failed', ev.message)
       this.onFail()
     }
-    w.postMessage({ op: 'rate', kbps: Math.min(CARRIER_START_KBPS, CARRIER_MAX_KBPS) })
+    this.rateKbps = Math.min(CARRIER_START_KBPS, this.maxKbps)
+    w.postMessage({ op: 'rate', kbps: this.rateKbps })
     this.worker = w
     return w
   }
@@ -323,6 +354,16 @@ export class CarrierLink {
   /** Bytes handed over and not yet packed into a carrier frame. */
   get bufferedAmount(): number {
     return this.handed - this.packed
+  }
+
+  /** How much the uplink may hand over at once (see CARRIER_BUFFER_MS). */
+  get bufferHigh(): number {
+    return Math.max(LINK_BUFFER_HIGH, Math.round((this.rateKbps / 8) * CARRIER_BUFFER_MS))
+  }
+
+  /** onBufferLow fires as the buffer falls to this. */
+  private get bufferLow(): number {
+    return Math.max(LINK_BUFFER_LOW, Math.round(this.bufferHigh / 4))
   }
 
   send(data: Uint8Array): boolean {
@@ -369,7 +410,8 @@ export class CarrierLink {
         if (media) {
           const before = this.bufferedAmount
           this.packed += media
-          if (before > LINK_BUFFER_LOW && this.bufferedAmount <= LINK_BUFFER_LOW) this.onBufferLow()
+          const low = this.bufferLow
+          if (before > low && this.bufferedAmount <= low) this.onBufferLow()
         }
         if (pad) {
           const before = this.probeLink.bufferedAmount
@@ -410,11 +452,22 @@ export class CarrierLink {
     }
   }
 
+  /** The most this connection sends now (kbps): carrierCapKbps for its round trip. */
+  get maxKbps(): number {
+    return carrierCapKbps(this.rttMs)
+  }
+
   /** A getStats() report of the connection: the browser's estimate, capped, is the send rate. */
   noteStats(report: StatsLike): void {
     this.lastStatsAt = performance.now()
-    const bps = parseLinkStats(report)?.availableBps
-    if (bps != null && bps > 0 && this.worker && !this.closed) this.worker.postMessage({ op: 'rate', kbps: Math.min(bps / 1000, CARRIER_MAX_KBPS) })
+    const r = parseLinkStats(report)
+    const rtt = r?.currentRttMs
+    if (rtt != null && rtt >= 0) this.rttMs = this.rttMs === null ? rtt : Math.min(this.rttMs, rtt)
+    const bps = r?.availableBps
+    if (bps != null && bps > 0 && this.worker && !this.closed) {
+      this.rateKbps = Math.min(bps / 1000, this.maxKbps)
+      this.worker.postMessage({ op: 'rate', kbps: this.rateKbps })
+    }
   }
 
   /** Reads the estimate while the carrier is busy, unless a stats poll just did (connMetrics). */

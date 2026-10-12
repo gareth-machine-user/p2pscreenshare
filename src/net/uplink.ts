@@ -1,4 +1,4 @@
-import { BACKGROUND_BUFFER_MAX, LINK_BUFFER_HIGH, LINK_BUFFER_LOW, type MediaLink } from './link'
+import { BACKGROUND_BUFFER_MAX, bufferHighOf, LINK_BUFFER_LOW, type MediaLink } from './link'
 import { tuning } from '../tuning'
 import { after } from './ticker'
 
@@ -356,7 +356,7 @@ export class Uplink {
         q.length = kept
         // Live media only: a headroom probe keeps its channel's buffer full on purpose, and replays
         // are meant to wait (live fragments queue ahead of them, so q[0] is live if any is).
-        if (kept && !bg && link.isOpen && link.bufferedAmount > LINK_BUFFER_HIGH) {
+        if (kept && !bg && link.isOpen && link.bufferedAmount > bufferHighOf(link)) {
           if (!q[0].replay) this.stats.bufferStalls++
           this.stalledMs(link, now)
         }
@@ -370,7 +370,7 @@ export class Uplink {
         progress = false
         // Background links only get a turn when no media link has anything it could send.
         const mediaWaiting = [...this.links].some(
-          ([l, e]) => e.queue.length > 0 && !e.background && l.isOpen && l.bufferedAmount <= LINK_BUFFER_HIGH,
+          ([l, e]) => e.queue.length > 0 && !e.background && l.isOpen && l.bufferedAmount <= bufferHighOf(l),
         )
         const links = [...this.links].filter(([, e]) => !mediaWaiting || !e.background)
         const n = links.length
@@ -385,7 +385,7 @@ export class Uplink {
             continue
           }
           // Background links (probes) are bounded below, by BACKGROUND_BUFFER_MAX.
-          if (!q.length || (!e.background && link.bufferedAmount > LINK_BUFFER_HIGH)) continue
+          if (!q.length || (!e.background && link.bufferedAmount > bufferHighOf(link))) continue
           const it = q[0]
           // Catch-up replays and probes only go out while the link's send buffer is nearly empty:
           // the carrier packs in order, so a deep backlog of either would hold up live media

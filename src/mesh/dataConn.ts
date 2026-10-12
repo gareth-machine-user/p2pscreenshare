@@ -4,7 +4,7 @@
 import type { LinkState, MediaLink, ProbeLink } from '../net/link'
 import { parseLinkStats, type StatsLike } from '../net/linkStats'
 import { after } from '../net/ticker'
-import { CARRIER_MAX_KBPS, carrierConfig, CarrierLink } from './carrierLink'
+import { carrierConfig, CarrierLink } from './carrierLink'
 
 const ICE_GATHER_TIMEOUT_MS = 2500
 export const CONNECT_TIMEOUT_MS = 15_000
@@ -20,7 +20,7 @@ export interface PairConn extends MediaLink {
   /** Padding in the carrier, as a probe link (see session/headroom.ts). */
   readonly probeLink: ProbeLink
   /**
-   * The most it sends (kbps), if it limits itself (the carrier: CARRIER_MAX_KBPS): its capacity is
+   * The most it sends (kbps), if it limits itself (the carrier: carrierCapKbps for the round trip): its capacity is
    * the browser's estimate, at most this.
    */
   readonly maxKbps?: number
@@ -66,7 +66,6 @@ export abstract class DataConn implements PairConn {
   readonly pc: RTCPeerConnection
   readonly carrier: CarrierLink
   readonly probeLink: ProbeLink
-  readonly maxKbps = CARRIER_MAX_KBPS
   state: LinkState = 'connecting'
   /** Whether this connection was ever open (a failure before that means the pair can't connect). */
   wasOpen = false
@@ -153,6 +152,14 @@ export abstract class DataConn implements PairConn {
   async usesRelay(): Promise<boolean | null> {
     const report = await this.stats()
     return (report && parseLinkStats(report)?.relayed) ?? null
+  }
+
+  get maxKbps(): number {
+    return this.carrier.maxKbps
+  }
+
+  get bufferHigh(): number {
+    return this.carrier.bufferHigh
   }
 
   /** The getStats() report; its bandwidth estimate also sets the carrier's send rate. */

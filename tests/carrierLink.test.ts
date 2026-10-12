@@ -1,7 +1,7 @@
-// The carrier's pure parts (mesh/carrierLink.ts): SDP seeding and feature detection. The carrier
+// The carrier's pure parts (mesh/carrierLink.ts): SDP seeding, the send cap and feature detection. The carrier
 // itself needs a browser: e2e/ covers it.
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { carrierUnsupported, seedStartBitrate } from '../src/mesh/carrierLink'
+import { CARRIER_MAX_KBPS, CARRIER_MIN_CAP_KBPS, CARRIER_UNKNOWN_RTT_KBPS, carrierCapKbps, carrierUnsupported, seedStartBitrate } from '../src/mesh/carrierLink'
 
 describe('seedStartBitrate', () => {
   const sdp = ['v=0', 'm=video 9 UDP/TLS/RTP/SAVPF 96 97 98', 'a=rtpmap:96 VP8/90000', 'a=rtpmap:97 rtx/90000', 'a=fmtp:97 apt=96', 'a=rtpmap:98 VP8/90000', 'a=fmtp:98 foo=1', ''].join('\r\n')
@@ -15,6 +15,21 @@ describe('seedStartBitrate', () => {
     // Idempotent, and a no-op without VP8.
     expect(seedStartBitrate(seedStartBitrate(sdp, 2500), 2500)).toBe(seedStartBitrate(sdp, 2500))
     expect(seedStartBitrate('v=0\r\na=rtpmap:111 opus/48000/2', 2500)).toBe('v=0\r\na=rtpmap:111 opus/48000/2')
+  })
+})
+
+describe('carrierCapKbps', () => {
+  it('lets a short path carry the most, a long one what keeps its packets in flight bounded', () => {
+    expect(carrierCapKbps(1)).toBe(CARRIER_MAX_KBPS)
+    expect(carrierCapKbps(0)).toBe(CARRIER_MAX_KBPS)
+    expect(carrierCapKbps(300)).toBe(20_000)
+    expect(carrierCapKbps(150)).toBe(40_000)
+    expect(carrierCapKbps(5000)).toBe(CARRIER_MIN_CAP_KBPS)
+  })
+
+  it('holds to the long-path cap until the round trip is known', () => {
+    expect(carrierCapKbps(null)).toBe(CARRIER_UNKNOWN_RTT_KBPS)
+    expect(carrierCapKbps(NaN)).toBe(CARRIER_UNKNOWN_RTT_KBPS)
   })
 })
 

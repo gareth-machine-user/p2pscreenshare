@@ -97,13 +97,17 @@ async function hostSample(vid: string, lag: typeof takeLag) {
   const p = window.__p2p!
   const full = p.publishing && p.publishing.full
   const u = p.uplink.stats
-  type Pair = { pSent: number; discarded: number | null; bytesSent: number; est: number | null }
+  type Pair = { pSent: number; discarded: number | null; bytesSent: number; est: number | null; frames?: number }
   const pairStats = async (pc: RTCPeerConnection | undefined): Promise<Pair | null> => {
     if (!pc) return null
     let out: Pair | null = null
     ;(await pc.getStats()).forEach((r) => {
       if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded')
         out = { pSent: r.packetsSent, discarded: r.packetsDiscardedOnSend ?? null, bytesSent: r.bytesSent, est: r.availableOutgoingBitrate ?? null }
+    })
+    // The carrier's frames sent (its outbound video stream).
+    ;(await pc.getStats()).forEach((r) => {
+      if (out && r.type === 'outbound-rtp' && r.kind === 'video') out.frames = r.framesSent
     })
     return out
   }
@@ -177,7 +181,7 @@ export interface DiagRow {
 /** The per-second table (deltas of cumulative counters) and a summary line. */
 export function formatTimeline(rows: DiagRow[]): string {
   const lines: string[] = []
-  lines.push('t     kbps  limit    enc   upKbps qMs  q1s  P stall drop(t0,t1,t2) capUp  capPeer   link(del,B,S) est    rtt    peakBuf(KB) discards tx(kB/s) rx(kB/s) fps lat  lagH lagV vis')
+  lines.push('t     kbps  limit    enc   upKbps qMs  q1s  P stall drop(t0,t1,t2) capUp  capPeer   link(del,B,S) est    rtt    peakBuf(KB) discards tx(kB/s) rx(kB/s) fps lat  lagH lagV vis  cfps')
   for (let i = 1; i < rows.length; i++) {
     const a = rows[i - 1]
     const b = rows[i]
@@ -221,7 +225,8 @@ export function formatTimeline(rows: DiagRow[]): string {
         String(b.v.latencyMs == null ? '-' : Math.round(b.v.latencyMs)).padEnd(4),
         `${b.h.lag.maxMs}`.padEnd(4),
         `${b.v.lag.maxMs}`.padEnd(4),
-        `${b.h.lag.visible[0]}${b.v.lag.visible[0]}`,
+        `${b.h.lag.visible[0]}${b.v.lag.visible[0]}`.padEnd(4),
+        String(hc?.pair?.frames != null && pc?.pair?.frames != null ? Math.round((hc.pair.frames - pc.pair.frames) / dt) : '-'),
       ].join(' '),
     )
   }
