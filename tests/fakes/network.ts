@@ -382,6 +382,7 @@ export class FakeConn extends FakeDataConn<FakeConn> implements PeerConn {
   lastHeardAt = performance.now()
   rttMs: number | null = null
   onCtl: (msg: Ctl) => void = () => {}
+  onIncompatible?: () => void
   /** Ctl messages sent, for assertions. */
   readonly sent: Ctl[] = []
   private pingSeq = 0
