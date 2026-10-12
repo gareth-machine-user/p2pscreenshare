@@ -93,8 +93,8 @@ test('one slow viewer does not throttle the stream; a capped uplink does, down t
       }
     }, ids)
 
-  // The uplink is measured (headroom probe, once the connections have settled: capacity.ts
-  // SETTLE_MS), at about the 20 Mbps cap.
+  // The uplink's capacity is known: the carriers' estimates, once polled a few seconds (capacity.ts
+  // ESTIMATE_SETTLE_MS).
   await waitFor(state, (st) => (st.uplinkKbps ?? 0) > 10_000, 60_000, 'uplink measured')
   await slowLink(ids[0])
   await new Promise((r) => setTimeout(r, 15_000))
