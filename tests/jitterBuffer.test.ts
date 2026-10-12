@@ -279,7 +279,7 @@ describe('PlayoutClock', () => {
     expect(c.bufferMs).toBe(3000)
   })
 
-  it('the warm-up lasts until the delay has settled after a late join burst, up to warmupMaxMs', () => {
+  it('the warm-up lasts through a join burst that outlasts warmupMs, up to warmupMaxMs', () => {
     const opts = { quantile: 0.99, safetyMs: 0, minDelayMs: 0, windowMs: 8000, slewMsPerSec: 250, slewDownMsPerSec: 8, holdMs: 60_000, warmupMs: 30_000, warmupMaxMs: 90_000 }
     const c = new PlayoutClock(opts)
     // 100 ms transit, with frames 3 s late from 25 to 29 s (a long path's join, not over at 30 s).
@@ -297,6 +297,15 @@ describe('PlayoutClock', () => {
     expect(d.bufferMs).toBe(3000)
     for (let t = 95_050; t <= 105_000; t += 50) d.addSample(t, t + 100)
     expect(d.bufferMs).toBeGreaterThan(2900)
+
+    // Hiccups (a retransmission's round trip) don't extend it: past 30 s they are held as usual.
+    const e = new PlayoutClock(opts)
+    let min = Infinity
+    for (let t = 0; t <= 70_000; t += 50) {
+      e.addSample(t, t + 100 + (t % 9000 < 200 ? 400 : 0))
+      if (t > 50_000) min = Math.min(min, e.bufferMs)
+    }
+    expect(min).toBe(400)
   })
 
   it('a repeated spike within the hold never lets the buffer shrink', () => {

@@ -29,11 +29,12 @@ export interface PlayoutClockOptions {
    * slew rate. A join's first seconds are its worst (the presenter's uplink bursts with the new
    * child's catch-up, SCTP retransmits what that burst lost): held for holdMs and then glided down
    * at the quality profile's 8 ms/s, a 3 s spike there took over 6 minutes to go.
-   * The warm-up goes on past warmupMs until it has settled, up to warmupMaxMs: the buffer needed
-   * back near the least it has needed since the start (within twice WARMUP_SETTLED_MS: whatever
-   * spike there was has left the window), and the delay within WARMUP_SETTLED_MS of it. A join whose
-   * turmoil lasted past warmupMs (a long lossy path's estimate ramping up) would otherwise keep
-   * seconds of buffer for minutes.
+   * The warm-up goes on past warmupMs, up to warmupMaxMs, while the join's turmoil does: while the
+   * buffer needed is over WARMUP_TURMOIL_MS above the least it has needed since the start, or the
+   * delay is still falling to it (more than WARMUP_SETTLED_MS above). A long lossy path's join
+   * (its estimate ramping up) can take longer than warmupMs, and its seconds of buffer were then
+   * kept for minutes. Hiccups (a retransmission's round trip or two) don't extend it: a warm-up
+   * lets the delay fall fast, so through a stretch of them it stalls.
    */
   warmupMs: number
   /** Defaults to 3 x warmupMs. */
@@ -52,6 +53,8 @@ export const BUFFERINGS: readonly Buffering[] = ['low', 'auto', 'extra']
 export const EXTRA_BUFFER_MS = 1500
 /** The warm-up ends once the delay is this close to its target (ms), see warmupMs. */
 export const WARMUP_SETTLED_MS = 25
+/** Past warmupMs, the warm-up goes on while the buffer needed is this much above its least (ms). */
+export const WARMUP_TURMOIL_MS = 1000
 
 const QUALITY = tuning.priority === 'quality'
 const DEFAULT_CLOCK: PlayoutClockOptions = {
@@ -191,7 +194,7 @@ export class PlayoutClock {
     if (age < this.opts.warmupMs) return true
     if (age >= Math.max(this.opts.warmupMs, this.opts.warmupMaxMs ?? 3 * this.opts.warmupMs)) return false
     if (this.delay === null) return true
-    return extra > this.lowExtra + 2 * WARMUP_SETTLED_MS || Math.abs(this.delay - target) > WARMUP_SETTLED_MS
+    return extra > this.lowExtra + WARMUP_TURMOIL_MS || this.delay - target > WARMUP_SETTLED_MS
   }
 
   /** Local time at which a frame captured at `captureTime` should be shown. */
