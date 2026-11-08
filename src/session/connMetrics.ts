@@ -161,6 +161,13 @@ export class ConnMetrics {
   sampleLinks(now: number, lagMs: number, quiet = false): void {
     const windows: ConnWindow[] = []
     for (const [conn, rec] of this.openConns()) {
+      const latest = conn.latestStats?.()
+      const latestBps = latest && parseLinkStats(latest)?.availableBps
+      if (latestBps != null && latestBps > 0 && conn.isOpen) {
+        const kbps = latestBps / 1000
+        const known = conn.maxKbps === undefined ? kbps : Math.min(kbps, conn.maxKbps)
+        this.capacity.setKnown(conn, rec.peer, known, now)
+      }
       this.uplink.setPathRtt(conn, rec.tracker.current(now)?.baselineMs ?? null)
       const snap = this.uplink.snapshot(conn, conn.probeLink, now)
       const last = rec.last
@@ -182,18 +189,29 @@ export class ConnMetrics {
     // The up= debug shaper, which no estimate sees (it can change at run time: e2e).
     this.capacity.capKbps = this.uplink.capKbps
     this.capacity.update(now, windows, { frozen: lagMs >= FROZEN_LAG_MS })
-    this.backloggedNow = windows.some((w) => w.active && w.backlogged)
+    const active = windows.filter((w) => w.active)
+    const backlogged = active.filter((w) => w.backlogged)
+    this.backloggedNow = active.length > 0 && backlogged.length * 2 > active.length
   }
 
+  private probeCursor = 0
+
   /**
-   * Pushes background bytes onto every open connection for 1.5 s (session/headroom.ts) and takes
-   * what each delivered as a backlogged window. False if no probe ran. A probe link is padding in
-   * the connection's carrier frames, within the browser's estimate: the padding is what lets that
-   * estimate grow while the stream sends less than it. Only a connection without an estimate
-   * measures anything by it (CapacityModel).
+   * Pushes background bytes onto open connections for 1.5 s (session/headroom.ts) and takes what
+   * each delivered as a backlogged window. False if no probe ran. While live media is flowing on
+   * some connections, only those active media connections are probed: probing idle mesh connections
+   * at the same time would flood the shared uplink with (N - 1) × BWE and divide each active child's
+   * GCC estimate by N - 1. When idle and connections already have browser estimates, at most one
+   * connection is probed per round-robin turn.
    */
   async probe(headroom: HeadroomProbe): Promise<boolean> {
-    const conns = this.openConns().filter(([conn]) => conn.probeLink.isOpen)
+    const all = this.openConns().filter(([conn]) => conn.probeLink.isOpen)
+    const activeMedia = all.filter(([, rec]) => (rec.rate?.mediaKbps ?? 0) > 0)
+    let conns = activeMedia.length > 0 ? activeMedia : all
+    if (activeMedia.length === 0 && conns.length > 1 && conns.every(([conn]) => this.capacity.conn(conn)?.estimated)) {
+      const idx = this.probeCursor++ % conns.length
+      conns = [conns[idx]]
+    }
     const snap = () => new Map(conns.map(([conn]) => [conn, this.uplink.snapshot(conn, conn.probeLink)]))
     const r = await headroom.run(
       conns.map(([conn]) => conn.probeLink),
@@ -209,6 +227,7 @@ export class ConnMetrics {
       windows.push({ ...linkWindow(conn, rec.peer, a, b), active: true, backlogged: true, transient: this.settling(conn, rec, now) })
     }
     this.capacity.update(now, windows, { probe: true })
+    await this.pollLinkStats()
     return true
   }
 

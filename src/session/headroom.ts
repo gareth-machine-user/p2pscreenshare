@@ -29,17 +29,15 @@ export const PROBE_MAX_GAP_MS = 250
 /** Headroom discovery runs this often while no media connection is backlogged... */
 export const HEADROOM_EVERY_MS = 30_000
 /** ...or this often while the measured capacity holds the bitrate below the chosen quality... */
-export const HEADROOM_LIMITED_MS = 5000
+export const HEADROOM_LIMITED_MS = 2500
 /** ...and the encoder uses at least this share of that bitrate (the limit binds)... */
 export const LIMIT_BINDS_SHARE = 0.7
 /** ...and first this long after the first link opens: a presenter's bitrate needs it... */
 export const HEADROOM_FIRST_MS = 1000
 /**
- * ...while anyone else's capacity only sizes its relay offers, so it waits out the join: a joiner
- * probing at once saturated its own uplink, and the acks of the stream it was being sent with it,
- * just as the presenter's uplink burst with its catch-up.
+ * ...while anyone else's capacity sizes its relay offers after the join's initial catch-up settles.
  */
-export const HEADROOM_FIRST_VIEWER_MS = 10_000
+export const HEADROOM_FIRST_VIEWER_MS = 4000
 
 /**
  * Whether headroom discovery is due. The fast cadence is for a presenter whose bitrate a capacity

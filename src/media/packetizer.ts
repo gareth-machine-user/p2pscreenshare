@@ -1,5 +1,5 @@
-import { encodePieces } from '../proto/fec'
-import { encodeFragment, MAX_FRAGMENT_PAYLOAD, type FragmentHeader } from '../proto/framing'
+import { encodePieces, pieceLength } from '../proto/fec'
+import { encodeFragment, HEADER_SIZE, MAX_FRAGMENT_PAYLOAD, type FragmentHeader } from '../proto/framing'
 
 export interface EncodedFrame {
   epoch: number
@@ -11,6 +11,14 @@ export interface EncodedFrame {
   audio: boolean
   captureTime: number
   data: Uint8Array
+}
+
+/** Wire bytes produced on each stripe for a frame of `frameLen` bytes split `k` ways. */
+export function stripeWireBytes(frameLen: number, k: number): number {
+  const p = pieceLength(frameLen, k)
+  const frags = Math.max(1, Math.ceil(p / MAX_FRAGMENT_PAYLOAD))
+  const fragOverhead = 16 * 1024 - MAX_FRAGMENT_PAYLOAD
+  return p + frags * (fragOverhead || HEADER_SIZE + 64)
 }
 
 /**

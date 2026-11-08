@@ -128,6 +128,17 @@ describe('bitrate pacing', () => {
     expect(c.step(DOWN_GAP_MS, low, t(low / 2, 'viewers', true))).toBe(low / 2)
   })
 
+  it('rides out a single-window moderate (<50%) dip in the browser’s estimate, cutting if it persists', () => {
+    const c = new BitrateController()
+    // A 1-window dip from 10 Mbps to 7 Mbps (absorbed by T2/T1 layer dropping) that recovers on the next window.
+    expect(c.step(0, 10_000, t(7000, 'viewers', true))).toBeNull()
+    expect(c.step(2000, 10_000, t(10_000, 'chosen', true))).toBeNull()
+    // A second single-window dip later is also absorbed, not treated as a continuation of the first.
+    expect(c.step(20_000, 10_000, t(7000, 'viewers', true))).toBeNull()
+    // Sustained into the next window: cuts to the target.
+    expect(c.step(22_000, 10_000, t(7000, 'viewers', true))).toBe(7000)
+  })
+
   it("the browser's estimate rising: straight up to its target, not 25% per 10 s, and soon after a cut", () => {
     const c = new BitrateController()
     expect(c.step(0, 8000, t(4000, 'viewers', true))).toBe(4000)
@@ -135,9 +146,9 @@ describe('bitrate pacing', () => {
     expect(c.step(2000, 4000, t(12_000, 'viewers', true))).toBeNull()
     expect(c.step(DOWN_GAP_MS, 4000, t(12_000, 'viewers', true))).toBe(12_000)
     expect(DOWN_GAP_MS).toBeLessThan(UP_GAP_MS)
-    // Then again DOWN_GAP_MS later, all the way to the chosen quality; under 5% is still noise.
-    expect(c.step(DOWN_GAP_MS + 2000, 12_000, t(16_000, 'chosen', true))).toBeNull()
-    expect(c.step(2 * DOWN_GAP_MS, 12_000, t(16_000, 'chosen', true))).toBe(16_000)
+    // Then again 2 s later (not 10 s), all the way to the chosen quality; under 5% is still noise.
+    expect(c.step(DOWN_GAP_MS + 1000, 12_000, t(16_000, 'chosen', true))).toBeNull()
+    expect(c.step(DOWN_GAP_MS + 2000, 12_000, t(16_000, 'chosen', true))).toBe(16_000)
     expect(c.step(4 * DOWN_GAP_MS, 15_000, t(15_500, 'viewers', true))).toBeNull()
   })
 

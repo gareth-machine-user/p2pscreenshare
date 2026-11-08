@@ -56,6 +56,7 @@ const DEDUPE_WINDOW = 256
 const packer = new CarrierPacker()
 const budget = new CarrierBudget(0)
 let padPending = 0
+let targetKbps = 0
 let packedMedia = 0
 let packedPad = 0
 let flushQueued = false
@@ -103,14 +104,16 @@ function flushPacked(): void {
 }
 
 function send(frame: EncodedFrame, controller: TransformStreamDefaultController<EncodedFrame>): void {
-  const r = nextCarrierFrame(packer, budget, performance.now(), new Uint8Array(frame.data), padPending)
-  padPending -= r.padded
+  const now = performance.now()
+  const r = nextCarrierFrame(packer, budget, now, new Uint8Array(frame.data), padPending, !idle ? targetKbps : 0)
+  const probePad = Math.min(r.padded, padPending)
+  padPending -= probePad
   frame.data = r.frame.buffer as ArrayBuffer
   controller.enqueue(frame)
-  if (packer.length || padPending > 0) busyAt = performance.now()
-  if (r.taken || r.padded) {
+  if (packer.length || padPending > 0 || r.taken > 0) busyAt = now
+  if (r.taken || probePad) {
     packedMedia += r.taken
-    packedPad += r.padded
+    packedPad += probePad
     // One report per burst of frames, not one per frame.
     if (!flushQueued) {
       flushQueued = true
@@ -163,6 +166,9 @@ scope.onmessage = (ev: MessageEvent) => {
     case 'rate':
       budget.rateKbps = d.kbps as number
       if (d.rttMs !== undefined) packer.stripeLimit = carrierStripeLimit(d.rttMs as number | null)
+      return
+    case 'target':
+      targetKbps = d.kbps as number
       return
     case 'start':
       // A worker's timers aren't throttled in a hidden tab, the page's are.

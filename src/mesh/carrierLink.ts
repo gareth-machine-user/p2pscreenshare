@@ -70,7 +70,9 @@ export const CARRIER_START_KBPS = 2500
  * keeps enough media frames waiting.
  */
 export const CARRIER_BUFFER_MS = 120
-/** How often the estimate is read while the carrier is busy, and the worker's clock checked (ms). */
+/** How often the estimate is read while the carrier is busy (ms), so GCC's ramp isn't held between 1 s ticks. */
+const FAST_ESTIMATE_POLL_MS = 200
+/** How often the worker's clock is checked for a hang (ms). */
 const ESTIMATE_POLL_MS = 1000
 /** The worker has hung if its clock hasn't ticked for this long (ms; it ticks at least every 200). */
 export const CARRIER_HUNG_MS = 2000
@@ -353,8 +355,12 @@ export class CarrierLink {
   private poll: (() => void) | null = null
   private watch: TickWatch | null = null
   private lastStatsAt = -Infinity
+  /** Most recent getStats() report seen by noteStats(), so capacity windows never lag behind async polling. */
+  lastReport: StatsLike | null = null
   /** The lowest round trip seen (ms), which sets the cap. */
   private rttMs: number | null = null
+  /** Wire rate (kbps) the active stripes on this link want at full quality; auto-pads while budget < targetKbps. */
+  private targetKbps = 0
 
   constructor(
     private readonly pc: RTCPeerConnection,
@@ -456,6 +462,7 @@ export class CarrierLink {
     }
     this.buf.rateKbps = Math.min(CARRIER_START_KBPS, this.maxKbps)
     w.postMessage({ op: 'rate', kbps: this.buf.rateKbps })
+    if (this.targetKbps > 0) w.postMessage({ op: 'target', kbps: this.targetKbps })
     this.worker = w
     return w
   }
@@ -489,8 +496,9 @@ export class CarrierLink {
     w.postMessage({ op: 'start', fps: CARRIER_FPS, idleFps: CARRIER_IDLE_FPS, idleMs: CARRIER_IDLE_MS })
     void this.tuneSender()
     const watch = (this.watch = new TickWatch(performance.now()))
-    this.poll = every(ESTIMATE_POLL_MS, () => {
-      if (watch.hung(performance.now())) {
+    let ticks = 0
+    this.poll = every(FAST_ESTIMATE_POLL_MS, () => {
+      if (++ticks % 5 === 0 && watch.hung(performance.now())) {
         console.warn('carrier worker stopped ticking')
         this.fail()
         return
@@ -606,9 +614,22 @@ export class CarrierLink {
     return carrierCapKbps(this.rttMs)
   }
 
+  /**
+   * Sets the wire bitrate (kbps) this connection's active stripes want at full quality. While the
+   * browser's estimate is below `kbps`, the carrier worker automatically pads spare token-bucket
+   * credit (above CARRIER_AUTO_PAD_RESERVE_MS) so GCC grows continuously without probe bursts.
+   */
+  setTargetKbps(kbps: number): void {
+    const next = Math.max(0, Math.round(kbps))
+    if (next === this.targetKbps) return
+    this.targetKbps = next
+    if (this.worker && !this.closed) this.worker.postMessage({ op: 'target', kbps: next })
+  }
+
   /** A getStats() report of the connection: the browser's estimate, capped, is the send rate. */
   noteStats(report: StatsLike): void {
     this.lastStatsAt = performance.now()
+    this.lastReport = report
     const r = parseLinkStats(report)
     const rtt = r?.currentRttMs
     if (rtt != null && rtt >= 0) this.rttMs = this.rttMs === null ? rtt : Math.min(this.rttMs, rtt)
@@ -623,7 +644,7 @@ export class CarrierLink {
 
   /** Reads the estimate while the carrier is busy, unless a stats poll just did (connMetrics). */
   private async pollEstimate(): Promise<void> {
-    if (this.idle || this.closed || performance.now() - this.lastStatsAt < ESTIMATE_POLL_MS * 0.9) return
+    if (this.idle || this.closed || performance.now() - this.lastStatsAt < FAST_ESTIMATE_POLL_MS * 0.9) return
     try {
       this.noteStats((await this.pc.getStats()) as unknown as StatsLike)
     } catch {

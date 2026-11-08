@@ -392,7 +392,7 @@ export class CapacityModel {
     // What its windows measured before is forgotten: if the estimate goes away, it measures afresh.
     if (!this.known.has(id)) this.conns.delete(id)
     const since = this.known.get(id)?.since ?? now
-    this.known.set(id, { peer, kbps, since, settled: now - since >= ESTIMATE_SETTLE_MS })
+    this.known.set(id, { peer, kbps, since, settled: now - since >= ESTIMATE_SETTLE_MS || this.probedAt >= since })
   }
 
   /**

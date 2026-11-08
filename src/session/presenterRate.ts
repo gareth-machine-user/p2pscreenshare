@@ -101,13 +101,15 @@ export class PresenterRate {
     const jump = this.gate.step(now, { ceilingKbps: s.ceilingKbps, currentKbps: full.kbps, targetKbps: t.kbps, probedAt: this.capacity.probedAt, children: edges.children > 0 })
     const next = jump ? this.ctl.jump(now, t) : this.ctl.step(now, full.kbps, t, { fastDropAt: this.capacity.fastDropAt })
     if (next === null) return
-    if (next < full.kbps) this.gate.cut(now)
+    if (next < full.kbps && t.limit !== 'unmeasured') this.gate.cut(now)
     s.adaptBitrate(next)
   }
 
   /**
    * This peer's direct children in its own full channel: (child, stripe) edges per child, and
-   * edges / stripes (at least one full copy once anyone watches).
+   * edges / stripes (at least one full copy once anyone watches). While a new subscriber's replan
+   * is still debounced, `full.subscribers` already names it so `rateTarget` caps to `START_KBPS`
+   * immediately instead of waiting for the next 2 s window.
    */
   private directEdges(full: ChannelPublisher): { byPeer: Map<string, number>; children: number } {
     const byPeer = new Map<string, number>()
@@ -118,6 +120,9 @@ export class PresenterRate {
         n++
         byPeer.set(child, (byPeer.get(child) ?? 0) + 1)
       }
+    }
+    if (!byPeer.size) {
+      for (const sub of full.subscribers.keys()) byPeer.set(sub, full.stripes)
     }
     return { byPeer, children: Math.max(n, full.subscribers.size ? full.stripes : 0) / full.stripes }
   }

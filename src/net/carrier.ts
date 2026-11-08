@@ -133,14 +133,22 @@ export class CarrierPacker {
 
   /**
    * As pack(), but always builds a frame, with no message if none waits. Then a padding message of
-   * up to `padBytes` (and at least CARRIER_MIN_PAD) fills it towards `budgetBytes`, less what the
-   * messages still waiting need: `padded` is its length (tag included). Messages often wait only
-   * for the stripe rule (one stripe of a media frame per carrier frame), so padding can't wait for
-   * an empty queue, but it never takes the budget they will need.
+   * up to `padBytes` (and at least CARRIER_MIN_PAD) fills it towards `padCapBytes` (defaults to
+   * `budgetBytes`), less what the messages still waiting need: `padded` is its length (tag
+   * included). Messages often wait only for the stripe rule (one stripe of a media frame per
+   * carrier frame), so padding can't wait for an empty queue, but it never takes the budget they
+   * will need.
    * `hold`: no messages but audio, leaving the rest of the queue as it is.
    */
-  packFrame(budgetBytes: number, prefix: Uint8Array = new Uint8Array(0), padBytes = 0, hold = false): { frame: Uint8Array; taken: number; padded: number } {
+  packFrame(
+    budgetBytes: number,
+    prefix: Uint8Array = new Uint8Array(0),
+    padBytes = 0,
+    hold = false,
+    padCapBytes = budgetBytes,
+  ): { frame: Uint8Array; taken: number; padded: number } {
     if (prefix.byteLength > MAX_PREFIX) throw new RangeError(`carrier prefix too long: ${prefix.byteLength} bytes`)
+    const overhead = prefix.byteLength + CARRIER_TRAILER_SIZE
     const scan = hold ? 0 : Math.min(this.queue.length, CARRIER_LOOKAHEAD + 1)
     const take: number[] = []
     // Media frame -> the stripes this carrier frame already holds pieces of.
@@ -157,7 +165,7 @@ export class CarrierPacker {
       }
       return true
     }
-    let size = prefix.byteLength + CARRIER_TRAILER_SIZE
+    let size = overhead
     const takeAudio: number[] = []
     for (let i = 0; i < this.audio.length; i++) {
       if (!stripeOk(this.audio[i])) continue
@@ -181,7 +189,7 @@ export class CarrierPacker {
       for (const i of take) waiting -= this.queue[i].data.byteLength
       for (const i of takeAudio) waiting -= this.audio[i].data.byteLength
       waiting += (this.length - take.length - takeAudio.length) * CARRIER_LENGTH_SIZE
-      const room = Math.min(budgetBytes - size - waiting - CARRIER_LENGTH_SIZE, MAX_CARRIER_MESSAGE)
+      const room = Math.min(padCapBytes - size - waiting - CARRIER_LENGTH_SIZE, MAX_CARRIER_MESSAGE)
       const n = Math.floor(Math.min(room, padBytes))
       if (n >= CARRIER_MIN_PAD) padded = n
     }
@@ -229,6 +237,12 @@ export class CarrierPacker {
 
 /** The carrier's send budget holds this much sending time as burst (ms): a few frames' worth. */
 export const CARRIER_BURST_MS = 40
+/**
+ * When `budget.rateKbps` is still below `targetKbps` (the wire rate the link's active stripes want),
+ * automatic carrier padding leaves this much sending time (ms) in the token bucket so the next
+ * arriving video frame has instant burst credit without queueing behind padding.
+ */
+export const CARRIER_AUTO_PAD_RESERVE_MS = 20
 
 /**
  * The send rate of a carrier, as a token bucket: credit accrues at `rateKbps` (the link sets it to
@@ -268,7 +282,8 @@ export class CarrierBudget {
 /**
  * The next carrier frame for the encoder's `prefix` (one per encoded frame): the queued messages
  * the budget covers, the head first and never past it; then, with nothing left waiting, up to
- * `padBytes` of padding within what remains. Spends the frame's bytes.
+ * `padBytes` of padding within what remains (or automatic padding above CARRIER_AUTO_PAD_RESERVE_MS
+ * while `budget.rateKbps < targetKbps`). Spends the frame's payload bytes.
  */
 export function nextCarrierFrame(
   packer: CarrierPacker,
@@ -276,13 +291,24 @@ export function nextCarrierFrame(
   now: number,
   prefix: Uint8Array,
   padBytes = 0,
+  targetKbps = 0,
 ): { frame: Uint8Array; taken: number; padded: number } {
   const overhead = prefix.byteLength + CARRIER_TRAILER_SIZE
   const head = packer.headBytes
   const avail = budget.refill(now, overhead + head)
   const hold = head > 0 && avail < overhead + head
-  const r = packer.packFrame(Math.max(overhead, Math.floor(avail)), prefix, padBytes, hold)
-  budget.spend(r.frame.byteLength)
+  const budgetBytes = Math.max(overhead, Math.floor(avail))
+  let effectivePad = padBytes
+  let padCapBytes = budgetBytes
+  if (padBytes === 0 && targetKbps > 0 && budget.rateKbps > 0 && budget.rateKbps < targetKbps) {
+    const reserve = (budget.rateKbps / 8) * CARRIER_AUTO_PAD_RESERVE_MS
+    padCapBytes = Math.max(overhead, Math.floor(avail + overhead - reserve))
+    effectivePad = MAX_CARRIER_MESSAGE
+  }
+  const r = packer.packFrame(budgetBytes, prefix, effectivePad, hold, padCapBytes)
+  // Bare keepalive frames carry no payload and must not drain credit into debt; payload frames
+  // spend only their payload + length headers so the dummy VP8 prefix/trailer doesn't starve BWE.
+  if (r.taken > 0 || r.padded > 0) budget.spend(r.frame.byteLength - overhead)
   return r
 }
 

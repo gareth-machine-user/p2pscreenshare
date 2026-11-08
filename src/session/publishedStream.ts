@@ -221,7 +221,7 @@ export class PublishedStream {
     this.changedAt = performance.now()
     // Down at once; up only as far as the bitrate already was: the rate control goes on to the new
     // quality once a probe confirms the uplink carries it (session/congestion.ts JumpGate).
-    full.kbps = Math.min(full.kbps, bitrateKbps)
+    full.setBitrate(Math.min(full.kbps, bitrateKbps))
     o.bitrateKbps = bitrateKbps
     o.fps = rate
     this.video.setTarget(full.kbps, rate)
@@ -250,7 +250,7 @@ export class PublishedStream {
     if (!full || !this.video) return
     const next = Math.round(Math.min(this.ceilingKbps, Math.max(MIN_ADAPTIVE_KBPS, kbps)) / BITRATE_STEP_KBPS) * BITRATE_STEP_KBPS
     if (next === full.kbps) return
-    full.kbps = next
+    full.setBitrate(next)
     this.video.setBitrate(next)
     this.ctx.announce()
   }

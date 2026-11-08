@@ -164,6 +164,8 @@ export class BitrateController {
   private lastUp = -Infinity
   /** The last target was START_KBPS for want of a measurement. */
   private unmeasured = false
+  /** A moderate estimated dip (<50%) seen in the previous window, absorbed by temporal layers unless sustained. */
+  private pendingEstCut = false
 
   /**
    * The next bitrate, or null to stay. `fastDropAt`: when a measured capacity last fell at once
@@ -174,22 +176,34 @@ export class BitrateController {
     this.unmeasured = t.limit === 'unmeasured'
     // The first measurement: straight to its target, which is as safe as any measured one.
     if (wasUnmeasured && !this.unmeasured && t.kbps > currentKbps) {
+      this.pendingEstCut = false
       this.lastUp = now
       return t.kbps
     }
     if (t.kbps < currentKbps * (1 - DEADBAND)) {
       if (now - this.lastDown < DOWN_GAP_MS) return null
+      // A moderate (<50%) dip in the browser's estimate (e.g. a brief packet-loss burst) is absorbed
+      // by Uplink's T2/T1 layer dropping on the first window; only cut the encoder if it persists
+      // into the next window or falls to MAX_CUT or below.
+      if (t.estimated && !this.unmeasured && t.kbps > currentKbps * MAX_CUT && !this.pendingEstCut) {
+        this.pendingEstCut = true
+        return null
+      }
+      this.pendingEstCut = false
       // The browser's estimate fell (20 → 3 Mbps): it already reflects the loss or delay it saw.
       const steep = t.estimated || (o.fastDropAt ?? -Infinity) > this.lastDown || this.unmeasured
-      this.lastDown = now
+      if (!this.unmeasured) this.lastDown = now
       return steep ? t.kbps : Math.max(t.kbps, currentKbps * MAX_CUT)
     }
+    this.pendingEstCut = false
     // Back to the chosen quality even from just below it; elsewhere small moves are noise.
     const up = t.kbps > currentKbps * (1 + DEADBAND) || (t.limit === 'chosen' && t.kbps > currentKbps)
     if (!up) return null
     if (t.estimated) {
       // The estimate grew (GCC grows only to about 1.5 times what is sent, so this climbs in steps).
-      if (now - this.lastUp < DOWN_GAP_MS || now - this.lastDown < DOWN_GAP_MS) return null
+      // Wait DOWN_GAP_MS after a cut so a dip and its recovery aren't two changes, and 2 s between
+      // raises so GCC's ramp doesn't take half a minute to reach the chosen quality.
+      if (now - this.lastUp < 2000 || now - this.lastDown < DOWN_GAP_MS) return null
       this.lastUp = now
       return t.kbps
     }

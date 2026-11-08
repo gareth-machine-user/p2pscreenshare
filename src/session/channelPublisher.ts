@@ -3,7 +3,7 @@
 // publisher plans its own channels' trees, so the planner fails together with the tree's source:
 // no leader election, no handover. Capture and encoding live in publishedStream.ts; nothing here
 // needs WebCodecs or MediaStream, so the policy can be unit-tested (tests/channelPublisher.test.ts).
-import { packetize, type EncodedFrame } from '../media/packetizer'
+import { packetize, stripeWireBytes, type EncodedFrame } from '../media/packetizer'
 import type { Mesh } from '../mesh/mesh'
 import type { ChannelAnnouncement } from '../mesh/records'
 import { gzip } from '../mesh/envelope'
@@ -104,6 +104,7 @@ export class ChannelPublisher {
   private disruption = new DisruptionTracker()
   /** Frames are signed in order, so fragments leave in capture order. */
   private signing: Promise<void> = Promise.resolve()
+  private worker: Worker | null = null
   private reattachQueue: ReattachRequest[] = []
   /** edgeKey(peer, stripe) -> when that peer's parent there last changed. */
   private parentChangedAt = new Map<string, number>()
@@ -172,6 +173,25 @@ export class ChannelPublisher {
     return Math.max(stripeKbpsFor(this.kbps, this.k, this.withAudio), Math.round(this.measuredStripeKbps))
   }
 
+  /**
+   * Changes the channel's target video bitrate (kbps), scaling down the recent stripe-rate window
+   * proportionally on a cut so the 90th-percentile filter doesn't keep announcing the old bitrate's
+   * stripe rate for 9 s and starve relay slot offers.
+   */
+  setBitrate(kbps: number): void {
+    if (kbps === this.kbps) return
+    const prevNominal = stripeKbpsFor(this.kbps, this.k, this.withAudio)
+    this.kbps = kbps
+    const nextNominal = stripeKbpsFor(this.kbps, this.k, this.withAudio)
+    if (nextNominal < prevNominal && prevNominal > 0) {
+      const scale = nextNominal / prevNominal
+      this.stripeSamples = this.stripeSamples.map((s) => s * scale)
+      this.measuredStripeKbps *= scale
+      this.announcedStripeKbps = this.stripeKbps
+      this.lastAnnounceAt = performance.now()
+    }
+  }
+
   announcement(): ChannelAnnouncement {
     return {
       id: this.id,
@@ -191,14 +211,38 @@ export class ChannelPublisher {
     this.ctx.announce()
   }
 
+  private ensureWorker(): Worker | null {
+    if (typeof Worker !== 'function' || !this.ctx.signingKey) return null
+    if (this.worker) return this.worker
+    try {
+      const w = new Worker(new URL('../media/packetizerWorker.ts', import.meta.url), { type: 'module' })
+      w.postMessage({ op: 'key', key: this.ctx.signingKey })
+      w.onmessage = (ev: MessageEvent<{ frags: ArrayBuffer[] }>) => {
+        if (this.stopped) return
+        for (const buf of ev.data.frags) this.ctx.relay.inject(new Uint8Array(buf))
+      }
+      w.onerror = (ev) => console.warn('packetizer worker failed', ev.message)
+      this.worker = w
+      return w
+    } catch {
+      return null
+    }
+  }
+
   emit(frame: EncodedFrame): void {
     if (this.stopped) return
     // Requested or scheduled, a keyframe serves every subscriber waiting for one.
     if (frame.key && !frame.audio) this.keyGate.onKeyframe(performance.now())
+    const bytes = stripeWireBytes(frame.data.byteLength, this.k)
+    for (let i = 0; i < this.stripes; i++) this.stripeBytes[i] = (this.stripeBytes[i] ?? 0) + bytes
+    if (!this.ctx.signingKey) return
+    const w = this.ensureWorker()
+    if (w) {
+      const data = frame.data.byteOffset === 0 && frame.data.byteLength === frame.data.buffer.byteLength ? frame.data : frame.data.slice()
+      w.postMessage({ op: 'frame', frame: { ...frame, data }, k: this.k, m: this.m, id: this.id }, [data.buffer])
+      return
+    }
     const stripes = packetize(frame, this.k, this.m, this.id)
-    stripes.forEach((frags, i) => {
-      for (const raw of frags) this.stripeBytes[i] = (this.stripeBytes[i] ?? 0) + raw.byteLength
-    })
     this.signing = this.signing
       .then(async () => {
         await signFrame(this.ctx.signingKey, stripes)
@@ -626,6 +670,8 @@ export class ChannelPublisher {
 
   stop(): void {
     this.stopped = true
+    this.worker?.terminate()
+    this.worker = null
     this.timers.forEach((cancel) => cancel())
     this.replanSoon.cancel()
     this.reattachTimer?.()

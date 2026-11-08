@@ -551,7 +551,8 @@ Rate control, in both profiles:
   several times the average size, which would overflow the uplinks the relay trees were planned
   for.
 - **Planning for peaks.** The publisher announces the 90th percentile of quarter-second stripe
-  rates over the last 10 s, so relay slots cover bursts.
+  rates over the last 10 s (scaled down immediately when the bitrate is cut), so relay slots cover
+  bursts without holding a stale peak after a cut.
 - **Frame-aware dropping.** When one fragment of a frame misses its deadline on a link, the rest of
   that frame's fragments on that link are dropped too, freeing upload for frames that can still
   play.

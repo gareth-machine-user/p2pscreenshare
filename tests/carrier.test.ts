@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CARRIER_AUTO_PAD_RESERVE_MS,
   CARRIER_BURST_MS,
   CARRIER_SHORT_RTT_MS,
   CARRIER_LENGTH_SIZE,
@@ -15,7 +16,7 @@ import {
   unpackCarrier,
   unpackCarrierFrame,
 } from '../src/net/carrier'
-import { packetize, type EncodedFrame } from '../src/media/packetizer'
+import { packetize, stripeWireBytes, type EncodedFrame } from '../src/media/packetizer'
 import { Reassembler, type AssembledFrame } from '../src/media/reassembler'
 import { decodeFragment, encodeFragment, NO_REF, peekStripe } from '../src/proto/framing'
 
@@ -563,5 +564,42 @@ describe('CarrierBudget', () => {
     p.push(bytes(100, 1))
     for (let t = 0; t < 100; t += FRAME_MS) expect(nextCarrierFrame(p, b, t, PREFIX).frame.byteLength).toBe(overhead)
     expect(p.length).toBe(1)
+    // Bare frames do not drain credit below zero while idle or holding.
+    expect(b.available).toBe(0)
+  })
+
+  it('auto-pads spare credit when budget.rateKbps < targetKbps while keeping CARRIER_AUTO_PAD_RESERVE_MS in reserve', () => {
+    const p = new CarrierPacker()
+    const b = new CarrierBudget(8000)
+    const reserve = (8000 / 8) * CARRIER_AUTO_PAD_RESERVE_MS
+    let taken = 0
+    let padded = 0
+    let payload = 0
+    // Feed 85% of 8 Mbps (6.8 Mbps = 8500 B per 10 ms frame) while targetKbps is 16 Mbps.
+    for (let t = 0; t <= 2000; t += FRAME_MS) {
+      if (t > 0) p.push(bytes(8500, t))
+      const r = nextCarrierFrame(p, b, t, PREFIX, 0, 16_000)
+      taken += r.taken
+      padded += r.padded
+      payload += r.frame.byteLength - overhead
+      if (r.padded > 0) {
+        // Auto-padding only spends credit above the burst reserve.
+        expect(b.available).toBeGreaterThanOrEqual(reserve - CARRIER_LENGTH_SIZE - 1)
+      }
+    }
+    expect(padded).toBeGreaterThan(0)
+    // Total payload + auto-pad matches ~100% of the 8 Mbps budget (less the 20 ms reserve).
+    expect((payload * 8) / 2000).toBeGreaterThan(8000 * 0.94)
+    expect((payload * 8) / 2000).toBeLessThan(8000 * 1.02)
+    // Once budget.rateKbps reaches targetKbps, auto-padding stops completely.
+    b.rateKbps = 16_000
+    expect(nextCarrierFrame(p, b, 2010, PREFIX, 0, 16_000).padded).toBe(0)
+    // stripeWireBytes matches the exact per-stripe byte length produced by packetize().
+    for (const len of [1, 500, 16_280, 180_000]) {
+      const stripes = packetize(frame(1, len), K, M, 7)
+      for (const s of stripes) {
+        expect(s.reduce((a, r) => a + r.byteLength, 0)).toBe(stripeWireBytes(len, K))
+      }
+    }
   })
 })

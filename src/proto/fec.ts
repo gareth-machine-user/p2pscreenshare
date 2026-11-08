@@ -53,11 +53,19 @@ function mulAddInto(dst: Uint8Array, src: Uint8Array, coef: number): void {
   if (coef === 0) return
   const n = dst.length
   if (coef === 1) {
-    for (let i = 0; i < n; i++) dst[i] ^= src[i]
+    const words = n >>> 2
+    if (words > 0 && (dst.byteOffset & 3) === 0 && (src.byteOffset & 3) === 0) {
+      const d32 = new Uint32Array(dst.buffer, dst.byteOffset, words)
+      const s32 = new Uint32Array(src.buffer, src.byteOffset, words)
+      for (let i = 0; i < words; i++) d32[i] ^= s32[i]
+    } else {
+      for (let i = 0; i < words * 4; i++) dst[i] ^= src[i]
+    }
+    for (let i = words * 4; i < n; i++) dst[i] ^= src[i]
     return
   }
-  const base = coef * 256
-  for (let i = 0; i < n; i++) dst[i] ^= MUL[base + src[i]]
+  const row = MUL.subarray(coef * 256, coef * 256 + 256)
+  for (let i = 0; i < n; i++) dst[i] ^= row[src[i]]
 }
 
 /** Splits `frame` into k data pieces (zero padded) and computes m parity pieces. */

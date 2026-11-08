@@ -19,7 +19,8 @@ import { Uplink } from '../net/uplink'
 import { isTopologyReport, parsePeerMsg, type EncoderRates, type PeerMsg, type TopologyReport, type UplinkRates } from '../proto/messages'
 import { verifyFragment } from '../proto/signing'
 import { RelayNode } from '../relay/relayNode'
-import { FROZEN_LAG_MS, rebalanceWeights, splitBudget, type CapacityModel } from './capacity'
+import { FROZEN_LAG_MS, rebalanceWeights, splitBudget, stripeKbpsFor, type CapacityModel } from './capacity'
+import { TARGET_SHARE } from './congestion'
 import type { ChannelPublisher, PublisherContext } from './channelPublisher'
 import { PublishedStream, type ShareOptions } from './publishedStream'
 import { Subscription, type SubscriptionContext } from './subscription'
@@ -59,7 +60,7 @@ export type { LinkRow } from './connMetrics'
 /** Budget weights shift towards channels with a deficit this often. */
 const REBALANCE_MS = 10_000
 /** How often to consider running it. */
-const HEADROOM_CHECK_MS = 1000
+const HEADROOM_CHECK_MS = 500
 /** The encoder dropping this many frames per second means it can't keep up (shown, not acted on). */
 const ENCODER_BEHIND_FPS = 3
 /** Each connection's getStats() (path RTT, wire rates) is polled this often. */
@@ -439,6 +440,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     }
     // Stopped (or replaced by a newer share) while the capture prompt was open.
     if (this.publishing !== stream) return
+    this.rateControl.adapt(this.publishing, performance.now())
     this.selected = this.selfId
     this.updateOffers()
     this.announce()
@@ -449,6 +451,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     if (!s) return
     this.publishing = null
     s.stop()
+    this.updateCarrierTargets()
     this.announce()
   }
 
@@ -505,6 +508,44 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       capacityKbps !== rec.capacityKbps
     ) {
       this.mesh.updateRecord({ offers, subs, capacityKbps })
+    }
+    this.updateCarrierTargets()
+  }
+
+  /**
+   * Sets each open connection's desired wire bitrate (`targetKbps`) from the stripes it actively
+   * feeds (as publisher or relay, scaled by 1 / TARGET_SHARE), so its carrier worker automatically
+   * pads spare token-bucket credit while GCC's estimate is still climbing towards that rate.
+   */
+  private updateCarrierTargets(): void {
+    const targets = new Map<string, number>()
+    const add = (peer: string, wireKbps: number) => {
+      if (peer === this.selfId || wireKbps <= 0) return
+      targets.set(peer, (targets.get(peer) ?? 0) + wireKbps)
+    }
+    for (const ch of this.ownChannels()) {
+      const ceilKbps = ch.kind === 'full' ? (this.publishing?.ceilingKbps ?? ch.kbps) : ch.kbps
+      const stripeKbps = stripeKbpsFor(ceilKbps, ch.k, ch.withAudio)
+      let hasEdges = false
+      for (let s = 0; s < ch.stripes; s++) {
+        for (const child of this.relay.childrenOf(ch.id, s)) {
+          hasEdges = true
+          add(child, stripeKbps / TARGET_SHARE)
+        }
+      }
+      if (!hasEdges && ch.kind === 'full') {
+        for (const sub of ch.subscribers.keys()) add(sub, (ch.stripes * stripeKbps) / TARGET_SHARE)
+      }
+    }
+    for (const sub of this.subs.values()) {
+      for (let s = 0; s < sub.ann.k + sub.ann.m; s++) {
+        for (const child of this.relay.childrenOf(sub.channel, s)) {
+          add(child, sub.ann.stripeKbps / TARGET_SHARE)
+        }
+      }
+    }
+    for (const [conn, rec] of this.metrics.openConns()) {
+      conn.setTargetKbps?.(targets.get(rec.peer) ?? 0)
     }
   }
 
@@ -564,6 +605,10 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       case 'stats':
       case 'topo-req':
         this.ownChannels().find((c) => c.id === msg.ch >>> 0)?.handle(msg, from)
+        if (msg.t === 'subscribe' || msg.t === 'unsubscribe') {
+          this.rateControl.adapt(this.publishing, performance.now())
+          this.updateCarrierTargets()
+        }
         return
       case 'set-parent':
       case 'add-child':
@@ -571,7 +616,10 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
       case 'position': {
         // Tree commands for a channel come only from that channel's publisher.
         const sub = this.subs.get(msg.ch >>> 0)
-        if (sub && sub.publisher === from) sub.handle(msg)
+        if (sub && sub.publisher === from) {
+          sub.handle(msg)
+          if (msg.t === 'add-child' || msg.t === 'remove-child') this.updateCarrierTargets()
+        }
         return
       }
       case 'topo': {
@@ -644,6 +692,7 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
     const now = performance.now()
     // A raised quality waits for a probe to confirm it (congestion.ts JumpGate): one per 5 s at most.
     const wanted = this.rateControl.probeWanted && now - this.headroom.lastAt >= HEADROOM_LIMITED_MS
+    const limited = limit === 'uplink' || limit === 'viewers' || limit === 'unmeasured'
     const due =
       wanted ||
       discoveryDue({
@@ -651,12 +700,15 @@ export class PeerSession implements PublisherContext, SubscriptionContext, Publi
         firstLinkAt: this.firstLinkAt,
         lastAt: this.headroom.lastAt,
         presenting: !!this.publishing,
-        limited: limit === 'uplink' || limit === 'viewers' || limit === 'unmeasured',
+        limited,
         encoderKbps: enc?.kbps ?? null,
         targetKbps: enc?.targetKbps ?? null,
       })
+    // A carrier whose estimate cut the stream to 85% of BWE was backlogged before the cut, but now
+    // sends below its estimate and needs probe padding to grow it back.
+    const canProbe = !this.metrics.backloggedNow || wanted || (limited && this.capacity.estimated)
     // Not while every connection is settling: a probe then would only measure its join (capacity.ts SETTLE_MS).
-    if (due && !this.metrics.backloggedNow && !this.metrics.allSettling(now)) void this.discover()
+    if (due && canProbe && !this.metrics.allSettling(now)) void this.discover()
   }
 
   /**

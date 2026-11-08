@@ -212,8 +212,9 @@ function toldParent(id: string, s: number): string | null | undefined {
 }
 
 /** Lets promise callbacks (gzip) run without moving fake time, until `cond` holds or for a while. */
-async function flush(cond = () => false): Promise<void> {
-  for (let i = 0; i < 2000 && !cond(); i++) await new Promise((r) => setImmediate(r))
+async function flush(cond?: () => boolean): Promise<void> {
+  const limit = cond ? 20_000 : 500
+  for (let i = 0; i < limit && !cond?.(); i++) await new Promise((r) => setImmediate(r))
 }
 
 /** Long enough for a reattach batch to be handled (the ticker runs every 50 ms). */
@@ -675,12 +676,36 @@ describe('ChannelPublisher: feasibility', () => {
     await advance(6000)
     expect(h.cp.limited).toBeNull()
   })
+
+  it('setBitrate scales recent stripe samples down immediately on a bitrate cut', async () => {
+    setup(4, 1, 5, 5000)
+    // Feed 5 Mbps worth of fragments over several 250 ms measurement ticks so stripeSamples fills at ~1500 kbps/stripe.
+    for (let i = 0; i < 10; i++) {
+      h.cp.emit({
+        epoch: 1,
+        seq: i,
+        gopId: 0,
+        refSeq: i === 0 ? 0xffff : i - 1,
+        key: i === 0,
+        layer: 0,
+        audio: false,
+        captureTime: i * 250,
+        data: new Uint8Array(180_000),
+      })
+      await advance(250)
+    }
+    const before = h.cp.stripeKbps
+    expect(before).toBeGreaterThan(1300)
+    // Cut channel bitrate from 5000 to 2000 kbps: stripeKbps scales down immediately without waiting 9 s.
+    h.cp.setBitrate(2000)
+    expect(h.cp.stripeKbps).toBeLessThan(before * 0.5)
+  })
 })
 
 describe('ChannelPublisher: topology reports', () => {
   /** The reports sent to `id`, once there are `n` (or after a while, if `n` is omitted). */
   async function topo(id: string, n?: number): Promise<TopologyReport[]> {
-    await flush(() => n !== undefined && sentTo(id, 'topo').length >= n)
+    await flush(n !== undefined ? () => sentTo(id, 'topo').length >= n : undefined)
     const out: TopologyReport[] = []
     for (const m of sentTo(id, 'topo')) if (m.t === 'topo') out.push(JSON.parse(await gunzip(fromBase64Url(m.z))))
     return out

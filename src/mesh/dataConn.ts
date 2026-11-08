@@ -35,6 +35,10 @@ export interface PairConn extends MediaLink {
   acceptAnswer(sdp: string): Promise<void>
   /** The connection's getStats() report (absent in tests' fakes; null when closed). */
   stats?(): Promise<StatsLike | null>
+  /** Most recent getStats() report already polled by the carrier, if any. */
+  latestStats?(): StatsLike | null
+  /** Sets the desired wire bitrate (kbps) for carrier-level auto-padding while GCC ramps. */
+  setTargetKbps?(kbps: number): void
   close(): void
 }
 
@@ -181,6 +185,14 @@ export abstract class DataConn implements PairConn {
     const report = await connStats(this.pc)
     if (report) this.carrier.noteStats(report)
     return report
+  }
+
+  latestStats(): StatsLike | null {
+    return this.carrier.lastReport
+  }
+
+  setTargetKbps(kbps: number): void {
+    this.carrier.setTargetKbps(kbps)
   }
 
   close(): void {
